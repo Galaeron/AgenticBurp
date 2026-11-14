@@ -39,8 +39,9 @@ class TestReportStructure(unittest.TestCase):
         report = generate_markdown_report("example.com", findings)
         self.assertNotIn("Steps to reproduce:** Rotate the signing key", report)
         self.assertIn("Fix note (from the detector):** Rotate the signing key", report)
-        # reproduction falls back to replaying the captured evidence
-        self.assertIn("replay the exact captured request", report)
+        # HU-2 (c): with no recorded send, say so -- never a generic replay hint
+        self.assertIn("**Steps to reproduce:** no reproducible request recorded.", report)
+        self.assertNotIn("replay the exact captured request", report)
 
     def test_real_reproduction_step_is_still_labelled_reproduction(self):
         findings = [sample(vulnerability_class="sqli", confirmed=True,

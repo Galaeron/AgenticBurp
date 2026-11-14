@@ -126,6 +126,14 @@ it retroactively de-risks the four validators that each re-implemented the same 
 source-form/CSRF-refresh logic. Honour the non-negotiables below (safe `config.yaml`
 defaults; a caller test + negative control per item; `full` green before close).
 
+**2026-11-09 human-utility batch (offline; after the r5/r6 tasks and r7):** The r5/r6 analysis
+showed detection is not the main limit on usefulness: 3 proven flaws on an app with about 100,
+while issues it saw were dropped for lack of operator intent, an oracle, or a route to the tester.
+The **Human-utility batch — HU-*** (end of file) targets that. Select **HU-1 → HU-2 → HU-5 →
+HU-3 → HU-6 → HU-4 → HU-8 → HU-7 → HU-9** once the four open review findings, T1–T6 and r7 in
+NOTES.md are done. HU-2 supersedes the Burp-tab half of P2-3; PR-E's measure (analyst minutes
+per accepted issue) is the batch's success measure. Non-negotiables unchanged.
+
 1. Work top-down: finish all `P0` items before `P1`, etc. Within a tier, respect
    `Depends on`.
 2. Pick the first item whose checkbox is `[ ]` and whose dependencies are all `[x]`.
@@ -4463,3 +4471,260 @@ Open items left after the initial milestone (fe8859b) and batches 01 (9404f29), 
 - **Spec:** [docs/AR10_INTEGRATED_ACCEPTANCE_SPEC.md](docs/AR10_INTEGRATED_ACCEPTANCE_SPEC.md)
   (2026-11-02, 2081d70). Open: merge + frozen offline acceptance (part A), prerequisites P1–P3,
   and the OWNER/LIVE live run and model A/B (parts B, C).
+
+## Human-utility batch — 2026-11-09 (HU-*)
+
+**Why this batch exists.** The harness is built to avoid false claims, and that works. Its yield
+for a human tester is low. r5 and r6 on Juice Shop (about 100 known flaws) produced 249 raw
+findings and 3 distinct proven flaws. Several serious issues were seen and dropped: they had no
+way to express intent, no oracle, or no route to the human. Source: the r5/r6 analysis,
+`.test-work/r5-r6-detection-analysis-20261109/ANALYSIS.md` (main checkout). Run numbers below
+are **SUPPORTED** (from that analysis; the stores were not re-read for this filing). Code
+references are **VERIFIED** at `integrate/r5-fixes-2026-11-06` @ `979803d5`.
+
+**Order:** these come after the four open review findings, T1–T6 and the r7 run in NOTES.md.
+Within the batch: **HU-1 → HU-2 → HU-5 → HU-3 → HU-6 → HU-4 → HU-8 → HU-7 → HU-9**. HU-1's
+matrix API can land alongside T1/T2. T1/T2 keep their mechanical oracles and gain a matrix
+consumer in HU-1's acceptance.
+
+**Batch measure:** analyst minutes per accepted issue, as defined by PR-E (OWNER). Test counts
+and raw finding counts are not success measures for this batch.
+
+Non-negotiables apply: new behaviour ships OFF in `config.yaml`, each item needs a caller-level
+test and a negative control, `full` must be green before close, and nothing may be specific to
+Juice Shop.
+
+### [ ] HU-1 — Operator access matrix: infer a draft, ask the tester, test every answered cell  ★
+- **Domain:** Authorization / human input · **Effort:** L · **Depends on:** none for the matrix
+  API; T2 (write leg) for write cells · **Mode:** LOOP (offline); live acceptance OWNER.
+- **Evidence (VERIFIED):**
+  - Intent comes only from the config key `engagement.access_expectations`
+    (`harness/experiment.py:61`, `:187`).
+  - It supports only `private_to_creator` and requires a declared create endpoint
+    (`experiment.py:345-352`).
+  - `PUT`/`GET /engagement/{host}/declarations` (`harness/server.py:1605`, `:1625`) stores
+    `protected_paths`/`owners`, but the Burp extension never calls it.
+  - Observed ownership is already stored (`ownership_facts`, `harness/store.py:397`).
+  - Experiment dispositions already carry `blocked_on: operator_input` (AR-FP).
+- **Evidence (SUPPORTED, r6):**
+  - Experiments were blocked with "no declared access expectation for object 'basket' / 'product'".
+  - 3,301 ownership facts were stored.
+  - 1,489 regular-user `PUT /api/Products/{n}` requests returned 200, and no candidate was raised.
+  - The `/api/Users` exposure of other users' `deluxeToken` was skipped as "needs manual review".
+- **Problem:** the bugs that matter most (access control, data exposure) depend on intent. The
+  tool cannot obtain intent except through hand-written YAML, so it skips them or calls them
+  inconclusive.
+- **Recommendation:**
+  - (a) Build a draft matrix from ownership facts, the role crawl and captured outcomes. Each row
+    is role × object type × action (read / list / create / update / delete), plus the sensitive
+    fields seen. Each row shows its observed outcome (allowed / denied / unknown) and a *proposed*
+    expectation.
+  - (b) Add `GET`/`PUT /engagement/{host}/access-matrix` with per-cell answers: `allowed` / `denied`
+    / `owner_only` / `admin_only` / `unknown`. Answers persist per engagement with operator
+    provenance.
+  - (c) Rank questions by impact and cap each round (for example 20). A cell is shown as a
+    question, such as "Can a customer update a Product?".
+  - (d) `experiment.py`, T1 and T2 read the answered cells. Widen the expectation kinds beyond
+    `private_to_creator`.
+  - (e) A proposed expectation is never treated as truth. Unanswered cells stay leads.
+- **Acceptance criteria:** a caller-level test on a generic two-role loopback app with an
+  owner-only object and an admin-only catalogue.
+  - The draft lists both objects with their observed outcomes.
+  - With no answers, nothing confirms (negative control).
+  - After the answers `owner_only` / `admin_only`, a cross-owner read and a low-privilege write
+    confirm through the real dispatch.
+  - The same traffic with the cell answered `allowed` gives `not_confirmed`.
+  - The Burp UI for answering is a follow-up; the API plus a report section are enough here.
+
+### [ ] HU-2 — Burp-native findings and a ranked lead queue with ready-to-send requests
+- **Domain:** Workflow fit · **Effort:** M-L · **Depends on:** none (Python half); P1-5 for the
+  Burp load · **Mode:** LOOP (Python + Java unit tests); OWNER for loading the JAR in Burp.
+- **Evidence (VERIFIED):**
+  - The extension writes to Burp only through `api.siteMap().add(HttpRequestResponse…)`
+    (`burp-extension/src/main/java/com/harness/llm/SiteMapImporter.java:41`), and no `AuditIssue`
+    is created anywhere.
+  - Montoya is `2023.12.1` (`burp-extension/build.gradle:31`).
+  - When there is no suggested test, the report's repro falls back to generic text
+    (`harness/report_generator.py:727`).
+  - A ledger recipe exists (`harness/evidence_ledger.py:447`, `reproduction_recipe`).
+  - `docs/LIMITATIONS.md` records "Results live outside Burp … every finding is copy-paste work"
+    as open.
+- **Problem:** an unproven candidate is still valuable to a tester, but only as a concrete next
+  action. Today it arrives as prose outside Burp.
+- **Recommendation:**
+  - (a) Add `GET /engagement/{host}/leads`. For each unproven candidate it returns:
+    - the exact recorded request, with secrets redacted;
+    - the one change to make;
+    - what a positive and a negative result look like;
+    - a typed `blocked_on` (`no_leg`, `identity_missing`, `operator_input`, `budget`, `deadline`,
+      `tool_reported`);
+    - a rank.
+  - (b) Burp: add a proof-bound finding as an `AuditIssue` with its proof request/response
+    attached. Show leads in a table with Send to Repeater, filling the session from the declared
+    role at send time.
+  - (c) Report: use the recipe, or state "no reproducible request recorded". Never use the
+    generic "replay and compare" text.
+- **Acceptance criteria:**
+  - Every lead carries a request or an explicit "no request recorded" reason.
+  - A finding with no recorded exchange never gets an invented request (negative control).
+  - A Java unit test maps a proven finding to an `AuditIssue` that has its request/response.
+  - `gradle shadowJar` plus loading in Burp stay OWNER, and are labelled unverified until run.
+- **Supersedes** the remaining Burp-tab half of P2-3: close P2-3 when this lands.
+
+### [ ] HU-5 — End-of-run handoff: what was not tested and what changed on the target
+- **Domain:** Coverage honesty / target safety · **Effort:** M · **Depends on:** none ·
+  **Mode:** LOOP.
+- **Evidence (SUPPORTED):**
+  - r5 left 365 captures unreviewed and 101 worklist nodes untouched.
+  - r6 hit its soft deadline before the coverage drive, the server-error pass and accounting ran.
+  - In r6, sqlmap ran full scans on about 10 write endpoints: PUT Products 1,261, PUT Addresss/{n}
+    2,018, PATCH reviews 2,025.
+- **Evidence (VERIFIED):** no module records a list of target changes. A grep for
+  restore/change-list tracking found nothing relevant. `docs/LIMITATIONS.md` lists "no automatic
+  cleanup or change-list".
+- **Problem:** a tester cannot trust silence without knowing what was skipped. They also cannot
+  report to a client, or clean up, without knowing what the tool wrote.
+- **Recommendation:**
+  - (a) Write a handoff incrementally, so a cancelled or timed-out run still has one. It lists the
+    untested surface ranked by value (unreviewed captures, untouched nodes, legs skipped with a
+    reason, phases not run) and the manual checks HU-2's leads recommend.
+  - (b) Keep a target change log. Each non-GET send that returned 2xx is recorded with method,
+    path, object ref, capability and restore status. A failed restore is shown loudly. Export the
+    log with the report.
+- **Acceptance criteria:**
+  - A run cancelled mid-confirmation (injected cancel) still yields a handoff that names the
+    phases not run.
+  - A completed run lists no phases as missing (negative control).
+  - A mutating leg against loopback produces change-log entries; a GET-only run produces none.
+  - A failed restore appears as an error entry.
+
+### [ ] HU-3 — Show the application map to the tester
+- **Domain:** Understanding / human support · **Effort:** M · **Depends on:** none ·
+  **Mode:** LOOP.
+- **Evidence (VERIFIED):**
+  - `ApplicationSemanticModel` (`harness/application_semantic_model.py:149`), built by
+    `harness/business_context_agent.py`, models roles, objects, workflows and value flows.
+  - It is off by default (`business_context:` at `harness/config.yaml:535`).
+  - No server route exposes it.
+- **Problem:** a tester's first day goes into building this map by hand. The harness holds most
+  of it and shows none of it. A map is useful even on a run that proves nothing.
+- **Recommendation:**
+  - Build the skeleton deterministically from the store, with no model call: roles seen; object
+    types with id patterns and owners (`ownership_facts`); endpoints per object × method × role
+    outcome; client-trusted value fields (price, quantity, role, is_admin); workflows observed in
+    capture order.
+  - Overlay the ASM's model hypotheses, labelled `proposed`.
+  - Expose it at `GET /engagement/{host}/map` and as a report section.
+  - The Burp panel is a follow-up.
+- **Acceptance criteria:**
+  - On a two-role loopback app with the model stubbed silent, the map lists the objects, owners,
+    role outcomes and value fields, and sends no new traffic.
+  - A model hypothesis is always labelled `proposed`, never `observed` (negative control).
+
+### [ ] HU-6 — Draft write-ups for proven issues, bound to the proof facts
+- **Domain:** Reporting · **Effort:** M · **Depends on:** HU-2 (recipe surfacing) ·
+  **Mode:** LOOP.
+- **Evidence (VERIFIED):** remediation is a generic per-class hint
+  (`harness/report_generator.py:232`, `_remediation_for`). `_render_finding`
+  (`report_generator.py:653`) prints badges, the evidence block and the model's suggested test. It
+  states no impact specific to the app.
+- **Problem:** writing up each issue is hours of tester time per engagement. The proof facts
+  needed for a good write-up are already recorded.
+- **Recommendation:** for proof-bound issues only, produce:
+  - a title and the grouped endpoints;
+  - an impact sentence built from the proof facts: which principal, which object or field, and
+    what that enables;
+  - the redacted proof request/response;
+  - reproduction steps from `reproduction_recipe`;
+  - remediation naming the actual field, endpoint and missing check.
+
+  A model may phrase the prose, but only from those facts. A fact-binding check rejects any field,
+  endpoint or principal not present in the proof. Export one Markdown file per issue.
+- **Acceptance criteria:**
+  - A proven cross-owner read on loopback renders a write-up that names the field, both
+    principals and the exact request.
+  - An unproven candidate gets no write-up (negative control).
+  - A draft naming a field absent from the proof is rejected.
+
+### [ ] HU-4 — Workflow misuse testing from captured flows
+- **Domain:** Business logic · **Effort:** L · **Depends on:** T9 (merged), HU-5 change log;
+  HU-1/HU-3 for operator confirmation of derived workflows · **Mode:** LOOP offline; live OWNER.
+- **Evidence (VERIFIED):**
+  - `workflow_engine.misuse_variants` (`harness/workflow_engine.py:389`: skip_prerequisite,
+    switch_principal, repeat) and `execute_misuse_variant` (`:403`) have no production caller;
+    only tests call them.
+  - Workflows run only when declared (`harness/engagement_builder.py:392-397`).
+- **Evidence (SUPPORTED):** r5 hypothesised a negative basket quantity at 0.65 confidence and
+  never tested it.
+- **Problem:** logic bugs live between steps. The engine that can skip, repeat and switch steps
+  exists but is never driven.
+- **Recommendation:**
+  - (a) Derive candidate workflows from captured per-principal sequences: ordered state-changing
+    requests that share ids or tokens. Offer them for operator confirmation, or accept them from
+    declarations.
+  - (b) Wire the misuse variants into the engagement loop behind `allow_mutating_replay`.
+  - (c) Add value-tamper variants (negative, zero, huge, using T9's typed edits) and a
+    step-reorder variant.
+  - (d) The oracle is a read-back invariant (for example total ≥ 0, single-use honoured). A 200
+    status is never enough.
+- **Acceptance criteria:** on a loopback shop:
+  - A negative quantity that lowers the total → confirmed through read-back.
+  - A server that rejects negatives → `not_confirmed`.
+  - An enforced step that is skipped → `not_confirmed`.
+  - Restore or cleanup is recorded in HU-5's change log.
+  - The caller is `investigate_engagement`.
+
+### [ ] HU-8 — Keep scanner-equivalent noise out of the tester's main view
+- **Domain:** Precision / attention · **Effort:** S-M · **Depends on:** none · **Mode:** LOOP.
+- **Evidence:**
+  - `docs/LIMITATIONS.md` lists "Duplicates Burp Scanner" (CORS, CSP, missing headers, verbose
+    error, JWT) as open.
+  - The existing `reporting.*` gates are confidence and catch-all gates, not overlap gates
+    (`harness/config.yaml`, `reporting:`).
+  - SUPPORTED: in r6, CONF-02 confirmed 42 issues and ERRH-01 confirmed 12, so low-value classes
+    dominate the counts.
+- **Recommendation:**
+  - Add a `reporting.scanner_overlap_appendix` option, default off. It moves scanner-equivalent
+    classes into a counted appendix and takes them out of the worklist budget.
+  - Keep proven high-impact exceptions in the main report, for example a credentialed CORS read
+    with proof.
+- **Acceptance criteria:**
+  - With the option on, the main report has no unproven header, CSP or CORS items, and the
+    appendix carries their counts.
+  - A proven credentialed CORS read stays in the main report (negative control).
+  - Default output is unchanged.
+
+### [ ] HU-7 — Stronger reasoning on structure only, for the planning passes
+- **Domain:** Model capacity · **Effort:** M · **Depends on:** HU-1, HU-3 · **Mode:** LOOP for
+  the seam and canary; OWNER for the A/B.
+- **Evidence (VERIFIED):**
+  - The default model is `qwen3:8b` (`harness/config.yaml:139`), and `cloud_reasoning: false`
+    (`:169`).
+  - The business-context input contract is an anonymised projection of structure only (comment
+    above `business_context:`).
+  - `docs/LIMITATIONS.md` and COMPETITIVE_LANDSCAPE: 8B models are weakest at authorization and
+    business logic.
+- **Recommendation:** let the matrix-proposal, map-hypothesis and workflow-derivation passes use a
+  configurable stronger model over the structure-only projection, default off. Request bodies and
+  values stay local.
+- **Acceptance criteria:**
+  - A secret-canary test proves the projection carries no body, header or parameter values.
+  - The default config sends nothing off-host.
+  - OWNER A/B metric: proposals the operator accepted, per run.
+
+### [ ] HU-9 — Incremental passive results while the tester browses
+- **Domain:** Workflow fit · **Effort:** M · **Depends on:** HU-2 (panel) · **Mode:** LOOP for
+  the Java unit tests; OWNER for loading in Burp.
+- **Evidence:** `docs/LIMITATIONS.md` lists "Manual, one-request-at-a-time, and slow" as open: the
+  only entry point is right-click, and a full engagement run takes about 3 h (historical). A
+  results-first workflow does not exist.
+- **Recommendation:**
+  - A Burp HTTP handler queues in-scope proxy traffic for passive analysis only, with no active
+    sends.
+  - Deduplicate by method + path template + input-name signature (as in T7's route feed key) and
+    cap the rate per minute.
+  - Stream results into the panel.
+- **Acceptance criteria:**
+  - A Java unit test: an in-scope response is enqueued once per route signature.
+  - Out-of-scope traffic never reaches the harness (negative control).
+  - Active legs are never triggered from this path.

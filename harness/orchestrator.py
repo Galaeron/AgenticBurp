@@ -135,6 +135,8 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
             seed=config["ollama"].get("seed"),  # run-level reproducibility seed; None => omit
             transient_retries=config["ollama"].get("transient_retries", 2),  # bounded; 0 => off
             think=config["ollama"].get("think"),  # AR-10 P2 opt-in; unset => think off
+            # ollama.api / max_output_tokens / reasoning_effort; unset => Ollama, unchanged
+            **backend_options(config["ollama"]),
         )
         
         # Configuration
@@ -373,6 +375,7 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
         self.coverage_request_reserve = self.engagement_policy.coverage_request_reserve
         self.investigation_seconds = self.engagement_policy.investigation_seconds
         self.coverage_drive_seconds = self.engagement_policy.coverage_drive_seconds
+        self.coverage_endpoint_check_share = self.engagement_policy.coverage_endpoint_check_share
         # P2-1: business-context planning agent (BusinessContextAgent). DEFAULT
         # OFF. When on, investigate_engagement runs ONE application-context pass
         # that builds an Application Semantic Model (roles/objects/workflows/
@@ -408,7 +411,7 @@ class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):
                 return self.validator_registry.ownership  # preserve explicitly injected ledgers
             identities = identity_headers.identities_for_host(urlsplit(url).hostname or "")
             if run_context is not None:
-                identities += [{"name": session.principal_id} for session in run_context.sessions.all()]
+                identities += [{"name": session.principal_id} for session in run_context.sessions.identities()]
             ledger = load_ownership(self.config, url, identities, engagement_owners=engagement_owners)
             if run_context is not None:
                 cached[origin] = ledger

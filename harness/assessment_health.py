@@ -250,8 +250,33 @@ def assessment_health(coverage, errors=(), *, stopped_on_confirmation=False):
             "objective_only": bool(stopped_on_confirmation)}
 
 
+def _run_scope(run_id):
+    """(runs, several): one run id, or every attempt of a resumed assessment (the job
+    and the jobs it resumed, oldest first). r9 resumed twice; the last job counted
+    only its own attempt and reported none of the 196 confirmations before it."""
+    runs = (frozenset([run_id]) if run_id is None or isinstance(run_id, str)
+            else frozenset(run_id))
+    return runs, len(runs) > 1
+
+
+_ATTEMPT_CASE_FIELDS = ('request_template_id', 'check_id', 'principal_id',
+                        'parameter_location', 'parameter_name', 'workflow_state_id')
+
+
+def attempt_case_key(case: dict) -> str:
+    """A case's identity without its run. case_id hashes the run id, so the same
+    request, check, principal, input and workflow state tested by two attempts has
+    two case ids; across attempts it is one case. finding_ref is left out too: it
+    names one attempt's finding or hypothesis."""
+    return json.dumps([str((case or {}).get(k) or '') for k in _ATTEMPT_CASE_FIELDS])
+
+
 def confirmed_issue_inventory(findings, run_id, proof_lookup):
-    """Resolve exact proof/case/run pointers before counting unique cases."""
+    """Resolve exact proof/case/run pointers before counting unique cases.
+
+    `run_id` is one run, or a collection of attempt run ids: then a case confirmed
+    by several attempts is one case (attempt_case_key)."""
+    runs, several = _run_scope(run_id)
     proven = {}
     for finding in findings:
         case_id, proof_id = finding.get("case_id"), finding.get("proof_id")
@@ -259,12 +284,13 @@ def confirmed_issue_inventory(findings, run_id, proof_lookup):
             continue
         # A tool-reported proof (an external tool's unreproduced detection) is not
         # a harness confirmation; it is accounted on its own (confirmed_issue_accounting).
-        if any(p.get("proof_id") == proof_id and (p.get("case") or {}).get("case_id") == case_id
-               and (p.get("case") or {}).get("run_id") == run_id and p.get("verdict") == "confirmed"
-               and not is_tool_reported(p)
-               for p in proof_lookup(case_id)):
-            proven[case_id] = {k: finding.get(k) for k in
-                              ("finding_id", "case_id", "proof_id", "url", "vulnerability_class")}
+        proof = next((p for p in proof_lookup(case_id)
+                      if p.get("proof_id") == proof_id and (p.get("case") or {}).get("case_id") == case_id
+                      and (p.get("case") or {}).get("run_id") in runs and p.get("verdict") == "confirmed"
+                      and not is_tool_reported(p)), None)
+        if proof is not None:
+            proven[attempt_case_key(proof["case"]) if several else case_id] = {
+                k: finding.get(k) for k in ("finding_id", "case_id", "proof_id", "url", "vulnerability_class")}
     return list(proven.values())
 
 
@@ -295,7 +321,7 @@ def stored_proof_artifacts_resolve(proof):
 # Batch 08: mechanisms whose proven flaw is a host trust policy, not a route: the same
 # policy fingerprint on several routes is one issue with several locations. AR-08b:
 # one set, shared with the report path's issue key (issues.py).
-from harness.issues import ROUTE_INDEPENDENT_MECHANISMS  # noqa: E402
+from harness.issues import ROUTE_INDEPENDENT_MECHANISMS, issue_class  # noqa: E402
 from harness.evidence import is_tool_reported  # noqa: E402
 _ORPHAN_REASONS = {'proof not found for case', 'proof belongs to another run', 'proof belongs to another case'}
 
@@ -306,7 +332,16 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
     Every proof instance stays visible. Vulnerability grouping requires intact
     structured controls; unknown/legacy confirmations remain candidates. The
     grouping key never crosses principal, parameter or workflow boundaries.
+
+    `run_id` is one run, or the attempt run ids of a resumed assessment, oldest
+    first: every attempt's proofs are counted, and a case two attempts confirmed is
+    one case and one group (attempt_case_key). With one run the output is the
+    single-run accounting, unchanged.
     """
+    runs, several = _run_scope(run_id)
+
+    def case_key(case):
+        return attempt_case_key(case) if several else case['case_id']
     proofs = {p.get('proof_id'): p for p in run_proofs if p.get('proof_id')}
     # Batch 08: the policy a confirmation was decided under travels on the finding
     # (Finding.header_fingerprint, set by the confirm path). AR-08a: it is also
@@ -338,7 +373,7 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
         proof = next((p for p in cache[case_id] if p.get('proof_id') == proof_id), None)
         if proof is None:
             reason = 'proof not found for case'
-        elif (proof.get('case') or {}).get('run_id') != run_id:
+        elif (proof.get('case') or {}).get('run_id') not in runs:
             reason = 'proof belongs to another run'
         elif (proof.get('case') or {}).get('case_id') != case_id:
             reason = 'proof belongs to another case'
@@ -354,16 +389,18 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
     # never a second execution (batch 08).
     first_attempt = {}
     for proof in sorted(proofs.values(), key=lambda p: (p.get('created_at') or 0, p.get('proof_id'))):
-        if (proof.get('case') or {}).get('run_id') == run_id and proof.get('executed')                 and proof.get('attack_artifact_id'):
+        if (proof.get('case') or {}).get('run_id') in runs and proof.get('executed')                 and proof.get('attack_artifact_id'):
             first_attempt.setdefault((proof['attack_artifact_id'], proof.get('baseline_artifact_id') or ''),
                                      proof['proof_id'])
     for proof_id, proof in sorted(proofs.items()):
         case = proof.get('case') or {}
-        if case.get('run_id') != run_id:
+        if case.get('run_id') not in runs:
             continue
         finding = referenced.get(proof_id)
         validator = proof.get('validator', '')
-        cls = ((finding or {}).get('vulnerability_class') or case.get('check_id') or validator).lower()
+        # The report's class (issues.issue_class), not the raw label: r9 grouped
+        # "info_disclosure" and "information_disclosure" on one origin as two issues.
+        cls = issue_class((finding or {}).get('vulnerability_class') or case.get('check_id') or validator)
         claimed = ('hardening' if validator in ('csp_validator', 'crypto_validator', 'verbose_error_validator',
                                                 'security_headers_validator', 'error_handling_validator',
                                                 'content_exposure_validator')
@@ -389,10 +426,10 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
             instance['reuses_attempt_of'] = original
         if finding:
             if tool_reported:
-                tool_reported_cases.add(case['case_id'])
+                tool_reported_cases.add(case_key(case))
                 instance['limitation'] = 'reported by an external tool; the harness did not reproduce it'
             else:
-                counted_cases.add(case['case_id'])
+                counted_cases.add(case_key(case))
             parts = urlsplit(finding.get('url') or '')
             origin = f'{parts.scheme}://{parts.hostname or ""}'
             if parts.port:
@@ -411,10 +448,11 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
             elif validator in ROUTE_INDEPENDENT_MECHANISMS and policy:
                 root = ('mechanism', validator, proof.get('validator_version') or '', policy)
             else:
-                root = case['case_id']
+                root = case_key(case)
             boundary = (case.get('principal_id', ''), case.get('parameter_location', ''),
                         case.get('parameter_name', ''), case.get('workflow_state_id', ''))
-            key = json.dumps([run_id, kind, cls, validator, origin, root, boundary], sort_keys=True)
+            scope = sorted(runs) if several else next(iter(runs))
+            key = json.dumps([scope, kind, cls, validator, origin, root, boundary], sort_keys=True)
             group = groups.setdefault(key, {'group_id': hashlib.sha256(key.encode()).hexdigest()[:20],
                           'kind': kind, 'vulnerability_class': cls, 'principal_id': boundary[0],
                           'proof_ids': [], 'case_ids': [], 'routes': [],
@@ -425,7 +463,7 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
             group['case_ids'] = sorted(set([*group['case_ids'], case['case_id']]))
             group['routes'] = sorted(set([*group['routes'], instance['route']]))
             if kind == 'candidate':
-                candidate_cases.add(case['case_id'])
+                candidate_cases.add(case_key(case))
                 instance['limitation'] = 'legacy, missing controls or unresolved exchange artifacts'
         instances.append(instance)
     counts = {kind: sum(g['kind'] == kind for g in groups.values())
@@ -434,7 +472,9 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
     orphans = [dict(e, repair='re-link the finding to a stored proof of this case and run, or re-run '
                               'its check; the link is not shown as proof') for e in excluded
                if e['reason'] in _ORPHAN_REASONS]
-    return {'schema_version': 1, 'run_id': run_id,
+    attempts = ({'run_id': list(run_id)[-1], 'attempt_run_ids': list(run_id)} if several
+                else {'run_id': next(iter(runs))})
+    return {'schema_version': 1, **attempts,
             'units': {'confirmed_issues': 'unique proof-bound cases (compatibility count)',
                       'vulnerabilities': 'distinct structured, artifact-resolved vulnerability groups',
                       'observations': 'presentation groups retaining route/principal proof instances',

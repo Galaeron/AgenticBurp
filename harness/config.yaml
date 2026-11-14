@@ -77,6 +77,22 @@ ollama:
   # call, or a list of model_stage labels (e.g. [iterative, critique]). The run
   # manifest records the setting under model_versions.think; the reasoning
   # trace is never parsed or stored, only its length.
+  #
+  # Backend keys, all left unset here (unset = Ollama, payload unchanged). Set
+  # them only in config.local.yaml:
+  # - api: "openai" sends every model call to an OpenAI-compatible server at
+  #   base_url instead (llama.cpp's llama-server; vLLM, LM Studio): POST
+  #   /v1/chat/completions with response_format json_object, GET /v1/models,
+  #   and llama-server's GET /props for the context window. Set num_ctx to the
+  #   server's per-slot window (-c divided by -np); it is not sent, only used by
+  #   the context guard and prompt_budget. `think` must stay unset with it.
+  # - reasoning_effort: low | medium | high, api "openai" only (gpt-oss reads it
+  #   from its chat template). Measured on gpt-oss-20b: low gives 24/24 valid
+  #   agent actions; medium often spends the reply on reasoning.
+  # - max_output_tokens: an integer cap on each reply (num_predict / max_tokens),
+  #   reasoning included. A reply that reaches it is discarded and counted as
+  #   output_capped, so a model stuck repeating itself fails fast instead of
+  #   running to timeout_seconds.
 
 # Context-window budget for agent and critique prompts (harness/prompt_budget.py).
 # The context is `ollama.num_ctx` when set, else `model_context_tokens` below;
@@ -401,14 +417,33 @@ engagement:
   coverage_request_reserve: 0
   investigation_seconds: 0
   coverage_drive_seconds: 0
+  # While coverage_drive_seconds bounds the drive, one check may spend at most this
+  # share of it on one endpoint (0.05 of a 4 h drive = 12 min), all identities
+  # together; access-control checks get the share once per identity. Variants left
+  # by the bound are reported as inconclusive (endpoint_check_time_share) and listed
+  # under coverage.endpoint_check_time_capped. A fraction from 0 to 1; 0 = no bound.
+  coverage_endpoint_check_share: 0.05
   # Phase time-slices of investigation_seconds (harness/phase_schedule.py). A map of
   # phase -> share for worklist, recrawl, capture_review and chain_rounds: each phase
   # gets its share of the time LEFT when it begins (time a phase leaves unused rolls
   # forward), so no phase holds the rest of the run. An explicit cap such as
-  # capture_review_seconds still applies. Empty, or investigation_seconds 0, keeps
-  # every phase's deadline as before. Example: {worklist: 4, recrawl: 1,
-  # capture_review: 2, chain_rounds: 2}.
+  # capture_review_seconds still applies. final_passes reserves a share for the
+  # passes after the chain rounds (second-order, coverage drive, server-error leads,
+  # retry rounds); without it the chain rounds get everything up to the deadline.
+  # Empty, or investigation_seconds 0, keeps every phase's deadline as before.
+  # Example: {worklist: 4, recrawl: 1, capture_review: 2, chain_rounds: 2,
+  # final_passes: 2}.
   phase_slices: {}
+  # Capture review beside the request-bound phases (harness/review_overlap.py). When
+  # the capture_review slice ends with captures left and a model reviews them, the
+  # review keeps going in the background while the chain rounds, second-order pass,
+  # coverage drive and server-error pass send their requests (r9: the model sat idle
+  # about 2 h through those passes), bounded by capture_review_seconds and
+  # investigation_seconds as before, and stops before the retry rounds. Its sends
+  # spend the same run request budget; with a coverage_request_reserve it stops when
+  # the drive starts. Inert without a capture_review slice; false runs the review
+  # inline, cut at its slice, as before.
+  review_overlap: true
   # Crawl once per registered principal (harness/role_crawl.crawl_roles_for) instead
   # of once per distinct role feature: two same-role users get two discovery sweeps,
   # two browser crawls and two feature crawls. DEFAULT OFF: it multiplies crawl traffic.
@@ -944,6 +979,47 @@ reporting:
   # measurement overlay (config.local.yaml or the runner's explicit config
   # dict) for blind/no-oracle evaluation.
   gate_uncorroborated_catchall: false
+  # HU-5: append the run handoff (phases not run, unreviewed captures, untouched
+  # worklist nodes, skipped legs) and the target change log (every non-read 2xx
+  # write and its restore status; a failed restore is flagged as an ERROR) to the
+  # Markdown report. Recording is always on and sends nothing; the artifacts live
+  # in runs.output_dir (<run_id>.handoff.json / .changes.json) and at
+  # GET /engagement/{host}/handoff. SHIPPED OFF so a default report is unchanged.
+  handoff_section: false
+  # HU-8: move scanner-equivalent classes (missing security headers, CSP, CORS,
+  # clickjacking, cookie flags, verbose errors, server banners, JWT header/alg
+  # hygiene -- harness/scanner_overlap.py) out of the main report into a counted
+  # appendix, and stop worklist nodes whose only findings are of those classes from
+  # taking agent-budget slots (skip reason `scanner_overlap`). A finding whose
+  # recorded proof shows impact (a credentialed CORS read, an accepted forged JWT)
+  # stays in the main report. SHIPPED OFF so a default report and sweep are unchanged.
+  scanner_overlap_appendix: false
+
+# HU-1: the operator access matrix (harness/access_matrix.py; GET/PUT
+# /engagement/{host}/access-matrix). The draft and the questions send nothing.
+# Saved operator answers are read only by the experiment cycle, which stays behind
+# engagement.experiments.enabled. report_section SHIPPED OFF so a default report
+# is byte-identical; max_questions_per_round caps each round of questions.
+access_matrix:
+  report_section: false
+  max_questions_per_round: 20
+
+# HU-3: the application map (harness/app_map.py; GET /engagement/{host}/map).
+# Built from the store with no model call and no traffic; model hypotheses are
+# labelled proposed. report_section SHIPPED OFF so a default report is unchanged.
+app_map:
+  report_section: false
+
+# HU-6: draft write-ups for proof-bound issues only (harness/writeups.py): impact,
+# redacted proof request/response, reproduction steps and remediation, all bound to
+# the recorded proof. export_markdown attaches one Markdown write-up per issue to the
+# issue export (export_issues_for_host); off = the export is unchanged.
+# model_phrasing lets the loopback model rephrase two sentences; a draft naming
+# anything absent from the proof falls back to the template. Both SHIPPED OFF.
+writeups:
+  export_markdown: false
+  model_phrasing: false
+  model: ""   # "" = agent_defaults.model
 
 # Cross-host pattern memory (harness/pattern_memory.py, P2.5). SAFE DEFAULT:
 # off. When enabled, a CONFIRMED finding's host-agnostic structural shape

@@ -144,11 +144,19 @@ class ValidatorTests(unittest.TestCase):
 
     # --- Phase 2.2 route-by-agent (producing-agent fallback) ------------------
     def _mislabelled_sqli(self) -> Finding:
-        # "sql_injection" is a real captured spelling that does NOT route by label
-        # (it is in the 2.1 baseline's missing set); the sqli agent is reliable.
-        return Finding(vulnerability_class="sql_injection", confidence=0.8,
+        # A label no table maps; the sqli agent is reliable. ("sql_injection", the
+        # 2.1 baseline's captured spelling, now routes by label: see below.)
+        return Finding(vulnerability_class="database_query_manipulation", confidence=0.8,
                        severity="high", summary="injection on id", evidence="id param",
                        suggested_test="probe id", basis="derived")
+
+    def test_a_snake_case_label_routes_by_label(self):
+        # r9: "sql_injection" read as no class and reached sqlmap only by the agent.
+        reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": True}})
+        f = Finding(vulnerability_class="sql_injection", confidence=0.8, severity="high",
+                    summary="injection on id", evidence="id param", suggested_test="probe id",
+                    basis="derived")
+        self.assertIn("sqlmap", {v.name for v in reg.for_finding(f, self.exchange)})
 
     def test_route_by_agent_recovers_a_mislabelled_finding(self):
         reg = ValidatorRegistry({"validators": {"enabled": True, "active_enabled": True}})

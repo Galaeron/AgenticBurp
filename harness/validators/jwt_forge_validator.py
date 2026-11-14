@@ -229,9 +229,13 @@ class JwtForgeValidator(Validator):
                                       if k.lower() in ("authorization", "cookie", "proxy-authorization")}
                 session_ref = "jwt-forge:" + hashlib.sha256(
                     repr(sorted(credential_headers.items())).encode()).hexdigest()[:16]
+                # A forged token is this check's own credential, never one of the
+                # run's identities (r9: cross_identity replayed every later IDOR
+                # check as each forged token: about 7k sends, every one answered 401).
                 self.run_context.sessions.register(
                     session_ref, session_ref, credential_headers,
-                    allowed_origins=[ScopePolicy.origin_of(url)], role="negative-control")
+                    allowed_origins=[ScopePolicy.origin_of(url)], role="negative-control",
+                    ephemeral=True)
                 request_headers = {k: v for k, v in headers.items()
                                    if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
                 outcome = await self.run_context.executor().execute(

@@ -369,13 +369,25 @@ async def execute_workflow(workflow: Workflow, run_context, *, initial_values=No
                 # Preserve dependency records: later normal steps are emitted as blocked.
                 continue
     finally:
+        from harness import run_handoff
         for cleanup_id in reversed(result.cleanup_registered):
             cleanup = by_id[cleanup_id]
-            sr = await run_step(cleanup, is_cleanup=True)
+            with run_handoff.restore_scope(f"{workflow.id}:{cleanup.id}"):
+                sr = await run_step(cleanup, is_cleanup=True)
             result.steps.append(sr)
             statuses[cleanup.id] = sr.status
             if sr.status == StepStatus.CLEANED:
                 result.cleanup_completed.append(cleanup.id)
+            # HU-5: the writes this cleanup undoes are restored, or loudly not.
+            undone = [s.artifact_id for s in result.steps
+                      if s.step_id in cleanup.prerequisites and s.status == StepStatus.PASSED]
+            run_handoff.mark_restore(
+                run_context, undone,
+                ok=(sr.status == StepStatus.CLEANED
+                    and (sr.status_code is None or 200 <= sr.status_code < 300)),
+                detail=(f"cleanup {cleanup.id}: {sr.status.value}"
+                        + (f" ({sr.reason})" if sr.reason else "")
+                        + (f" HTTP {sr.status_code}" if sr.status_code is not None else "")))
     return result
 
 

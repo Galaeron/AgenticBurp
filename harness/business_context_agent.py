@@ -124,14 +124,10 @@ def _value_flow_kind(param: str) -> str | None:
 
 
 def _singular(noun: str) -> str:
-    n = (noun or "").lower()
-    if n.endswith("ies") and len(n) > 3:
-        return n[:-3] + "y"
-    if n.endswith("ses") and len(n) > 3:
-        return n[:-2]
-    if n.endswith("s") and not n.endswith("ss") and len(n) > 1:
-        return n[:-1]
-    return n
+    """Lower-case singular (the shared rule in harness.naming, so object names
+    agree with the access matrix and the self-observed ownership facts)."""
+    from harness.naming import singular
+    return singular((noun or "").lower())
 
 
 def _primary_noun(path: str) -> str | None:

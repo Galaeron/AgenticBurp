@@ -185,6 +185,22 @@ class PathTraversalValidator(Validator):
         except Exception:
             return True
 
+    def _write_allowance(self, finding: Finding, method: str) -> int | None:
+        """How many more mutating sends the run gate allows this leg's finding
+        (R16), or None when its sends are not counted (a safe method, no finding
+        id, no run gate, or an accounting the gate cannot answer: then the ceiling
+        cut below still ends the leg at the first refusal)."""
+        finding_id = getattr(finding, "finding_id", "") or ""
+        if not finding_id or self.run_context is None:
+            return None
+        try:
+            gate = self.run_context.gate
+            if gate.classify(method) != ActionRiskTier.MUTATING:
+                return None
+            return gate.mutating_headroom(finding_id, self.name)[0]
+        except Exception:
+            return None
+
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
         if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
@@ -211,7 +227,25 @@ class PathTraversalValidator(Validator):
         # the per-finding mutating ceiling (R16) once it is spent: the gate would
         # refuse every remaining payload alike. A probe that never answered is
         # not part of a negative.
-        planned = len(targets) * len(_PREFIXES) * len(_TARGETS)
+        plan = [(loc, param, prefix, target) for loc, param in targets
+                for prefix in _PREFIXES for target in _TARGETS]
+        planned = len(plan)
+        # r9: a write request with several inputs planned up to 7 x 16 payloads
+        # against a per-finding ceiling of 20; 203 legs sent until the gate refused
+        # and stopped, most inputs never tried. A leg the ceiling cannot cover sends
+        # every input's strongest encodings first, stops while the gate still has
+        # the allowance it read (a payload no transport can send costs none of it)
+        # and says the check is partial; with nothing left it sends nothing.
+        allowance = self._write_allowance(finding, method)
+        limited = allowance is not None and allowance < planned
+        if limited:
+            if allowance == 0:
+                return self._skip("path-traversal replay declined: this finding's mutating-request "
+                                  "ceiling (R16) is spent; nothing sent")
+            rank = {p: i for i, p in enumerate(_PREFIXES)}
+            files = {t: i for i, t in enumerate(_TARGETS)}
+            plan = sorted(plan, key=lambda step: (rank[step[2]], files[step[3]]))
+        stepped = 0
         # Under a per-parameter dispatch, the one input this leg was bound to.
         tested = tested_inputs(finding, targets)
         points = ", ".join("the path segment" if loc == _PATHSEG else f"{loc} parameter {param!r}"
@@ -226,78 +260,78 @@ class PathTraversalValidator(Validator):
         # a probe confirms only with a signature match the baseline lacks.
         baseline = {t: set(m.findall(exchange.response_body or "")) for t, m in _TARGETS.items()}
         baseline_echoes = 0
-        for loc, param in targets:
+        for loc, param, prefix, target in plan:
             if refused:
                 break
-            for prefix in _PREFIXES:
-                if refused:
-                    break
-                for target, marker in _TARGETS.items():
-                    url, body = self._mutated(exchange, loc, param, prefix + target)
-                    label = f"{'path segment' if loc == _PATHSEG else param} <- {prefix + target}"
-                    try:
-                        if self.run_context is not None:
-                            from harness.run_context import TypedRequest
-                            outcome = await self.run_context.executor().execute(
-                                TypedRequest(method, url, headers=request_headers,
-                                             body=body or None),
-                                capability=self.name, session_ref=session_ref,
-                                case_ref=finding.finding_id or "", max_redirects=0)
-                            if not outcome.executed:
-                                ceiling_cut = (outcome.outcome == "blocked"
-                                               and self._ceiling_spent(finding, method))
-                                if outcome.outcome in ("out_of_scope", "blocked") and not ceiling_cut:
-                                    unsendable.append(f"{label}: {outcome.outcome}")
-                                    continue
-                                why = getattr(outcome, "error", "") or ""
-                                refused = (f"path-traversal replay declined: {outcome.outcome}"
-                                           + (f" ({why})" if why else ""))
-                                break
-                            if not outcome.ok:
-                                art = getattr(outcome, "artifact", None)
-                                errors.append(f"{label}: "
-                                              f"{getattr(art, 'transport_outcome', '') or outcome.error}")
-                                continue
-                            text = outcome.body or ""
-                        else:
-                            await global_throttle.acquire()
-                            async with GatedAsyncClient(get_default_gate(), self.name,
-                                                        timeout=self.timeout,
-                                                        follow_redirects=False,
-                                                        verify=False) as client:
-                                resp = await client.request(
-                                    method, url, headers=headers or None,
-                                    content=body or None)
-                            text = resp.text
-                    except SafetyGateBlocked as blocked:
-                        # One probe URL the gate refuses must not abort the whole leg
-                        # and be mislabelled a mutating-replay denial. A traversal
-                        # payload can produce a URL the scope lock cannot validate
-                        # (e.g. backslash path segments), which fails closed as
-                        # out-of-scope: skip that payload and try the rest. A genuine
-                        # mutating-replay denial still terminates -- nothing more can send.
-                        if blocked.decision.tier == ActionRiskTier.OUT_OF_SCOPE:
-                            unsendable.append(f"{label}: out_of_scope")
+            if limited and self._write_allowance(finding, method) == 0:
+                break
+            stepped += 1
+            marker = _TARGETS[target]
+            url, body = self._mutated(exchange, loc, param, prefix + target)
+            label = f"{'path segment' if loc == _PATHSEG else param} <- {prefix + target}"
+            try:
+                if self.run_context is not None:
+                    from harness.run_context import TypedRequest
+                    outcome = await self.run_context.executor().execute(
+                        TypedRequest(method, url, headers=request_headers,
+                                     body=body or None),
+                        capability=self.name, session_ref=session_ref,
+                        case_ref=finding.finding_id or "", max_redirects=0)
+                    if not outcome.executed:
+                        ceiling_cut = (outcome.outcome == "blocked"
+                                       and self._ceiling_spent(finding, method))
+                        if outcome.outcome in ("out_of_scope", "blocked") and not ceiling_cut:
+                            unsendable.append(f"{label}: {outcome.outcome}")
                             continue
-                        refused = (f"path-traversal replay not authorized by the safety gate "
-                                   f"({blocked.decision.reason})")
+                        why = getattr(outcome, "error", "") or ""
+                        refused = (f"path-traversal replay declined: {outcome.outcome}"
+                                   + (f" ({why})" if why else ""))
                         break
-                    except httpx.HTTPError as e:
-                        errors.append(f"{label}: {e.__class__.__name__}")
+                    if not outcome.ok:
+                        art = getattr(outcome, "artifact", None)
+                        errors.append(f"{label}: "
+                                      f"{getattr(art, 'transport_outcome', '') or outcome.error}")
                         continue
-                    answered += 1
-                    found = set(marker.findall(text))
-                    if found and not found - baseline[target]:
-                        baseline_echoes += 1
-                    elif found:
-                        where = "path segment" if loc == _PATHSEG else f"{loc} parameter {param!r}"
-                        return ValidationResult(
-                            self.name, "confirmed", "path_traversal", confidence=0.95, confirmed=True,
-                            summary=f"Path traversal confirmed: the {where} read an arbitrary file "
-                                    f"outside the intended directory.",
-                            evidence=f"Injected `{prefix + target}` into the {where}; the response contained "
-                                     f"the canonical contents of {target} (matched /{marker.pattern}/).",
-                            tested_parameters=tested)
+                    text = outcome.body or ""
+                else:
+                    await global_throttle.acquire()
+                    async with GatedAsyncClient(get_default_gate(), self.name,
+                                                timeout=self.timeout,
+                                                follow_redirects=False,
+                                                verify=False) as client:
+                        resp = await client.request(
+                            method, url, headers=headers or None,
+                            content=body or None)
+                    text = resp.text
+            except SafetyGateBlocked as blocked:
+                # One probe URL the gate refuses must not abort the whole leg
+                # and be mislabelled a mutating-replay denial. A traversal
+                # payload can produce a URL the scope lock cannot validate
+                # (e.g. backslash path segments), which fails closed as
+                # out-of-scope: skip that payload and try the rest. A genuine
+                # mutating-replay denial still terminates -- nothing more can send.
+                if blocked.decision.tier == ActionRiskTier.OUT_OF_SCOPE:
+                    unsendable.append(f"{label}: out_of_scope")
+                    continue
+                refused = (f"path-traversal replay not authorized by the safety gate "
+                           f"({blocked.decision.reason})")
+                break
+            except httpx.HTTPError as e:
+                errors.append(f"{label}: {e.__class__.__name__}")
+                continue
+            answered += 1
+            found = set(marker.findall(text))
+            if found and not found - baseline[target]:
+                baseline_echoes += 1
+            elif found:
+                where = "path segment" if loc == _PATHSEG else f"{loc} parameter {param!r}"
+                return ValidationResult(
+                    self.name, "confirmed", "path_traversal", confidence=0.95, confirmed=True,
+                    summary=f"Path traversal confirmed: the {where} read an arbitrary file "
+                            f"outside the intended directory.",
+                    evidence=f"Injected `{prefix + target}` into the {where}; the response contained "
+                             f"the canonical contents of {target} (matched /{marker.pattern}/).",
+                    tested_parameters=tested)
         if not answered and not errors:
             # Nothing reached the target: a declined leg, as before.
             return self._skip(refused or f"path-traversal replay declined: every payload was "
@@ -316,6 +350,14 @@ class PathTraversalValidator(Validator):
         if baseline_echoes:
             skipped += (f" {baseline_echoes} response(s) carried only file signatures the captured "
                         f"baseline already shows, which is not a read the payload caused.")
+        if limited and stepped < planned:
+            return ValidationResult(
+                self.name, "inconclusive", "path_traversal", confidence=0.0, confirmed=False,
+                summary=f"Path-traversal check partial: this finding's mutating-request ceiling "
+                        f"(R16) left room for {stepped} of {planned} probe(s); not a negative result",
+                evidence=f"{answered} answered probe(s) across {points}, the strongest encodings "
+                         f"first, returned no system-file contents.{skipped}",
+                tested_parameters=tested)
         return ValidationResult(
             self.name, "not_confirmed", "path_traversal", confidence=0.0, confirmed=False,
             summary="No system-file contents returned -- traversal appears blocked or not a file read",

@@ -40,6 +40,17 @@ def _field_cap(value) -> int:
     return value
 
 
+def _share(value) -> float:
+    """engagement.coverage_endpoint_check_share: a fraction from 0 to 1 (no bool)."""
+    if isinstance(value, bool):
+        raise ValueError(f"engagement.coverage_endpoint_check_share must be a number, got {value!r}")
+    share = float(value)
+    if not 0 <= share <= 1:
+        raise ValueError("engagement.coverage_endpoint_check_share must be between 0 and 1, "
+                         f"got {value!r}")
+    return share
+
+
 @dataclass(frozen=True)
 class EngagementPolicy:
     """Active/engagement toggles read by Orchestrator.__init__.
@@ -83,6 +94,10 @@ class EngagementPolicy:
     coverage_request_reserve: int = 0
     investigation_seconds: float = 0.0
     coverage_drive_seconds: float = 0.0
+    # The share of coverage_drive_seconds one check may spend on one endpoint
+    # (all identities together; access-control checks per identity). Applies only
+    # while the drive is time-bound; 0 = no per-endpoint bound.
+    coverage_endpoint_check_share: float = 0.05
 
     @classmethod
     def from_config(cls, config: dict) -> "EngagementPolicy":
@@ -117,6 +132,7 @@ class EngagementPolicy:
             coverage_request_reserve=int(eng_cfg.get("coverage_request_reserve", 0)),
             investigation_seconds=float(eng_cfg.get("investigation_seconds", 0)),
             coverage_drive_seconds=float(eng_cfg.get("coverage_drive_seconds", 0)),
+            coverage_endpoint_check_share=_share(eng_cfg.get("coverage_endpoint_check_share", 0.05)),
         )
 
     def as_dict(self) -> dict:

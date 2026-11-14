@@ -382,7 +382,8 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
                               generic_confidence_floor: float = 0.5,
                               gate_uncorroborated_catchall: bool = False,
                               engagement_id: str | None = None,
-                              captured_principal: str | None = None) -> str:
+                              captured_principal: str | None = None,
+                              scanner_overlap_appendix: bool = False) -> str:
     """
     Build a submission-ready Markdown report from store.all_host_findings()
     -shaped dicts (or anything with the same keys). Chain hypotheses
@@ -423,6 +424,13 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     verification instead. SHIPPED OFF (False) so a fully-confirmed run, and
     any run that doesn't opt in, is byte-for-byte unaffected. Deliberately
     narrow -- never a global leg requirement; every other class is untouched.
+
+    `scanner_overlap_appendix` (HU-8): when True, scanner-equivalent findings
+    (scanner_overlap.SCANNER_OVERLAP_CLASSES: headers, CSP, CORS, framing, cookie
+    flags, verbose errors, banners, JWT header hygiene) leave the main sections for
+    a counted appendix at the end, unless a recorded proof shows impact
+    (scanner_overlap.is_proven_exception, e.g. a credentialed CORS read). Nothing
+    is dropped. SHIPPED OFF (False): the report is byte-for-byte unchanged.
     """
     from harness.confirmation_gate import (
         should_quarantine_as_lead, is_low_confidence_generic_guess,
@@ -449,8 +457,13 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     # unchanged output.
     leads_bucket: list = []
     individual: list = []
+    # HU-8: scanner-equivalent findings, routed before the lead gates so an item
+    # is counted in exactly one place. Empty unless the option is on.
+    appendix: list = []
     for raw, f in individual_pairs:
-        if quarantine_leads and should_quarantine_as_lead(raw):
+        if scanner_overlap_appendix and _routes_to_scanner_appendix(raw):
+            appendix.append(f)
+        elif quarantine_leads and should_quarantine_as_lead(raw):
             leads_bucket.append(f)
         elif gate_low_confidence_generic and is_low_confidence_generic_guess(raw, generic_confidence_floor):
             leads_bucket.append(f)
@@ -513,9 +526,11 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
                    if leads_bucket else "")
     _tool_note = (f"**{len(tool_reported)} tool-reported finding(s) not reproduced by the harness**, "
                   if tool_reported else "")
+    _appendix_note = (f", **{len(appendix)} scanner-equivalent item(s) in the appendix**"
+                      if appendix else "")
     lines.append(f"**{len(confirmed)} confirmed finding(s)**, {_tool_note}"
                  f"**{len(unconfirmed)} unconfirmed finding(s)**, "
-                 f"**{len(chains)} potential attack chain(s)**{_leads_note}.")
+                 f"**{len(chains)} potential attack chain(s)**{_leads_note}{_appendix_note}.")
     if collapsed_count:
         lines.append("")
         lines.append(f"*{collapsed_count} duplicate finding(s) were collapsed* -- the same class proven or "
@@ -623,12 +638,77 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
         for f in leads_bucket:
             lines.extend(_render_finding(f, recon_map))
 
-    if not individual and not chains and not leads_bucket:
+    if not individual and not chains and not leads_bucket and not appendix:
         lines.append("_No findings recorded for this host._")
         lines.append("")
 
+    if appendix:
+        lines.extend(_render_scanner_appendix(appendix))
+
     # Include metadata/headlines and chain sections in the shared export policy.
     return security.sanitize_text("\n".join(lines))
+
+
+# HU-8: the export tag (issue `report_section`, SARIF `reportSection`) of an item
+# the report moves to its scanner-equivalent appendix.
+SCANNER_APPENDIX_SECTION = "scanner_overlap_appendix"
+
+
+def _routes_to_scanner_appendix(raw: dict) -> bool:
+    """HU-8: scanner_overlap.routes_to_appendix for a store row. A confirmed CORS
+    row with a case also reads its confirmed proofs' observed_result, where the
+    CORS leg records a credentialed grant when the row kept the agent's evidence."""
+    from harness import scanner_overlap
+    if scanner_overlap.overlap_class(raw) is None:
+        return False
+    proof_texts: list[str] = []
+    if (raw.get("confirmed") and raw.get("case_id")
+            and scanner_overlap.overlap_class(raw) == "cors"):
+        try:
+            from harness import store
+            proof_texts = [p.get("observed_result") or "" for p in store.proofs_for_case(raw["case_id"])
+                           if p.get("verdict") == "confirmed"]
+        except Exception:
+            proof_texts = []
+    return scanner_overlap.routes_to_appendix(raw, proof_texts)
+
+
+_SCANNER_APPENDIX_LIST_CAP = 100
+
+
+def _render_scanner_appendix(appendix: list[ReportFinding]) -> list[str]:
+    """HU-8: per-class counts plus one compact line per collapsed item."""
+    from harness import issues, scanner_overlap
+    by_class: dict[str, list[ReportFinding]] = {}
+    for f in appendix:
+        by_class.setdefault(scanner_overlap.overlap_class(
+            {"vulnerability_class": f.vulnerability_class, "summary": f.summary,
+             "validator": f.validator}) or "other", []).append(f)
+    order = list(scanner_overlap.SCANNER_OVERLAP_CLASSES) + ["other"]
+    out = ["## Appendix: Scanner-Equivalent Findings", "",
+           f"_{len(appendix)} finding(s) of classes a passive scanner (such as Burp Scanner) also "
+           "reports were moved here from the sections above. A finding whose recorded proof shows "
+           "impact (for example a credentialed CORS read) stays in the main report._", "",
+           "| Class | Findings | Confirmed |", "|---|---|---|"]
+    for cls in order:
+        rows = by_class.get(cls)
+        if rows:
+            out.append(f"| {scanner_overlap.SCANNER_OVERLAP_LABELS.get(cls, 'Other')} | {len(rows)} | "
+                       f"{sum(1 for f in rows if f.confirmed)} |")
+    out.append("")
+    collapsed, _ = _collapse_duplicates(list(appendix))
+    collapsed.sort(key=lambda f: (_SEVERITY_ORDER.get(f.severity, 99), -f.confidence))
+    for f in collapsed[:_SCANNER_APPENDIX_LIST_CAP]:
+        where = f"{f.method + ' ' if f.method else ''}{issues.redact_url(f.url)}"
+        times = f" (x{f.duplicate_count})" if f.duplicate_count > 1 else ""
+        state = "confirmed" if f.confirmed else "unconfirmed"
+        summary = issues.redact(" ".join((f.summary or "").split()))[:160]
+        out.append(f"- `{where}` -- {f.vulnerability_class} -- {f.severity}, {state}{times}"
+                   + (f" -- {summary}" if summary else ""))
+    if len(collapsed) > _SCANNER_APPENDIX_LIST_CAP:
+        out.append(f"- ... and {len(collapsed) - _SCANNER_APPENDIX_LIST_CAP} more")
+    out.append("")
+    return out
 
 
 _STATE_BADGE = {
@@ -720,14 +800,11 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
         lines.append("```")
         lines.append("")
     # Weakness #5: keep the reproduction field ACTUAL reproduction, not remediation.
-    if suggested_test and not _looks_like_remediation(suggested_test):
-        lines.append(f"**Steps to reproduce:** {suggested_test}")
-        lines.append("")
-    elif evidence:
-        lines.append("**Steps to reproduce:** replay the exact captured request/response shown in the "
-                     "Evidence block above, as the identity/session it was captured under, and compare "
-                     "the actual result against a secure baseline.")
-        lines.append("")
+    # HU-2 (c): the ledger's reproduction recipe when it recorded a send, else an
+    # explicit "no reproducible request recorded" -- never a generic replay hint.
+    from harness import leads
+    lines.extend(leads.report_repro_lines(
+        f.finding_id, suggested_test if suggested_test and not _looks_like_remediation(suggested_test) else ""))
     # A remediation-shaped suggested_test is surfaced as a fix note, never as repro.
     if suggested_test and _looks_like_remediation(suggested_test):
         lines.append(f"**Fix note (from the detector):** {suggested_test}")
@@ -810,7 +887,7 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
     suppressed_count = len(all_including_suppressed) - len(findings)
     host = store.host_of(url)
     reporting = (config or {}).get("reporting") or {}
-    return generate_markdown_report(
+    report = generate_markdown_report(
         host, findings, effort_ledger=effort_ledger, suppressed_count=suppressed_count,
         quarantine_leads=bool(reporting.get("quarantine_unverified_leads", False)),
         gate_low_confidence_generic=bool(reporting.get("gate_low_confidence_generic", False)),
@@ -818,7 +895,14 @@ def generate_report_for_host(url: str, effort_ledger: EffortLedger | None = None
         gate_uncorroborated_catchall=bool(reporting.get("gate_uncorroborated_catchall", False)),
         engagement_id=engagement_id,
         captured_principal=captured_principal,
+        scanner_overlap_appendix=bool(reporting.get("scanner_overlap_appendix", False)),
     )
+    from harness import access_matrix, app_map, run_handoff
+    # HU-1 / HU-5 / HU-3: each section is "" unless its report option is on.
+    return (report
+            + access_matrix.report_section(host, config=config, engagement_id=engagement_id)
+            + run_handoff.report_section(host, config)
+            + app_map.report_section(host, config=config, engagement_id=engagement_id))
 
 
 def issue_exports(findings: list[dict], proofs_by_case: dict | None = None,
@@ -892,18 +976,38 @@ def export_issues_for_host(url: str, *, config: dict | None = None, engagement_i
     findings = store.all_host_findings(url, engagement_id=engagement_id, captured_principal=captured_principal,
                                        include_chains=True)
     reporting = (config or {}).get("reporting") or {}
+    # HU-8: the Markdown report moves scanner-equivalent rows to its appendix
+    # before the lead gates; the export makes the same split. Appendix rows are
+    # grouped on their own and tagged (report_section), so every issue sits
+    # wholly in the section its rows sit in on the report.
+    appendix_rows: list = []
+    if bool(reporting.get("scanner_overlap_appendix", False)):
+        routed = [_routes_to_scanner_appendix(f) for f in findings]
+        appendix_rows = [f for f, moved in zip(findings, routed) if moved]
+        findings = [f for f, moved in zip(findings, routed) if not moved]
     if reporting:
         findings = [f for f in findings if not _demoted_by_reporting_gates(f, reporting)]
     proofs_by_case: dict = {}
-    for f in findings:
+    for f in findings + appendix_rows:
         cid = f.get("case_id")
         if cid and cid not in proofs_by_case:
             attempts = store.proofs_for_case(cid)   # every recorded attempt, append-only
             if engagement_id:
-                owned_runs = {row.get("run_id") for row in findings if row.get("case_id") == cid}
+                owned_runs = {row.get("run_id") for row in findings + appendix_rows
+                              if row.get("case_id") == cid}
                 attempts = [attempt for attempt in attempts if attempt.get("run_id") in owned_runs]
             if attempts:
                 proofs_by_case[cid] = attempts
     # Legacy host-wide overrides have no engagement authority.
     merges = store.all_issue_merges(store.host_of(url)) if not engagement_id else {}
-    return issue_exports(findings, proofs_by_case=proofs_by_case, merges=merges)
+    from harness import writeups   # HU-6: no-op unless writeups.export_markdown is on
+    exports = issue_exports(findings, proofs_by_case=proofs_by_case, merges=merges)
+    if appendix_rows:
+        from harness import scanner_overlap
+        for exp in issue_exports(appendix_rows, proofs_by_case=proofs_by_case, merges=merges):
+            exp["report_section"] = SCANNER_APPENDIX_SECTION
+            exp["scanner_overlap_class"] = scanner_overlap.overlap_class(exp) or "other"
+            exports.append(exp)
+    return writeups.attach_to_exports(exports,
+                                      proofs_by_case, config=config, engagement_id=engagement_id,
+                                      captured_principal=captured_principal)

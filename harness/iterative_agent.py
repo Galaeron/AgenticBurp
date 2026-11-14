@@ -42,7 +42,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx  # noqa: F401 -- HTTP transport site; sends now go via run_context.TargetTransport
 
 from harness import circuit_breaker, global_throttle
-from harness.models import Finding, HttpExchange, sanitize_agent_finding
+from harness.models import Finding, HttpExchange, request_body_is_placeholder, sanitize_agent_finding
 from harness.ollama_client import OllamaInvalidJSONError, OllamaTransientError
 from harness.safety_gate import get_default_gate
 from harness.security import SECRET_HEADER_NAMES  # the one classifier behind redact_headers
@@ -831,6 +831,11 @@ class IterativeAgent:
             f"{_excerpt(exchange.response_body or '', _RESP_HEAD_CHARS)}",
             f"MUTABLE PARAMETERS: {json.dumps(self._mutable_params(exchange))}",
         ]
+        if request_body_is_placeholder(exchange):
+            history.append(
+                "NOTE: the captured request body is a placeholder the harness guessed; its "
+                "body parameters are not known inputs of this endpoint, so a result on them "
+                "says nothing about the endpoint's real parameters.")
 
         for step in range(1, budget + 1):
             if consecutive_no_progress >= 3:

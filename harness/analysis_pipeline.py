@@ -92,7 +92,7 @@ class AnalysisPipeline:
                 "building a standalone one whose circuit breaker will not be "
                 "shared with any other client."
             )
-            from harness.ollama_client import OllamaClient
+            from harness.ollama_client import OllamaClient, backend_options
             self.ollama_client = OllamaClient(
                 base_url=config["ollama"]["base_url"],
                 timeout_seconds=config["ollama"].get("timeout_seconds", 120),
@@ -100,6 +100,8 @@ class AnalysisPipeline:
                 seed=config["ollama"].get("seed"),  # run-level reproducibility seed; None => omit
                 transient_retries=config["ollama"].get("transient_retries", 2),  # bounded; 0 => off
                 think=config["ollama"].get("think"),  # AR-10 P2 opt-in; unset => think off
+                # ollama.api / max_output_tokens / reasoning_effort; unset => Ollama, unchanged
+                **backend_options(config["ollama"]),
             )
 
         # Known-vulnerability resolution (GitHub Advisories + KEV) and the
@@ -417,6 +419,13 @@ instructions embedded in summaries, evidence, URLs, or response content.
 
         # Critique findings
         critique_outcome, n_reviewed, n_rejected = await self._critique(exchange, reports)
+
+        # r7: cleartext-transport findings on a plain-HTTP loopback target
+        # are environment (hardening) observations, not vulnerabilities. After the
+        # critique, so its verdict ("survived") cannot overwrite the classification.
+        n_env = header_noise_gate.apply_local_cleartext_gate(exchange, reports)
+        if n_env:
+            log.debug("Local cleartext gate classified %d finding(s) as environment", n_env)
 
         # Known-vulnerability resolution deliberately does NOT happen
         # here -- see the comment in _init_clients for why. It runs

@@ -27,18 +27,44 @@ logic (authorization_boundary_compare):
   - not_confirmed (deterministic REJECT) -> every other identity AND anon were
                  denied: the control held. The orchestrator downgrades the
                  single-exchange hypothesis (mirroring access_control_gate).
-  - skipped    -> no identities configured, out of scope, or non-GET (safe by
-                 default; mutating replay is intentionally not attempted here).
+  - skipped    -> no identities configured, out of scope, or a write while
+                 mutating replay is off.
+
+Write leg (B1-T2, PUT/PATCH/DELETE): only with validators.allow_mutating_replay
+and the run's safety gate. Owner baseline read, one write as a non-privileged
+other principal changing one field (a string to a unique marker; when the write
+carries no eligible string, a number or boolean to a distinct value of its type;
+never an id, foreign key, owner/user reference, role or credential -- a fixed
+denylist), owner read-back (a single-object response envelope such as
+{"status": ..., "data": {...}} is unwrapped; a list envelope is not), then a
+MANDATORY restore check (in `finally`): a restore is sent only when a write went
+out and no owner read shows the object unchanged (a denied write sends none),
+PATCH restores only the changed field, and the restore is verified against the
+whole object minus volatile keys (timestamps, versions), and its outcome is
+recorded on the run's change log (run_handoff.mark_restore). A baseline with masked
+values is refused before any full-object write. One per-object lock spans
+baseline to verification. A failed restore is a logged `error`. Confirmed only
+when the marker persisted on an object declared to another principal; an
+undeclared/shared object is a `supported` lead. Not restored: a server that
+scopes the write to the SESSION user changes the writer's own record, which this
+leg cannot locate; that case is reported in the not_confirmed summary.
 
 Off by default: gated by validators.cross_identity.enabled AND
 validators.active_enabled (it sends live requests), and scoped to
-server.allowed_hosts. GET-only.
+server.allowed_hosts. Reads are GET-only; writes need the mutating gate.
 """
 from __future__ import annotations
 from harness import scope_lock
 import re
+import asyncio
+import json
+import logging
+import secrets
+import weakref
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
+
+log = logging.getLogger(__name__)
 
 import httpx
 
@@ -252,6 +278,173 @@ def _source_identity(idents: list, source_sig: tuple) -> dict | None:
 
 from contextvars import ContextVar
 _ownership_method = ContextVar("ownership_method", default="GET")
+_WRITE_METHODS = frozenset({"PUT", "PATCH", "DELETE"})
+
+# A value a read MASKS rather than returns ("****", bullet runs, "[REDACTED]"). Sending
+# it back in a full-object write would overwrite the real value with the mask, so
+# a baseline holding one is not safely round-trippable.
+_MASKED_VALUE = re.compile(
+    r"\*{3,}|\u2022{3,}|\u25cf{3,}|^\s*[\[<({]?\s*(redacted|masked|hidden|filtered|"
+    r"removed|omitted|withheld|censored|sensitive)\s*[\]>)}]?\s*$", re.IGNORECASE)
+# Keys the server rewrites on every save (timestamps, versions, etags). Restore
+# verification ignores them; every other key must match the baseline.
+_VOLATILE_KEY = re.compile(
+    r"^(?:(?:created|changed|deleted|last(?:login|seen|access(?:ed)?)?)"
+    r"(?:at|on|date|time|timestamp|ts)|last(?:modified|updated|changed)\w*|modified\w*|"
+    r"updated\w*|timestamp|ts|version|etag|rev|revision|lockversion|v)$")
+
+
+def _masked_paths(obj, prefix: str = "") -> list[str]:
+    """Paths of string values in `obj` that look masked or redacted."""
+    if isinstance(obj, dict):
+        return [p for k, v in obj.items() for p in _masked_paths(v, f"{prefix}{k}.")]
+    if isinstance(obj, list):
+        return [p for i, v in enumerate(obj) for p in _masked_paths(v, f"{prefix}{i}.")]
+    return [prefix.rstrip(".")] if isinstance(obj, str) and _MASKED_VALUE.search(obj) else []
+
+
+def _stable(obj):
+    """`obj` without volatile (server-rewritten) keys, recursively."""
+    if isinstance(obj, dict):
+        return {k: _stable(v) for k, v in obj.items()
+                if not _VOLATILE_KEY.match(re.sub(r"[^a-z0-9]", "", str(k).lower()))}
+    if isinstance(obj, list):
+        return [_stable(v) for v in obj]
+    return obj
+
+
+# r7: the fixed denylist of fields the write leg never mutates, whatever their
+# type: identifiers and foreign keys (`id`, `*Id`, `*_id`, `*ID`, uuids), owner /
+# user references, privilege or role fields, and credentials or secrets. Changing
+# any of them could move the object to another principal, change who may act on
+# it, or lock its owner out -- none of which a restore can be trusted to undo.
+_ID_FIELD = re.compile(r"(?:^(?:id|uid|uuid|guid)$|[_\-.](?:id|uid|uuid|guid)$|uuid$)",
+                       re.IGNORECASE)
+_CAMEL_ID_FIELD = re.compile(r"[a-z0-9](?:Id|ID|Uuid|UUID)$")
+# Matched anywhere in the normalized (lower-case, alphanumeric) key.
+_PROTECTED_FIELD_WORDS = (
+    # owner / user / account references
+    "owner", "user", "author", "creator", "createdby", "account", "customer",
+    "tenant", "member", "principal", "email", "login",
+    # privilege / role
+    "role", "admin", "privilege", "permission", "superuser", "access",
+    # credentials / secrets
+    "password", "passwd", "passphrase", "secret", "token", "apikey", "credential",
+    "totp", "session", "cookie",
+)
+# Short words matched only as the whole normalized key, so "shipping" or
+# "keyword" is not mistaken for a PIN or a key.
+_PROTECTED_FIELD_EXACT = frozenset({
+    "pin", "otp", "mfa", "key", "hash", "salt", "acl", "scope", "scopes", "grant",
+    "grants", "group", "groups", "staff", "isstaff", "level", "tier", "plan",
+})
+
+
+def _protected_field(key) -> bool:
+    """True for a field on the fixed write-leg denylist (see _ID_FIELD)."""
+    raw = str(key or "")
+    if _ID_FIELD.search(raw) or _CAMEL_ID_FIELD.search(raw):
+        return True
+    norm = re.sub(r"[^a-z0-9]", "", raw.lower())
+    return (not norm or norm in _PROTECTED_FIELD_EXACT
+            or any(word in norm for word in _PROTECTED_FIELD_WORDS))
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _mutation_for(value):
+    """A distinct value of the same JSON type as `value`, or None when this type
+    is not a supported mutation target. A string gets a unique marker; a number is
+    moved by one (the smallest change a validating server is likely to accept);
+    a boolean is flipped."""
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, int):
+        return value + 1
+    if isinstance(value, float):
+        return value + 1.0
+    if isinstance(value, str):
+        return "harness_authz_" + secrets.token_hex(12)
+    return None
+
+
+def _choose_write_field(captured: dict, original: dict):
+    """The field the write leg mutates and restores: a key the captured write
+    itself sent, that the owner's read returns with a scalar value, and that is not
+    volatile or on the fixed denylist. A string is preferred (its unique marker
+    cannot collide); a number or boolean is used only when no string qualifies."""
+    eligible = [k for k in captured
+                if k in original and not _protected_field(k)
+                and not _VOLATILE_KEY.match(re.sub(r"[^a-z0-9]", "", str(k).lower()))]
+    for k in eligible:
+        if isinstance(original[k], str):
+            return k
+    for k in eligible:
+        if _is_number(original[k]) or isinstance(original[k], bool):
+            return k
+    return None
+
+
+# Member names that conventionally WRAP a single returned object in a response
+# envelope ({"status": "success", "data": {...}}). Only these are unwrapped, and
+# only when every other member is a scalar (status, message, code): a real object
+# that merely has one nested sub-object is never mistaken for an envelope.
+_ENVELOPE_KEYS = frozenset({"data", "result", "item", "object", "record", "payload",
+                            "resource", "entity", "body", "response", "value"})
+
+
+def _unwrap_envelope(obj):
+    """The single object `obj` wraps, else `obj` unchanged. Unwraps a one-member
+    dict (the earlier rule) or a generic envelope: exactly one non-scalar member,
+    under a conventional envelope key, holding a non-empty dict, with only scalar
+    siblings. A list envelope ({"data": [...]}) returns None: a collection is not
+    a single restorable object."""
+    for _ in range(3):
+        if not isinstance(obj, dict):
+            break
+        if len(obj) == 1 and isinstance(next(iter(obj.values())), dict):
+            obj = next(iter(obj.values()))
+            continue
+        nested = [k for k, v in obj.items() if isinstance(v, (dict, list))]
+        if len(nested) == 1 and str(nested[0]).lower() in _ENVELOPE_KEYS:
+            inner = obj[nested[0]]
+            if isinstance(inner, list):
+                return None   # a collection envelope, not one object
+            if inner:
+                obj = inner
+                continue
+        break
+    return obj
+
+
+def _object_lock_key(url: str) -> str:
+    """One key per target object: scheme, host, effective port, the path with
+    duplicate/trailing slashes collapsed, and the query in sorted order."""
+    from urllib.parse import unquote, urlsplit
+    parts = urlsplit(url)
+    scheme = (parts.scheme or "http").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    port = port or {"http": 80, "https": 443}.get(scheme)
+    path = re.sub(r"/+", "/", unquote(parts.path or "/")).rstrip("/") or "/"
+    query = "&".join(sorted(parts.query.split("&"))) if parts.query else ""
+    return f"{scheme}://{(parts.hostname or '').lower()}:{port}{path}?{query}"
+
+
+# Per event loop, one lock per target object: two write cases on the same object
+# (registry dispatch and the engagement chain's own validator instance) must not
+# interleave, or the second takes the first's marker as its "original" and
+# restores to it.
+_OBJECT_LOCKS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _object_lock(url: str) -> asyncio.Lock:
+    locks = _OBJECT_LOCKS.setdefault(asyncio.get_running_loop(), {})
+    return locks.setdefault(_object_lock_key(url), asyncio.Lock())
 
 
 class CrossIdentityValidator(Validator):
@@ -260,7 +453,8 @@ class CrossIdentityValidator(Validator):
 
     def __init__(self, allowed_hosts: list[str] | None = None,
                  timeout: float = 10.0, max_identities: int = 3, ownership=None,
-                 run_context=None):
+                 run_context=None, delete_restore_method: str = "",
+                 allow_writes: bool = False):
         self.allowed_hosts = set(allowed_hosts or [])
         self.timeout = timeout
         self.max_identities = max_identities
@@ -275,6 +469,14 @@ class CrossIdentityValidator(Validator):
         # the legacy direct path, so registry construction is unchanged until a run
         # supplies a context.
         self.run_context = run_context
+        # DELETE cannot be reversed generically. An operator must explicitly
+        # declare that PUT recreates the exact resource before this leg deletes it.
+        self.delete_restore_method = (delete_restore_method or "").upper()
+        # B1-T2: whether this registry's config permits mutating replay
+        # (validators.allow_mutating_replay). Off, a captured write never arms the
+        # leg -- reads stay GET-only. On, the run's own safety gate still decides
+        # every send (validate re-checks it before writing anything).
+        self.allow_writes = bool(allow_writes)
 
     def _object_ref(self, url: str) -> str:
         from harness import principals
@@ -285,15 +487,28 @@ class CrossIdentityValidator(Validator):
         # Reuse the access-control gate's markers so the two never drift.
         if not access_control_gate._is_access_control_class(finding.vulnerability_class):
             return False
-        return self.shape_applies(exchange)
+        return self.shape_applies(exchange) and self.write_admitted(exchange.method)
+
+    def write_admitted(self, method: str | None) -> bool:
+        """Whether this leg may be armed for `method`: GET always; PUT/PATCH only
+        with mutating replay permitted; DELETE additionally needs the operator's
+        delete_restore_method=PUT recreation contract."""
+        method = (method or "GET").upper()
+        if method == "GET":
+            return True
+        if method not in _WRITE_METHODS or not self.allow_writes:
+            return False
+        return method != "DELETE" or self.delete_restore_method == "PUT"
 
     @staticmethod
     def shape_applies(exchange: HttpExchange) -> bool:
-        """The request shapes this leg can test: a GET (it replays reads only) that
-        names an object to swap or reaches an admin-namespaced function. Any other
-        shape (a login POST, a collection read like /rest/memories/) is never sent
-        here, so the leg's own "skipped" is not recorded as having tested it (r5)."""
-        if (exchange.method or "GET").upper() != "GET":
+        """The request shapes this leg can test: a GET, or an object write (PUT/
+        PATCH/DELETE, B1-T2), that names an object to swap or reaches an
+        admin-namespaced function. Any other shape (a login POST, a collection read
+        like /rest/memories/) is never sent here, so the leg's own "skipped" is not
+        recorded as having tested it (r5). Whether a write may arm the leg is a
+        policy question answered by write_admitted, not by shape."""
+        if (exchange.method or "GET").upper() not in {"GET", *_WRITE_METHODS}:
             return False
         return has_object_identifier(exchange.url) or is_admin_namespaced(exchange.url)
 
@@ -326,13 +541,13 @@ class CrossIdentityValidator(Validator):
         return [{"name": s.name or s.principal_id, "role": s.role,
                  "headers": dict(s.headers), "session_ref": s.session_id,
                  "principal_id": s.principal_id, "principal": s.principal}
-                for s in self.run_context.sessions.all()
+                for s in self.run_context.sessions.identities()
                 if s.principal_id != "anonymous"]
 
     def _anonymous_session_ref(self) -> str | None:
         if self.run_context is None:
             return None
-        for session in self.run_context.sessions.all():
+        for session in self.run_context.sessions.identities():
             if session.principal_id == "anonymous":
                 return session.session_id
         return None
@@ -623,6 +838,297 @@ class CrossIdentityValidator(Validator):
                 control_outcome="control_held")
         return self._skip(fc, "function-level comparison inconclusive")
 
+    async def _validate_write(self, finding, exchange):
+        from harness.principals import AuthzDecision
+        from harness.run_context import TypedRequest
+        from harness.security import is_identity_credential_header
+
+        fc, method, run = finding.vulnerability_class, exchange.method.upper(), self.run_context
+        if not self.write_admitted(method):
+            # The construction-time policy (validators.allow_mutating_replay and
+            # the DELETE recreation contract) binds every caller, including
+            # those that call validate() without applies().
+            return self._skip(fc, "Write authorization skipped: this validator was not built with "
+                                  "mutating replay permission (validators.allow_mutating_replay) "
+                                  "or, for DELETE, a delete_restore_method=PUT contract")
+        if run is None:
+            return self._skip(fc, "Write authorization requires a run transport and registered sessions")
+        if not run.gate.config.active_enabled or not run.gate.config.allow_mutating_replay:
+            return self._skip(fc, "Write authorization skipped: mutating replay permission is off")
+        if not run.scope.in_scope(exchange.url) or not self.shape_applies(exchange):
+            return self._skip(fc, "Write authorization requires an in-scope object reference")
+        # Refuse before changing anything when known ceilings cannot pay for undo.
+        case_ref = finding.finding_id or finding.case_id or "write-authz-" + secrets.token_hex(8)
+        headroom, _, _ = run.gate.mutating_headroom(case_ref, self.name)
+        if headroom < 2 or (run.budget.remaining is not None and run.budget.remaining < 6):
+            return self._skip(fc, "Write and verified restore need two mutating sends for this case "
+                                  "(validators.mutating_ceiling_by_check.cross_identity >= 2) and "
+                                  "six request slots; nothing was written")
+        idents = self._run_identities(urlparse(exchange.url).hostname or "")
+        source = _source_identity(idents, _auth_signature(exchange.request_headers))
+        fact = self.ownership.lookup(self._object_ref(exchange.url), method) if self.ownership else None
+        owner_id = fact.owner_principal_id if fact else ""
+        owner = next((i for i in idents if _principal_for(i).id == owner_id), None) if owner_id else source
+        if owner is None or not owner.get("session_ref"):
+            return self._skip(fc, "No registered owner/baseline session is available for restoration")
+        others = _distinct_other_principals(idents, _auth_signature(owner["headers"]))
+        others = [i for i in others if not _PRIVILEGED_ROLE.search(i.get("role", ""))
+                  and not _principal_for(i).provisional
+                  and self._ownership_decision(_principal_for(i), exchange.url) != AuthzDecision.AUTHORIZED]
+        if not others:
+            return self._skip(fc, "No distinct non-privileged principal available to test the write")
+        # Held from the baseline read through restore verification, so a second
+        # write case on the same object never reads this case's marker as its
+        # original (and restores the target to it).
+        async with _object_lock(exchange.url):
+            return await self._write_locked(finding, exchange, case_ref, owner, others[0],
+                                            AuthzDecision, TypedRequest, is_identity_credential_header)
+
+    async def _write_locked(self, finding, exchange, case_ref, owner, other,
+                            AuthzDecision, TypedRequest, is_identity_credential_header):
+        fc, method, run = finding.vulnerability_class, exchange.method.upper(), self.run_context
+        # One controlled attempt per dispatch; no repeated mutation of the object.
+        headers = {k: v for k, v in exchange.request_headers.items()
+                   if not is_identity_credential_header(k) and k.lower() not in
+                   {"host", "content-length", "if-match", "if-none-match"}}
+        headers["Content-Type"] = "application/json"
+
+        async def send(verb, ident, body=None, cleanup=False):
+            return await run.executor().execute(
+                TypedRequest(verb, exchange.url, headers=headers,
+                             body=json.dumps(body) if body is not None else None),
+                capability=self.name, session_ref=ident["session_ref"],
+                case_ref=case_ref, allow_cancelled_cleanup=cleanup)
+
+        def object_body(answer):
+            if answer is None or not answer.ok or not 200 <= (answer.status or 0) < 300:
+                return None
+            try:
+                obj = _unwrap_envelope(json.loads(answer.body))
+            except (ValueError, TypeError):
+                return None
+            return obj if isinstance(obj, dict) and obj else None
+
+        baseline = await send("GET", owner)
+        original = object_body(baseline)
+        if original is None:
+            return self._skip(fc, "Owner baseline did not return a restorable JSON object")
+        try:
+            captured = json.loads(exchange.request_body or "{}")
+        except ValueError:
+            captured = {}
+        if not isinstance(captured, dict):
+            captured = {}
+        # r7: a string field is preferred, else a number or boolean; never an
+        # identifier, foreign key, owner/user reference, role or credential.
+        field = _choose_write_field(captured, original)
+        if method != "DELETE" and field is None:
+            return self._skip(fc, "No restorable field in the captured write: it carries no "
+                                  "existing string, number or boolean field outside the fixed "
+                                  "denylist (identifiers, foreign keys, owner/user references, "
+                                  "roles, credentials); nothing was written")
+        # A full-object write (the PUT attack, its restore, and the DELETE
+        # recreation PUT) sends the owner's GET body back. A read that masks a
+        # value would turn that into an overwrite with the mask, so refuse the
+        # leg before any write. PATCH sends only `field`, so only it must be real.
+        # NOT covered: a field the read OMITS entirely (server-computed, write-only)
+        # is invisible here; a full PUT can still drop it, and verification cannot
+        # see it either. Operators should arm PUT only on round-trippable objects.
+        masked = _masked_paths(original if method in {"PUT", "DELETE"} else {field: original[field]})
+        if masked:
+            return self._skip(fc, "Owner baseline is not safely round-trippable (masked/redacted "
+                                  "value at " + ", ".join(masked[:5]) + "); nothing was written")
+        marker = (_mutation_for(original[field]) if field is not None
+                  else "harness_authz_" + secrets.token_hex(12))
+        if marker is None or (field is not None and marker == original[field]):
+            return self._skip(fc, f"Field {field!r} has no distinct value of its type to write; "
+                                  "nothing was written")
+        string_marker = isinstance(marker, str)
+        attack_body = ({**original, field: marker} if method == "PUT" else {field: marker})
+        # Minimal restore: PATCH sends back only the changed field; PUT (and the
+        # DELETE recreation PUT) must carry the whole object.
+        restore_body = original if method in {"PUT", "DELETE"} else {field: original[field]}
+        # DELETE is undone by the operator-declared recreation verb (only PUT is admitted).
+        restore_method = self.delete_restore_method if method == "DELETE" else method
+        # Preflight both payloads through the same gate before attempting a write.
+        for verb, body in ((method, None if method == "DELETE" else attack_body),
+                           (restore_method, restore_body)):
+            decision = run.gate.authorize(validator_name=self.name, method=verb,
+                                          url=exchange.url, body=json.dumps(body))
+            if not decision.allowed:
+                return self._skip(fc, "Write/restore preflight refused: " + decision.reason)
+
+        def matches_original(obj) -> bool:
+            # The whole object minus volatile keys (timestamps, versions, etags the
+            # server rewrites on every save), and no trace of the marker.
+            # A numeric/boolean marker is not unique text, so only the whole-object
+            # equality (which includes the field) speaks for it.
+            return (obj is not None
+                    and not (string_marker and marker in json.dumps(obj))
+                    and _stable(obj) == _stable(original))
+
+        def changed(observed):
+            """True: the object differs from the baseline (marker present, other
+            values changed, or -- for DELETE -- gone). False: an owner read shows
+            it unchanged (still present, for DELETE). None: unknown."""
+            if observed is None or not observed.ok:
+                return None
+            if method == "DELETE" and observed.status in {404, 410}:
+                return True
+            obj = object_body(observed)
+            if obj is None:
+                return None
+            if method == "DELETE":
+                return False   # still present: nothing to recreate
+            return not matches_original(obj)
+
+        attack_sent = False
+
+        def restore_needed(observed) -> bool | None:
+            state = changed(observed)
+            if state is not None:
+                return state
+            if not attack_sent or (attack is not None and not attack.executed):
+                return False   # no write ever left: nothing to undo
+            if attack is not None and attack.ok and 400 <= (attack.status or 0) < 500:
+                return False   # denied (401/403/4xx), and no read shows a change
+            return None        # a write may have committed and no read says otherwise
+
+        async def restore():
+            """Undo only what may have changed. Returns (undo, check, sent)."""
+            need = restore_needed(after)
+            check = after
+            if need is None:
+                # Look before writing: a fresh owner read decides.
+                check = await send("GET", owner, cleanup=True)
+                need = changed(check)
+                if need is None:
+                    need = True   # the attack may have committed; undo it
+            if not need:
+                return None, check, False
+            from harness import run_handoff
+            with run_handoff.restore_scope(f"{case_ref}:cross_identity_restore"):
+                undo = await send(restore_method, owner, restore_body, cleanup=True)
+            check = await send("GET", owner, cleanup=True)
+            return undo, check, True
+
+        attack = after = undo = restored = None
+        restore_sent = False
+        failure, cancelled = "", False
+        try:
+            attack_sent = True
+            attack = await send(method, other, None if method == "DELETE" else attack_body)
+            after = await send("GET", owner)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as exc:  # a timeout can follow a committed write
+            failure = f"probe raised {type(exc).__name__}: {exc}"
+        finally:
+            # MANDATORY undo check, as the owner, even after an exception or run
+            # cancellation (cleanup sends bypass the cancel token). A restore is
+            # SENT only when a write went out and was not shown unchanged by an
+            # owner read. Shielded so a second cancellation cannot abandon it.
+            task = asyncio.ensure_future(restore())
+            try:
+                try:
+                    undo, restored, restore_sent = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    undo, restored, restore_sent = await task
+            except Exception as exc:
+                restore_sent = True   # unknown: report it as a failed restore
+                failure += f"; restore raised {type(exc).__name__}: {exc}"
+        if restore_sent:
+            restore_ok = (undo is not None and undo.ok and 200 <= (undo.status or 0) < 300
+                          and matches_original(object_body(restored)))
+        else:
+            restore_ok = True
+        self._record_restore(attack, restore_sent, restore_ok, undo, exchange.url)
+        evidence = (f"object={exchange.url}; owner/baseline={_principal_for(owner).id}; "
+                    f"writer={_principal_for(other).id}; method={method}; "
+                    f"field={field or '[deleted object]'}; marker={marker}; "
+                    f"attack_status={getattr(attack, 'status', None)}; "
+                    f"restore={'sent' if restore_sent else 'not_needed'}; "
+                    f"restore_status={getattr(undo, 'status', None)}; "
+                    f"restore_succeeded={str(restore_ok).lower()}")
+        if not restore_ok:
+            # Loud: the target may still hold the marker (or lack the object).
+            message = ("RESTORE FAILED: the original state of " + exchange.url + " could not be "
+                       "restored and verified; the target may still hold " + repr(marker)
+                       + " -- restore it manually. " + evidence + (" " + failure if failure else ""))
+            log.error(message)
+            if cancelled:
+                raise asyncio.CancelledError(message)
+            return ValidationResult(self.name, "error", fc, summary=message, evidence=evidence)
+        if cancelled:
+            raise asyncio.CancelledError
+        undone = "original restored" if restore_sent else "object unchanged, no restore needed"
+        controls = [after] + ([restored] if restore_sent else [])
+        if failure or attack is None or after is None or not attack.ok or not after.ok:
+            return ValidationResult(self.name, "error", fc,
+                                    summary=f"Write probe incomplete; {undone}. " + failure,
+                                    evidence=evidence)
+        if attack.status in {401, 403}:
+            return ValidationResult(self.name, "not_confirmed", fc,
+                                    summary=f"Other principal's {method} was denied "
+                                            f"(HTTP {attack.status}); {undone}",
+                                    evidence=evidence, control_outcome="control_held"
+                                    ).with_artifacts(baseline=baseline, attack=attack,
+                                                     controls=controls)
+        persisted = ((after.status in {404, 410}) if method == "DELETE" else
+                     (object_body(after) or {}).get(field) == marker)
+        if not 200 <= (attack.status or 0) < 300 or not persisted:
+            note = ""
+            if 200 <= (attack.status or 0) < 300 and method != "DELETE":
+                # NOT restored: a server that scopes the write to the SESSION user
+                # applies it to the writer's own record, which this leg cannot
+                # locate generically. Surface it so the operator can check.
+                note = (f" The server accepted the write without changing this object; if it "
+                        f"scopes writes to the session user, {_principal_for(other).id!r}'s own "
+                        f"record may now hold {marker} in {field!r} -- check and restore it manually.")
+                log.warning("cross_identity write accepted but not applied to %s; the writer's "
+                            "own record may hold %s", exchange.url, marker)
+            return ValidationResult(self.name, "not_confirmed", fc,
+                                    summary=f"{method} as another principal returned HTTP "
+                                            f"{attack.status} but the owner read-back did not show "
+                                            f"the change; {undone}.{note}",
+                                    evidence=evidence).with_artifacts(
+                                        baseline=baseline, attack=attack, controls=controls)
+        # Confirmed only against a DECLARED boundary: a known owner who is not the
+        # writer, or an object declared to a privileged principal (admin-only).
+        # Undeclared/shared (catalogue) objects stay a lead.
+        denied = self._ownership_decision(_principal_for(other), exchange.url) == AuthzDecision.UNAUTHORIZED
+        return ValidationResult(
+            self.name, "confirmed" if denied else "supported", fc,
+            confirmed=denied, confidence=0.9 if denied else 0.4,
+            summary=(f"Broken object-level write authorization: {_principal_for(other).id!r} "
+                     f"{method} persisted on an object declared to another principal; original restored"
+                     if denied else
+                     f"LEAD: a low-privilege {method} persisted on an object with no declared "
+                     f"owner or access expectation; original restored. Verify whether this "
+                     f"principal may modify it."),
+            evidence=evidence + "; " + self._ownership_provenance(exchange),
+        ).with_artifacts(baseline=baseline, attack=attack, controls=controls)
+
+    def _record_restore(self, attack, restore_sent: bool, restore_ok: bool, undo, url: str) -> None:
+        """Record the write leg's restore outcome on the run's change log (HU-5
+        run_handoff.mark_restore): `restored`, or a loud `restore_failed`. Only a
+        write that went out and was recorded (it ended 2xx) has an entry to mark.
+        Bookkeeping only: never raises, never sends."""
+        artifact = getattr(attack, "artifact_id", "") if attack is not None else ""
+        if not artifact or self.run_context is None:
+            return
+        if restore_sent:
+            detail = (f"cross_identity restore {'verified' if restore_ok else 'NOT verified'} "
+                      f"(restore HTTP {getattr(undo, 'status', None)}) on {url}")
+        else:
+            detail = f"cross_identity: owner read showed {url} unchanged; no restore needed"
+        try:
+            from harness import run_handoff
+            run_handoff.mark_restore(self.run_context, [artifact], ok=restore_ok, detail=detail)
+        except Exception:
+            log.debug("cross_identity: mark_restore failed", exc_info=True)
+
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         token = _ownership_method.set(exchange.method)
         try:
@@ -632,6 +1138,8 @@ class CrossIdentityValidator(Validator):
 
     async def _validate_with_ownership_method(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         fc = finding.vulnerability_class
+        if (exchange.method or "GET").upper() in _WRITE_METHODS:
+            return await self._validate_write(finding, exchange)
         if (exchange.method or "GET").upper() != "GET":
             return self._skip(fc, "cross-identity replay is GET-only (safe); a mutating request is not replayed here")
         host = urlparse(exchange.url).hostname or ""

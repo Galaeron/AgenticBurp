@@ -40,6 +40,8 @@ except Exception:  # pragma: no cover - categories is always present in the harn
         return (x or "").lower().strip() or None
 
 _SEV_W = {"critical": 1.0, "high": 0.75, "medium": 0.5, "low": 0.25, "info": 0.1}
+# Presentation assets: nothing in them takes input (is_parameterless_static).
+_STATIC_ASSET = re.compile(r"\.(?:css|js|mjs|png|jpe?g|gif|svg|ico|webp|bmp|woff2?|ttf|eot|otf)$", re.I)
 _TIER_W = {"critical": 1.0, "high": 0.75, "medium": 0.5, "low": 0.25, "info": 0.1, "unscored": 0.1}
 
 # Path shapes that read as privileged/sensitive -- used to flag the high-value
@@ -126,6 +128,22 @@ def _looks_privileged(path: str) -> bool:
     return bool(_PRIVILEGED.search(path or ""))
 
 
+# The request template's object_id: the LAST path segment of digits or of 8+ hex
+# or dash characters. The coverage case CaseKey("path", "object_id") names it, so a
+# leg that injects into that case's input finds the segment with this same rule.
+_LEAF_OBJECT_ID_SEGMENT = re.compile(r"\d+|[0-9a-fA-F-]{8,}")
+
+
+def leaf_object_id_index(path: str) -> int | None:
+    """Index, in `path.split("/")`, of the segment template_from_exchange records as
+    the request's object_id (the leaf object id); None when the path has none."""
+    found = None
+    for i, seg in enumerate((path or "").split("/")):
+        if seg and _LEAF_OBJECT_ID_SEGMENT.fullmatch(seg):
+            found = i
+    return found
+
+
 def template_from_exchange(ex) -> dict:
     """A compact, replayable request TEMPLATE captured from a real exchange (R05):
     method, query string, request body, content-type, and the observed leaf object
@@ -141,10 +159,8 @@ def template_from_exchange(ex) -> dict:
     body = get("request_body", "") or ""
     parts = urlsplit(url)
     ctype = next((v for k, v in headers.items() if (k or "").lower() == "content-type"), "")
-    obj_id = None
-    for seg in [s for s in (parts.path or "").split("/") if s]:
-        if re.fullmatch(r"\d+|[0-9a-fA-F-]{8,}", seg):
-            obj_id = seg  # keep the LAST matching segment -> the leaf object id
+    leaf = leaf_object_id_index(parts.path or "")
+    obj_id = (parts.path or "").split("/")[leaf] if leaf is not None else None
     # object_id is the LEAF id only. path_ids keeps every id in path order, so a
     # nested route (/accounts/17/orders/42) can be replayed with each parameter
     # intact rather than the leaf id copied into every slot.
@@ -187,6 +203,28 @@ def capture_variant(exchange) -> dict:
     return variant
 
 
+def _variant_digest(fields: dict) -> str:
+    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+
+
+def stable_capture_id(variant: dict) -> str:
+    """A capture's id without its credentials: capture_id's digest over the same
+    fields minus `identity_key`. identity_key (and so capture_id) hashes the
+    credential VALUES, which a re-login changes; this does not (r9: a resumed run
+    whose roles logged in again re-ran every finished authenticated worklist node)."""
+    return _variant_digest({k: v for k, v in (variant or {}).items()
+                            if k not in ("capture_id", "identity_key")})
+
+
+def rekey_variant(variant: dict, identity_key: str) -> dict:
+    """The same capture under another identity key (the same principal after a
+    re-login), with capture_id recomputed the way capture_variant() computes it."""
+    moved = {k: v for k, v in variant.items() if k != "capture_id"}
+    moved["identity_key"] = identity_key
+    moved["capture_id"] = _variant_digest(moved)
+    return moved
+
+
 # Marks a variant built from an access-matrix probe rather than a full capture.
 ACCESS_MATRIX_SOURCE = "access_matrix"
 
@@ -208,7 +246,7 @@ def identity_probe_variant(probe: dict) -> dict:
     return variant
 
 
-def replayable_variants(ep, identity_key: str) -> list:
+def identity_variants(ep, identity_key: str) -> list:
     """The variants a check can replay AS this identity: its full captures, plus
     its access-matrix probe unless a full capture already holds the same request
     (the full one also carries the response). Empty when the identity was never
@@ -220,6 +258,15 @@ def replayable_variants(ep, identity_key: str) -> list:
     held = {shapes(v) for v in full}
     return full + [v for v in mine if v.get("source") == ACCESS_MATRIX_SOURCE
                    and shapes(v) not in held]
+
+
+def replayable_variants(ep, identity_key: str) -> list:
+    """`identity_variants`, with captures that differ only by throwaway values and
+    drew the same response replayed once (replay_dedupe.distinct_replays). Object
+    ids, identities and differing responses are never merged."""
+    from harness.replay_dedupe import distinct_replays
+    return distinct_replays(identity_variants(ep, identity_key),
+                            endpoint_variants=getattr(ep, "capture_variants", None) or [])
 
 
 _RESULT_BODY_HEAD = 200
@@ -504,6 +551,26 @@ class SurfaceEndpoint:
         tmpl = self.template or {}
         return bool(tmpl.get("body") or tmpl.get("query") or self.object_scoped)
 
+    def captured_parameters(self) -> list[str]:
+        """`location:name` of each query, form or JSON parameter a capture of this
+        endpoint carried, blank values included (coverage_model.captured_parameter_names)."""
+        from harness.coverage_model import captured_parameter_names
+        return captured_parameter_names({"template": self.template,
+                                         "capture_variants": self.capture_variants})
+
+    def is_parameterless_static(self) -> bool:
+        """A GET/HEAD of a presentation asset (stylesheet, script, image, font) with
+        no captured parameter, no object id and no confirmed finding: nothing to
+        inject into, so it should not hold a worklist slot ahead of a route that
+        takes input. Decided by method, extension and captured shape only."""
+        if self.method not in ("GET", "HEAD") or self.object_scoped:
+            return False
+        if not _STATIC_ASSET.search(self.path or ""):
+            return False
+        if any(f.get("confirmed") for f in self.findings or []):
+            return False
+        return not self.captured_parameters()
+
     def best_finding(self) -> dict | None:
         if not self.findings:
             return None
@@ -614,6 +681,13 @@ class SurfaceEndpoint:
         if self.is_input_bearing():
             score += 0.2
             reasons.append("input-bearing route (body/query/object-id) -- concrete probe available")
+        # r7: a search route whose captures carried a (blank) query parameter tied
+        # with parameterless routes and was skipped for time. A named parameter a
+        # capture carried is a concrete injection point: rank it ahead.
+        params = self.captured_parameters()
+        if params:
+            score += 0.3
+            reasons.append(f"captured parameter(s) {', '.join(params[:3])} -- injection point")
 
         # P2-1: business impact from the Application Semantic Model (a
         # value-bearing checkout/payment/role endpoint outranks a generic static
@@ -642,6 +716,9 @@ class SurfaceEndpoint:
         if self.is_repeat_5xx_artifact():
             score *= 0.05
             reasons.append("every probed role got a server error here -- dead endpoint (deprioritized)")
+        if not params and self.is_parameterless_static():
+            score *= 0.2
+            reasons.append("parameterless static resource (deprioritized)")
 
         return round(score, 4), reasons
 

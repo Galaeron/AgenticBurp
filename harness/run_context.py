@@ -245,6 +245,10 @@ class ManagedSession:
     role: str = "user"
     name: str = ""
     principal: object | None = None
+    # A one-request credential (send_creds): headers a check or the agent supplied
+    # for its own send, which no configured identity owns. It carries that send's
+    # credentials and cookie jar; it is never one of the run's identities.
+    ephemeral: bool = False
     # Bumped each time the session's credentials are replaced (a refresh or
     # SessionManager.replace_headers). A caller that caches anything derived from
     # the credentials -- a token, decoded claims, a cache key -- must key it on
@@ -304,7 +308,7 @@ class SessionManager:
 
     def register(self, session_id: str, principal_id: str, headers: dict | None = None, *,
                  allowed_origins=None, role: str = "user", name: str = "",
-                 principal=None) -> ManagedSession:
+                 principal=None, ephemeral: bool = False) -> ManagedSession:
         normalized = frozenset(ScopePolicy.origin_of(o) for o in (allowed_origins or []))
         if "" in normalized:
             raise ValueError("sessions require valid HTTP(S) allowed origins")
@@ -312,7 +316,8 @@ class SessionManager:
             raise ValueError("credential-bearing sessions require an explicit allowed origin")
         s = ManagedSession(session_id=session_id, principal_id=principal_id,
                            headers=dict(headers or {}), allowed_origins=normalized,
-                           role=role, name=name or principal_id, principal=principal)
+                           role=role, name=name or principal_id, principal=principal,
+                           ephemeral=ephemeral)
         self._by_id[session_id] = s
         return s
 
@@ -328,6 +333,14 @@ class SessionManager:
 
     def all(self) -> list[ManagedSession]:
         return list(self._by_id.values())
+
+    def identities(self) -> list[ManagedSession]:
+        """The run's identities: every session except the ephemeral ones send_creds
+        registers for one check's own credentials. A check that replays "as each
+        identity" reads this. r9: the agent's empty `Bearer ` header and other
+        one-off credentials had become identities, and cross_identity re-sent
+        each later check as them (355 refused sends)."""
+        return [s for s in self._by_id.values() if not s.ephemeral]
 
     # -- E5a: session health -------------------------------------------------
 
@@ -394,6 +407,20 @@ class SessionManager:
                     k: v for k, v in supplied.items()
                     if not is_identity_credential_header(k)}
         return None, supplied
+
+    def identity_principal(self, headers: dict | None) -> str:
+        """The principal of the run identity whose credentials `headers` carry, else "".
+
+        A capture made with a configured user's token is that user's request. r9
+        filed its proofs under "captured" and the same user's role-session proofs
+        under the user's name, so one forged-JWT root cause was two issues. Only a
+        named identity answers: not the capture's own credential alias ("captured",
+        registered when no identity owns the credentials) nor a one-send session."""
+        ref, _ = self.bind_headers(headers)
+        session = self._by_id.get(ref) if ref else None
+        if session is None or session.ephemeral or session.session_id == "captured":
+            return ""
+        return session.principal_id or ""
 
     async def aclose(self) -> None:
         for s in self._by_id.values():
@@ -655,7 +682,8 @@ class TargetTransport:
             session_ref, non_cred = self.ctx.sessions.bind_headers(hdrs)
             if session_ref is None:
                 sid = f"w16-ephemeral-{uuid.uuid4().hex[:8]}"
-                self.ctx.sessions.register(sid, sid, headers=cred, allowed_origins=[url])
+                self.ctx.sessions.register(sid, sid, headers=cred, allowed_origins=[url],
+                                           ephemeral=True)
                 session_ref = sid
                 non_cred = {k: v for k, v in hdrs.items()
                             if not is_identity_credential_header(k)}
@@ -766,7 +794,20 @@ class TargetTransport:
                       allow_cancelled_cleanup: bool = False) -> ExecutionOutcome:
         """Send one request through scope + gate + budget, following redirects
         MANUALLY so every hop is re-checked. Captures an artifact on every path,
-        including blocks and errors."""
+        including blocks and errors. HU-5: every outcome is then offered to the
+        run's change log and handoff (bookkeeping only; it sends nothing)."""
+        outcome = await self._execute(request, capability=capability, session_ref=session_ref,
+                                      case_ref=case_ref, max_redirects=max_redirects,
+                                      allow_cancelled_cleanup=allow_cancelled_cleanup)
+        from harness import run_handoff
+        run_handoff.observe_execution(self.ctx, request, outcome, capability=capability,
+                                      case_ref=current_case_ref() or case_ref)
+        return outcome
+
+    async def _execute(self, request: TypedRequest, *, capability: str,
+                       session_ref: str | None = None, case_ref: str = "",
+                       max_redirects: int = 5,
+                       allow_cancelled_cleanup: bool = False) -> ExecutionOutcome:
         ctx = self.ctx
         # R16 accounting and the record's finding_ref: the caller's own case_ref,
         # never ambient. The record's case: the enclosing case_scope, if any.
@@ -933,7 +974,8 @@ class TargetTransport:
                 ctx.self_ownership.observe(
                     source="transport", method=method, url=url, status=resp.status_code,
                     principal_id=session.principal_id if session and credential_destination else "",
-                    response_body=resp.text)
+                    response_body=resp.text,
+                    request_body=body if isinstance(body, str) else None)
             return ExecutionOutcome(outcome="ok", status=resp.status_code, body=resp.text,
                                     headers=dict(resp.headers), final_url=url,
                                     artifact=self._artifact(
@@ -1269,6 +1311,11 @@ _ambient_run: "contextvars.ContextVar[RunContext | None]" = contextvars.ContextV
     "harness_run_context_ambient", default=None)
 
 
+def _new_change_log(run_id: str):
+    from harness.run_handoff import ChangeLog
+    return ChangeLog(run_id)
+
+
 def current_run_context() -> "RunContext | None":
     """The RunContext whose `async with` block encloses this call, if any."""
     return _ambient_run.get()
@@ -1337,6 +1384,11 @@ class RunContext:
     # route_feed.RouteFeed, installed by an engagement with engagement.recrawl on;
     # the transport offers it every route it first sees. None: nothing is offered.
     route_feed: object = field(default=None, repr=False, compare=False)
+    # HU-5: the run's target change log (run_handoff.ChangeLog; every non-read send
+    # that ended 2xx, in memory) and its handoff (run_handoff.RunHandoff, attached
+    # by the server per job; None: no handoff is kept). Bookkeeping only.
+    change_log: object = field(default=None, repr=False, compare=False)
+    handoff: object = field(default=None, repr=False, compare=False)
     _freshness: object = field(default=None, repr=False, compare=False)
     _freshness_built: bool = field(default=False, repr=False, compare=False)
 
@@ -1389,6 +1441,7 @@ class RunContext:
             cache_namespace=(f"{configured_namespace}:{resolved_run_id}"
                              if configured_namespace else resolved_run_id), timeout=timeout,
             objective_task=objective_task,
+            change_log=_new_change_log(resolved_run_id),
             self_ownership=(self_ownership.SelfOwnership(run_id=resolved_run_id)
                             if self_ownership.enabled(config_snapshot) else None))
 

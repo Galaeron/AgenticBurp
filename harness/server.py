@@ -1482,6 +1482,26 @@ def _evict_expired_jobs(now: float | None = None) -> None:
         raise HTTPException(status_code=503, detail='durable job status unavailable') from None
 
 
+def _attempt_findings(base_url: str, attempts) -> list[dict]:
+    """Stored findings of every attempt of this assessment, oldest attempt first."""
+    return [row for run_id in attempts for row in store.all_host_findings(base_url, run_id=run_id)]
+
+
+def _attempt_accounting(attempts, findings) -> tuple[list, dict]:
+    """(proof-bound case refs, issue accounting) over every attempt of this
+    assessment: a resumed job's own run and the runs it resumed (r9). One attempt
+    is the single-run accounting, unchanged."""
+    from harness.assessment_health import (confirmed_issue_inventory, confirmed_issue_accounting,
+                                           stored_proof_artifacts_resolve)
+    scope = attempts[0] if len(attempts) == 1 else list(attempts)
+    proven = confirmed_issue_inventory(findings, scope, store.proofs_for_case)
+    accounting = confirmed_issue_accounting(
+        findings, scope, store.proofs_for_case,
+        run_proofs=[p for run_id in attempts for p in store.proofs_for_run(run_id)],
+        artifact_resolver=stored_proof_artifacts_resolve)
+    return proven, accounting
+
+
 def _job_public(job: dict, *, include_result: bool = False) -> dict:
     """The JSON-safe view of a job (never leaks the asyncio Task)."""
     from harness.job_status import JobStatusStore
@@ -1635,6 +1655,144 @@ async def engagement_declarations_view(host: str, base_url: str = Query(max_leng
             "owners": (saved or {}).get("owners", [])}
 
 
+# --- HU-1: the operator access matrix (logic in harness/access_matrix.py) ---------
+
+class AccessMatrixAnswersRequest(_BaseModel):
+    operator: str = Field(min_length=1, max_length=64)
+    answers: list[dict] = Field(default_factory=list, max_length=500)
+    engagement_id: str = Field(default="", max_length=128)
+
+
+def _access_matrix_max_questions() -> int:
+    cfg = (orchestrator.config or {}).get("access_matrix") or {}
+    try:
+        return max(1, int(cfg.get("max_questions_per_round", 20)))
+    except (TypeError, ValueError):
+        return 20
+
+
+@app.get("/engagement/{host}/access-matrix")
+async def engagement_access_matrix_view(host: str,
+                                        engagement_id: str = Query(default="", max_length=128),
+                                        authorization: str | None = Header(default=None)):
+    """The draft access matrix for this engagement with the saved operator answers
+    and this round's ranked questions. Sends nothing; proposals are never truth."""
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    from harness import access_matrix
+    return await asyncio.to_thread(access_matrix.build_draft, host.lower(),
+                                   engagement_id=engagement_id,
+                                   max_questions=_access_matrix_max_questions())
+
+
+@app.put("/engagement/{host}/access-matrix")
+async def engagement_access_matrix_answer(host: str, req: AccessMatrixAnswersRequest,
+                                          authorization: str | None = Header(default=None)):
+    """Save operator answers (allowed / denied / owner_only / admin_only / unknown, or
+    null to clear) per cell, with provenance (operator, time, source=operator).
+    All-or-nothing: 422 names every invalid entry and saves none."""
+    _require_auth(authorization)
+    from harness import access_matrix
+    problems = []
+    for index, entry in enumerate(req.answers):
+        try:
+            access_matrix.clean_answer(entry)
+        except ValueError as exc:
+            problems.append(f"answers[{index}]: {exc}")
+    if problems:
+        raise HTTPException(status_code=422, detail=problems[:20])
+    saved = await asyncio.to_thread(access_matrix.save_answers, host.lower(), req.answers,
+                                    operator=req.operator, engagement_id=req.engagement_id)
+    return {"host": host.lower(), "engagement_id": req.engagement_id, "saved": len(saved),
+            "answers": await asyncio.to_thread(access_matrix.load_answers, host.lower(),
+                                               engagement_id=req.engagement_id)}
+
+
+def _leads_investigation(host: str, job_id: str) -> tuple[dict, dict]:
+    """(result, meta) of the named or newest finished investigation for `host`
+    whose durable result is readable; ({}, meta) when there is none."""
+    import json
+    journal = _job_store()
+    jobs = [journal.get(job_id)] if job_id else journal.list(host)
+    for job in jobs:
+        if not job or job.get("host") != host or not job.get("result_ref"):
+            continue
+        try:
+            return (json.loads(journal.read_result(job["job_id"])),
+                    {"job_id": job["job_id"], "used": True, "note": "newest readable result"})
+        except (ValueError, OSError, __import__("sqlite3").Error):
+            continue
+    return {}, {"job_id": None, "used": False,
+                "note": "no readable investigation result; blocked_on uses stored findings and the ledger only"}
+
+
+@app.get("/engagement/{host}/leads")
+async def engagement_leads(host: str, authorization: str | None = Header(default=None),
+                           engagement_id: str = Query(default="", max_length=128),
+                           captured_principal_id: str | None = Query(default=None, max_length=128),
+                           job_id: str = Query(default="", max_length=128)):
+    """HU-2: the ranked queue of unproven leads for a host, each with its recorded
+    request (secrets redacted) or an explicit no-request reason, the one change to
+    make, the expected positive/negative, and a typed blocked_on. Read-only: sends
+    no traffic. Shape documented in harness/leads.py."""
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    from harness import leads
+    url = host if "//" in host else f"http://{host}/"
+    investigation, meta = await asyncio.to_thread(_leads_investigation, host, job_id)
+    try:
+        items = await asyncio.to_thread(leads.build_leads, url, engagement_id=engagement_id,
+                                        captured_principal=captured_principal_id,
+                                        investigation=investigation)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"schema_version": leads.SCHEMA_VERSION, "host": host, "engagement_id": engagement_id,
+            "sends_traffic": False, "investigation": meta, "lead_count": len(items), "leads": items}
+
+
+@app.get("/engagement/{host}/handoff")
+async def engagement_handoff_view(host: str, authorization: str | None = Header(default=None)):
+    """HU-5: the newest run's handoff for this host (what was not tested) and the
+    target change log of every run on it. Reads run artifacts; sends nothing."""
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    from harness import run_handoff
+    return await asyncio.to_thread(run_handoff.latest_for_host, host,
+                                   run_handoff.output_dir_for(config))
+
+
+@app.get("/engagement/{host}/map")
+async def engagement_app_map_view(host: str,
+                                  engagement_id: str = Query(default="", max_length=128),
+                                  authorization: str | None = Header(default=None)):
+    """HU-3: the application map built from the store (roles, objects with owners and
+    id patterns, endpoints by role outcome, value fields, captured workflows), with
+    the stored semantic model overlaid as `proposed`. No model call; sends nothing."""
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    from harness import app_map
+    return await asyncio.to_thread(app_map.build_map, host.lower(), engagement_id=engagement_id)
+
+
+@app.get("/engagement/{host}/writeups")
+async def engagement_writeups(host: str, authorization: str | None = Header(default=None),
+                              engagement_id: str = Query(default="", max_length=128),
+                              captured_principal_id: str | None = Query(default=None, max_length=128)):
+    """HU-6: one Markdown write-up per proof-bound issue (harness/writeups.py), drawn
+    only from the recorded proof. Empty unless writeups.export_markdown is on. Sends nothing."""
+    _require_auth(authorization)
+    _require_read_auth(authorization)
+    from harness import report_generator, writeups
+    url = host if "//" in host else f"http://{host}/"
+    enabled = writeups.settings(config)["export_markdown"]
+    exports = (await asyncio.to_thread(report_generator.export_issues_for_host, url, config=config,
+                                       engagement_id=engagement_id,
+                                       captured_principal=captured_principal_id)) if enabled else []
+    items = [{"issue_id": e.get("issue_id"), **e["writeup"]} for e in exports if e.get("writeup")]
+    return {"host": host, "engagement_id": engagement_id, "enabled": enabled, "sends_traffic": False,
+            "writeup_count": len(items), "writeups": items}
+
+
 @app.post("/engagement/{host}/investigate")
 async def engagement_investigate(host: str, req: InvestigateRequest,
                                  authorization: str | None = Header(default=None)):
@@ -1716,6 +1874,8 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     journal_on = bool((config.get('runs', {}) or {}).get('journal', False))
     journal_root = None
     journal_key = _journal_context_key(config, req) if journal_on else ''
+    # The attempts this job continues (oldest first): its accounting counts them all.
+    prior_attempts: list[str] = []
 
     if req.resume_job_id:
         journal = _job_store()
@@ -1729,6 +1889,9 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             raise HTTPException(status_code=409, detail='prior job is not terminal or has a different target origin')
         from harness.coverage_tracker import resume_context_key
         prior_root = prior.get('journal_root') or req.resume_job_id
+        # A job saved before attempt_run_ids existed names its root and itself.
+        prior_attempts = [r for r in (prior.get('attempt_run_ids') or []) if isinstance(r, str) and r] \
+            or [prior_root, req.resume_job_id]
         result_missing = False
         try:
             import json
@@ -1783,12 +1946,16 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             run_context.run_journal = None
             log.warning('run journal unavailable (%s); this job is not journaled', type(exc).__name__)
     output_dir = Path(runs_cfg.get('output_dir') or Path(__file__).parent / 'run-output')
+    # HU-5: the run's handoff + change log, persisted beside the manifest as it runs.
+    from harness import run_handoff
+    run_handoff.attach(run_context, host=host, base_url=req.base_url, output_dir=output_dir)
     job: dict = {"job_id": job_id, "host": host, "base_url": req.base_url,
                  "status": "running", "task": None, "result": None, "error": None,
                  "started_at": _time.time(), "finished_at": None,
                  "manifest_path": str(output_dir / f'{job_id}.json'), "run_context": run_context,
                  "journal_root": (run_context.run_journal.root_job_id
-                                  if run_context.run_journal is not None else None)}
+                                  if run_context.run_journal is not None else None),
+                 "attempt_run_ids": list(dict.fromkeys([*prior_attempts, job_id]))}
     try:
         _, admitted = _job_store().create(job)
         if not admitted:
@@ -1817,7 +1984,11 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                         # AR-10 P2: whether Ollama calls ran with thinking on
                         # (ollama.think); "off" means no reasoning-mode result.
                         "think": __import__("harness.ollama_client", fromlist=["think_setting"]).think_setting(
-                            (config.get("ollama") or {}).get("think"))})
+                            (config.get("ollama") or {}).get("think")),
+                        # Which wire protocol served the model calls (ollama.api) and
+                        # the output cap / reasoning effort it ran with.
+                        "model_backend": __import__("harness.ollama_client", fromlist=["backend_setting"]).backend_setting(
+                            config.get("ollama"))})
     except Exception:
         job.update(status='error', finished_at=_time.time(),
                    error='job manifest initialization failed; no work was scheduled')
@@ -1827,6 +1998,7 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                             headers={'Retry-After': '5'}) from None
 
     def _finish_manifest(status, *, result=None, error=None):
+        run_handoff.finish(run_context, status, result)
         try:
             manifest.finish(status, result=security.sanitize_data(result), error=error)
         except Exception as exc:
@@ -1863,19 +2035,15 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
                 job["result"].setdefault("declarations_source", declarations_source)
             job["result"].setdefault("cache_namespace", run_context.cache_namespace)
             job["result"].setdefault("request_count", run_context.budget.used)
-            # Use the persisted, proof-resolved projection and this run only.
-            # Raw model flags and repeated validator records are not issue counts.
-            rows = store.all_host_findings(req.base_url, run_id=run_context.run_id)
-            from harness.assessment_health import (confirmed_issue_inventory, confirmed_issue_accounting,
-                                                   stored_proof_artifacts_resolve)
-            proven = confirmed_issue_inventory(
-                [*rows, *job["result"].get("findings", [])], run_context.run_id, store.proofs_for_case)
+            # Use the persisted, proof-resolved projection of this run and the
+            # attempts it resumed. Raw model flags and repeated validator records
+            # are not issue counts.
+            attempts = job["attempt_run_ids"]
+            rows = _attempt_findings(req.base_url, attempts)
+            proven, accounting = _attempt_accounting(attempts, [*rows, *job["result"].get("findings", [])])
+            job["result"]["attempt_run_ids"] = list(attempts)
             job["result"]["confirmed_issues"] = len(proven)
             job["result"]["confirmed_issue_refs"] = proven
-            accounting = confirmed_issue_accounting(
-                [*rows, *job['result'].get('findings', [])], run_context.run_id, store.proofs_for_case,
-                run_proofs=store.proofs_for_run(run_context.run_id),
-                artifact_resolver=stored_proof_artifacts_resolve)
             job['result']['issue_accounting'] = accounting
             job['result']['confirmed_vulnerabilities'] = accounting['counts']['vulnerabilities']
             job['result']['confirmed_issues_unit'] = 'proof_bound_cases'
@@ -1889,9 +2057,22 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             job["status"] = "cancelled"
             # Persist evidence already produced by this run even if the chain
             # never returned its final result. Recovery never resumes execution.
+            attempts = job["attempt_run_ids"]
             job['result'] = {'partial': True, 'run_id': run_context.run_id,
+                             'attempt_run_ids': list(attempts),
                              'request_count': run_context.budget.used,
-                             'findings': store.all_host_findings(req.base_url, run_id=run_context.run_id)}
+                             'findings': _attempt_findings(req.base_url, attempts)}
+            # r9's last attempt was cancelled and reported no count at all. The
+            # accounting is best effort here: it must never hide the cancel.
+            try:
+                proven, accounting = _attempt_accounting(attempts, job['result']['findings'])
+                job['result'].update(
+                    confirmed_issues=len(proven), confirmed_issue_refs=proven,
+                    issue_accounting=accounting, confirmed_issues_unit='proof_bound_cases',
+                    confirmed_vulnerabilities=accounting['counts']['vulnerabilities'])
+            except Exception as exc:
+                job['result']['accounting_error'] = type(exc).__name__
+                log.warning("cancelled job %s: issue accounting failed (%s)", job_id, type(exc).__name__)
             _finish_manifest("cancelled", result=job['result'])
             raise
         except Exception as e:  # a failed job must report, never crash the server

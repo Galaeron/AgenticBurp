@@ -381,6 +381,9 @@ class ValidatorRegistry:
         # config-file edit -- in-memory only, gone on restart, matching how the
         # identities it needs are supplied (identity_headers.py).
         self._xid_cfg = cfg.get("cross_identity", {})
+        # B1-T2: a captured write arms cross_identity only with mutating replay on.
+        from harness.config_schema import parse_validators_flags
+        self._allow_mutating_replay = parse_validators_flags(cfg)["allow_mutating_replay"]
         self._allowed_hosts = config.get("server", {}).get("allowed_hosts", [])
         # WL-04 / owner decision D1: the ownership source every cross-identity
         # validator this registry builds consults before confirming (a
@@ -398,6 +401,8 @@ class ValidatorRegistry:
             timeout=float(self._xid_cfg.get("timeout", 10.0)),
             max_identities=int(self._xid_cfg.get("max_identities", 3)),
             ownership=self.ownership,
+            delete_restore_method=str(self._xid_cfg.get("delete_restore_method", "")),
+            allow_writes=getattr(self, "_allow_mutating_replay", False),
         )
 
     def set_ownership(self, ledger) -> None:
@@ -511,6 +516,15 @@ class ValidatorRegistry:
             return decision("needs_prerequisite", "missing_capture", "an authorized capture is required")
         if run_context is not None and not run_context.scope.in_scope(exchange.url):
             return decision("policy_denied", "scope_rejected", "capture is outside the owning run scope")
+        # Same rule as for_finding: an Engine.IO long-poll's query and body are
+        # transport framing, so injection and CSRF legs against it test nothing.
+        # The coverage drive dispatches by check, not by finding, so it needs the
+        # rule here too (r9 spent about 2 h of its drive on these legs).
+        from harness.volatile_params import is_polling_transport
+        if (is_polling_transport(exchange.url or "")
+                and {family, getattr(validator, "name", "")} & POLLING_EXCLUDED_VALIDATORS):
+            return decision("unsupported", "protocol_inapplicable",
+                            "a long-polling transport request carries framing, not application input")
         method = (exchange.method or "GET").upper()
         path = urlsplit(exchange.url).path.lower()
         if check.id in {"WSTG-ATHN-07", "WSTG-SESS-03"}:
@@ -530,12 +544,15 @@ class ValidatorRegistry:
             if not password or not user:
                 return decision("needs_prerequisite", "missing_credentials", "captured username/password fields are required")
         if family == "nosql":
-            from .nosql_validator import _credential_names
-            if method != "POST" or "login" not in path:
-                return decision("unsupported", "unsupported_boundary", "NoSQL adapter only supports a POST login boundary")
-            if not all(_credential_names(exchange.request_body or "")):
-                return decision("needs_prerequisite", "missing_credentials", "observed login username/password fields are required")
-            mechanism = "nosql.login_operator"
+            from .nosql_validator import _login_boundary, operator_targets
+            if _login_boundary(exchange):
+                mechanism = "nosql.login_operator"
+            elif operator_targets(exchange):
+                # r7: the finding's own request, one parameter at a time.
+                mechanism = "nosql.operator_differential"
+            else:
+                return decision("needs_prerequisite", "missing_parameter",
+                                "a captured query or body parameter is required")
         if family == "csp":
             content_type = next((str(v).lower() for k,v in exchange.response_headers.items()
                                  if k.lower() == "content-type"), "")
@@ -554,19 +571,25 @@ class ValidatorRegistry:
                 return decision("needs_prerequisite", "undecodable_jwt", "a complete decodable observed JWT is required")
         if family == "cross_identity" and run_context is not None and not any(
                 s.headers and s.principal_id != "anonymous" and s.health != "expired"
-                for s in run_context.sessions.all()):
+                for s in run_context.sessions.identities()):
             return decision("needs_prerequisite", "missing_principal", "a registered non-expired authenticated principal is required")
         if family == "cross_identity" and run_context is not None and not any(
                 s.principal_id == "anonymous" and s.health != "expired"
-                for s in run_context.sessions.all()):
+                for s in run_context.sessions.identities()):
             return decision("needs_prerequisite", "missing_anonymous_control", "an explicit anonymous control session is required")
-        if family == "cross_identity" and method != "GET":
-            return decision("unsupported", "unsupported_method", "cross-identity replay is GET-only")
+        if family == "cross_identity" and method not in {"GET", "PUT", "PATCH", "DELETE"}:
+            return decision("unsupported", "unsupported_method", "cross-identity supports GET and reversible object writes")
+        if family == "cross_identity" and method in {"PUT", "PATCH", "DELETE"}:
+            if run_context is None or not run_context.gate.config.allow_mutating_replay:
+                return decision("policy_denied", "mutating_policy_denied", "write authorization requires explicit mutating replay permission")
+            if method == "DELETE" and str(self._xid_cfg.get("delete_restore_method", "")).upper() != "PUT":
+                return decision("needs_prerequisite", "missing_restore_contract", "DELETE requires an explicit PUT recreation contract")
         if check.id == "WSTG-ATHZ-04":
             from .idor_read_validator import _locate_id
             if not _locate_id(exchange):
                 return decision("needs_prerequisite", "missing_object_id", "an observed object identifier is required")
-        if family in {"auth_sequence", "nosql"} and run_context is not None and not run_context.gate.config.allow_mutating_replay:
+        if ((family == "auth_sequence" or (family == "nosql" and method not in {"GET", "HEAD"}))
+                and run_context is not None and not run_context.gate.config.allow_mutating_replay):
             return decision("policy_denied", "mutating_policy_denied", "this procedure needs explicit mutating replay permission")
         return decision("ready", "ready", "exact procedure and known inputs are available")
 

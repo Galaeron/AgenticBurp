@@ -29,6 +29,7 @@ from unittest.mock import patch
 import yaml
 
 from harness import cache, evidence_ledger, report_generator, safety_gate, sarif_adapter, store
+from harness.issues import issue_class
 from harness.models import HttpExchange
 from harness.ollama_client import OllamaResult
 from harness.orchestrator import Orchestrator
@@ -37,6 +38,8 @@ from harness.validators.base import ValidationResult
 _HARNESS = Path(__file__).resolve().parent
 _URL = "http://bind.invalid/api/items/7"   # no query: keeps analyze's shape legs out
 _A, _B = "sqli", "cleartext_transmission"
+# The report groups on the class (issues.issue_class): B's label reads as insecure_transport.
+_B_ISSUE = issue_class(_B)
 
 
 class _Model:
@@ -173,11 +176,11 @@ class ProofBindingStorageExportTests(unittest.TestCase):
         self.assertFalse(stored_b["confirmed"])
         self.assertNotEqual(stored_b.get("proof_id"), a.proof_id)
         issues = self._issues()
-        self.assertFalse(issues[_B]["confirmed"])
-        self.assertNotIn(a.proof_id, json.dumps(issues[_B]))
+        self.assertFalse(issues[_B_ISSUE]["confirmed"])
+        self.assertNotIn(a.proof_id, json.dumps(issues[_B_ISSUE]))
         sarif = sarif_adapter.export_issues_to_sarif(list(issues.values()))
         b_results = [r for run in sarif["runs"] for r in run["results"]
-                     if _B in json.dumps(r) and _A not in r.get("ruleId", "")]
+                     if _B_ISSUE in json.dumps(r) and _A not in r.get("ruleId", "")]
         self.assertTrue(b_results)
         self.assertNotIn(a.proof_id, json.dumps(b_results))
 

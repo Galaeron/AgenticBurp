@@ -16,8 +16,10 @@ A route is keyed on its method, path template and the sorted NAMES of its inputs
 (query parameter names and top-level body field names; values never count), so a new
 input on a known route is new while a repeat with other values is not. A route key
 already in the engagement, or already offered for the same principal, is a
-duplicate; one out of scope or off the engagement origin is refused; and at most
-`max_new_routes` are ever accepted per run (the budget guard). The engagement drains
+duplicate; one out of scope or off the engagement origin is refused; a path that
+carries an attack payload is refused (`probe_path`: the route is the harness's own probe
+echoed back, not the app's surface); and at most `max_new_routes` are ever accepted per
+run (the budget guard). The engagement drains
 the feed between phases and investigates what is new (orchestrator_chain recrawl).
 
 OFF by default (`engagement.recrawl.enabled: false`): no feed is installed, the
@@ -27,16 +29,51 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 __all__ = ["RecrawlConfig", "RouteFeed", "RouteObservation", "input_names", "route_key",
-           "endpoint_route_keys"]
+           "endpoint_route_keys", "probe_path"]
 
 _CREDENTIAL_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization",
                                  "x-api-key", "x-auth-token"})
 # Capabilities whose traffic is the run looking after itself, not the app's surface.
 _IGNORED_CAPABILITIES = frozenset({"session_health", "session_refresh"})
 _MAX_BODY = 4000
+
+# probe_path: what a payload leaves in a URL path. r9 (2026-11-11): a path-traversal
+# probe's URL answered 401 (the app's auth layer answers any path under its API prefix),
+# so the feed took it as a new route; the recrawl investigated it, its probes echoed
+# new payload paths back, and 62 worklist units grew from one route
+# (`/<route>/....//....//etc/passwd`, `/<route>//windows/win.ini`, ...).
+_PROBE_TARGET_FILES = ("etc/passwd", "etc/shadow", "etc/group", "etc/hosts", "win.ini",
+                       "boot.ini", "system.ini", "proc/self/", "system32/")
+_PROBE_MARKERS = ("<", ">", '"', "`", "${", "{{", "$(")   # `..\` is a traversal segment
+_DECODE_ROUNDS = 3
+
+
+def probe_path(url: str) -> bool:
+    """True when a URL's path carries an attack payload rather than naming a route:
+    a traversal segment (`..`, `....`, encoded or not), a standard traversal target
+    file, or injection markup. Percent-decoding is applied up to three times, so
+    double-encoded payloads count. Query values are not looked at (they never make
+    a new route)."""
+    path = urlsplit(url or "").path or ""
+    seen = path
+    for _ in range(_DECODE_ROUNDS):
+        decoded = unquote(seen)
+        if decoded == seen:
+            break
+        seen = decoded
+    lowered = seen.lower()
+    if any(ord(ch) < 0x20 for ch in lowered):
+        return True
+    segments = lowered.replace("\\", "/").split("/")
+    if any(len(seg) >= 2 and set(seg) == {"."} for seg in segments):
+        return True
+    squeezed = "/".join(seg for seg in segments if seg)
+    if any(target in squeezed for target in _PROBE_TARGET_FILES):
+        return True
+    return any(marker in lowered for marker in _PROBE_MARKERS)
 
 
 def input_names(url: str, body=None) -> tuple:
@@ -156,6 +193,8 @@ class RouteFeed:
                 return self._refuse("out_of_scope")
         except Exception:
             return self._refuse("out_of_scope")
+        if probe_path(url):
+            return self._refuse("probe_path")
         path = normalize_path(url)
         inputs = input_names(url, exchange.get("request_body"))
         route = route_key(method, path, inputs)

@@ -57,8 +57,25 @@ BROWSER_STORED = "browser_stored_input_execution"
 BROWSER_KINDS = (BROWSER_HASH, BROWSER_STORED)
 SUPPORTED_KINDS = (KIND, *BROWSER_KINDS)
 SUPPORTED_CLASSES = frozenset({"idor", "bola"})
-SUPPORTED_EXPECTATIONS = ("private_to_creator",)
+# HU-1: `private_to_creator` (the access matrix's `owner_only`), `admin_only` and
+# `denied` all say the other identity's cross read must NOT succeed; `allowed` says
+# it may, so the same traffic can never confirm. The kinds come from config or from
+# an operator answer in the access matrix (access_matrix.expectation_for).
+SUPPORTED_EXPECTATIONS = ("private_to_creator", "owner_only", "admin_only", "denied", "allowed")
+RESTRICTIVE_EXPECTATIONS = frozenset({"private_to_creator", "owner_only", "admin_only", "denied"})
 EXPECTATION_SOURCE = "config engagement.access_expectations"
+MATRIX_SOURCE = "operator access matrix"
+# r7: an unattended run declares nothing, so every experiment was blocked. When an
+# object-scoped type has self-observed per-principal ownership (a principal of THIS
+# run created one, or was served one as its own) and the two identities share a
+# role, the expectation "owner only; the other same-role principal is denied" is
+# INFERRED. Inferred is never declared: it is labelled wherever it is recorded, a
+# confirmation that rests on it carries the assumption (basis "assumed"), and any
+# declared expectation or access-matrix answer replaces it.
+INFERRED_SOURCE = "inferred from self-observed ownership"
+INFERRED_EXPECTATION = "owner_only"
+INFERRED_LIMITATION = ("access expectation inferred, not declared: assumes objects of this type "
+                       "are private to their owner")
 
 # Judge outcomes.
 NEGATIVE = "negative"
@@ -297,18 +314,135 @@ def _expectation_for(expectations, object_name: str, endpoints: set):
     return None
 
 
+class SessionIdentity(tuple):
+    """A (session ref, principal id) pair that also carries the session's role, so
+    the access-matrix lookup can find the other identity's cell. It unpacks and
+    compares as the plain 2-tuple every caller already uses."""
+    role: str = ""
+
+    def __new__(cls, ref: str, pid: str, role: str = ""):
+        pair = super().__new__(cls, (ref, pid))
+        pair.role = role or ""
+        return pair
+
+
+def _single_placeholder_path(key: str, method: str) -> str:
+    """The path of an endpoint key "<METHOD> /a/{id}" whose ONLY placeholder is a
+    trailing `{...}`, normalised to `{id}`; "" otherwise."""
+    verb, _, path = str(key or "").partition(" ")
+    if verb.upper() != method or path.count("{") != 1 or not re.search(r"\{[^}]*\}/?$", path):
+        return ""
+    return re.sub(r"\{[^}]*\}", "{id}", path.rstrip("/"))
+
+
+def _inferred_expectation(obj, ownership, owner, other) -> dict | None:
+    """The expectation an unattended run may assume for `obj`, or None.
+
+    Only when: the object is object-scoped; the run's self-observed ownership has
+    per-principal facts for its type and no object of the type that two accounts
+    were both served (see SelfOwnership.owned_type); and the owner and the other
+    identity have the SAME (non-empty) role -- a different role (an admin) may be
+    entitled, which no observation can rule out. Mechanics come only from what was
+    observed: the create a principal of this run sent (method, path, id pointer,
+    redacted body) and the object's read and delete endpoints."""
+    if ownership is None or obj is None or not getattr(obj, "object_scoped", False):
+        return None
+    if owner is None or other is None:
+        return None
+    role = getattr(owner, "role", "")
+    if not role or role != getattr(other, "role", ""):
+        return None
+    owned_type = getattr(ownership, "owned_type", None)
+    seen = owned_type(obj.name) if callable(owned_type) else None
+    if not seen:
+        return None
+    basis = (f"{seen['objects']} object(s) of type '{obj.name}' observed owned by "
+             f"{len(seen['principals'])} principal(s) of this run, none served to two accounts; "
+             f"owner and other share role '{role}'")
+    exp = {"object": obj.name, "expectation": INFERRED_EXPECTATION,
+           "_source": f"{INFERRED_SOURCE} ({basis})", "_inferred": True, "_basis": basis}
+    create = seen.get("create") or {}
+    if create.get("method") and create.get("path"):
+        exp["create"] = {k: create[k] for k in ("method", "path", "body", "id_pointer") if k in create}
+        prefix = create["path"].rstrip("/").lower() + "/{id}"
+        reads = [p for p in (_single_placeholder_path(k, "GET")
+                             for k in getattr(obj, "read_endpoints", []) or []) if p]
+        read = next((p for p in reads if p.lower() == prefix), reads[0] if reads else "")
+        if read:
+            exp["read"] = {"method": "GET", "path": read}
+        deletes = [p for p in (_single_placeholder_path(k, "DELETE")
+                               for k in getattr(obj, "write_endpoints", []) or []) if p]
+        delete = next((p for p in deletes if p.lower() == prefix), deletes[0] if deletes else "")
+        if delete:
+            exp["delete"] = {"method": "DELETE", "path": delete}
+    return exp
+
+
 def _identities(sessions) -> tuple:
     """(owner, other) as (session ref, principal id): the first authenticated
     session and the next authenticated one with a DIFFERENT principal."""
-    authed = [(ref, pid) for ref, pid in (sessions or [])
-              if ref and pid and ref != "anonymous" and pid != ANON]
+    authed = [s for s in (sessions or []) if len(s) == 2 and s[0] and s[1]
+              and s[0] != "anonymous" and s[1] != ANON]
     owner = authed[0] if authed else None
     other = next((s for s in authed[1:] if owner and s[1] != owner[1]), None)
     return owner, other
 
 
+def _endpoint_objects(endpoints) -> list:
+    from harness.access_matrix import object_and_action
+    names = []
+    for key in sorted(endpoints or ()):
+        method, _, path = str(key).partition(" ")
+        shape = object_and_action(method, path)
+        if shape and shape[0] not in names:
+            names.append(shape[0])
+    return names
+
+
+def _matrix_expectation(base_url: str, other, object_names) -> dict | None:
+    """The operator's access-matrix answer for the other identity reading this
+    object, or None (no answer, or `unknown`). Never a proposed expectation."""
+    from urllib.parse import urlsplit
+    from harness import access_matrix
+    host = urlsplit(base_url or "").netloc
+    if not host or other is None:
+        return None
+    for name in object_names:
+        if not name:
+            continue
+        found = access_matrix.expectation_for(
+            None, host, getattr(other, "role", ""), name, "read", principal_id=other[1])
+        if found is not None:
+            return found
+    return None
+
+
+def _with_matrix(exp, matrix, name: str):
+    """(expectation entry, conflict text). The matrix answer supplies the kind
+    when config declares none (and its mechanics when config has no entry); an
+    explicit config kind that disagrees with the answer is a conflict."""
+    if matrix is None:
+        return exp, ""
+    kind = matrix["expectation"]
+    declared = str((exp or {}).get("expectation", "")).strip()
+    if exp is not None and declared:
+        if (declared == "allowed") != (kind == "allowed"):
+            return exp, (f"conflicting access expectations for object '{name}': "
+                         f"engagement.access_expectations declares '{declared}', the access "
+                         f"matrix answers '{matrix['answer']}'")
+        return exp, ""
+    merged = dict(exp or {})
+    if exp is None:
+        merged.update(matrix.get("mechanics") or {})
+    merged.update(object=(exp or {}).get("object") or name, expectation=kind,
+                  _source=f"{MATRIX_SOURCE} ({matrix['role']} {matrix['action']} "
+                          f"{matrix['object_type']}: {matrix['answer']}, by {matrix['operator']})")
+    return merged, ""
+
+
 def translate_cross_account(hypothesis_or_task, asm, expectations, sessions, values, *,
-                            base_url: str = "", id_pointers: dict | None = None) -> ExperimentPlan:
+                            base_url: str = "", id_pointers: dict | None = None,
+                            ownership=None) -> ExperimentPlan:
     """Translate one IDOR/BOLA hypothesis into a cross-account private-object
     experiment, or into a blocked plan listing every input that is missing.
 
@@ -316,7 +450,10 @@ def translate_cross_account(hypothesis_or_task, asm, expectations, sessions, val
     the run's registered (session ref, principal id) pairs; `values` the values
     observed so far. `id_pointers` maps a declared create key to an id pointer a
     validated planner proposal supplied: it can complete an extraction, never an
-    expectation. Sends nothing."""
+    expectation. `ownership` is the run's SelfOwnership (default: the one
+    `run_sessions` attached to `sessions`): with no declared expectation and no
+    matrix answer it may supply an INFERRED one (see _inferred_expectation).
+    Sends nothing."""
     values = values or {}
     hid, hyp = _hypothesis_of(hypothesis_or_task, asm)
     if hyp is None:
@@ -329,6 +466,14 @@ def translate_cross_account(hypothesis_or_task, asm, expectations, sessions, val
     exp = _expectation_for(expectations, obj.name if obj else "", endpoints)
     name = (obj.name if obj else "") or str((exp or {}).get("object", "")).strip() \
         or _object_name_from_source(hyp)
+    # HU-1: an operator answer in the access matrix for the other identity's read.
+    exp, conflict = _with_matrix(exp, _matrix_expectation(
+        base_url, _identities(sessions)[1], [name, *_endpoint_objects(endpoints)]), name)
+    if exp is None and not conflict:
+        exp = _inferred_expectation(
+            obj, ownership if ownership is not None else getattr(sessions, "self_ownership", None),
+            *_identities(sessions))
+    inferred = bool((exp or {}).get("_inferred"))
     exp_id = experiment_id(KIND, hid, name)
     missing: list = []
     unblock = {"object": name, "extractions": [], "values": [], "hard": False}
@@ -342,11 +487,14 @@ def translate_cross_account(hypothesis_or_task, asm, expectations, sessions, val
     create = (exp or {}).get("create") if isinstance((exp or {}).get("create"), dict) else {}
     read = (exp or {}).get("read") if isinstance((exp or {}).get("read"), dict) else {}
     delete = (exp or {}).get("delete") if isinstance((exp or {}).get("delete"), dict) else {}
-    if exp is None:
+    if conflict:
+        hard(conflict)
+    elif exp is None:
         hard(missing_expectation(name))
     elif declared not in SUPPORTED_EXPECTATIONS:
         hard(f"unsupported access expectation '{declared or '(none)'}' for object '{name}' "
-             f"(engagement.access_expectations supports only 'private_to_creator')")
+             f"(engagement.access_expectations supports only "
+             f"{', '.join(repr(k) for k in SUPPORTED_EXPECTATIONS)})")
     elif not create.get("method") or not create.get("path"):
         hard(f"no declared create endpoint (method, path) for object '{name}'")
     elif str(create["method"]).upper() not in ("POST", "PUT"):
@@ -358,6 +506,10 @@ def translate_cross_account(hypothesis_or_task, asm, expectations, sessions, val
         if delete and (not delete.get("method") or "{id}" not in str(delete.get("path", ""))):
             hard(f"declared delete endpoint for object '{name}' needs a method and an "
                  f"{{id}} placeholder in its path")
+        if inferred and not delete:
+            # Nobody declared this test: it may write only what it can remove again.
+            hard(f"no observed delete endpoint to clean up the inferred experiment's objects "
+                 f"for '{name}'")
 
     if owner is None:
         hard(MISSING_OWNER_IDENTITY)
@@ -457,7 +609,10 @@ def translate_cross_account(hypothesis_or_task, asm, expectations, sessions, val
     experiment = Experiment(
         id=exp_id, kind=KIND, hypothesis_id=hid,
         required_identities={"owner": owner_ref, "other": other_ref},
-        access_expectation={"object": name, "expectation": declared, "source": EXPECTATION_SOURCE},
+        access_expectation={"object": name, "expectation": declared,
+                            "source": exp.get("_source") or EXPECTATION_SOURCE,
+                            **({"inferred": True, "basis": exp.get("_basis", "")}
+                               if inferred else {})},
         setup_steps=(creator(SETUP_OWNER, owner_ref, owner_value),
                      creator(SETUP_OTHER, other_ref, other_value)),
         baseline_steps=(reader(BASELINE, owner_ref, read_owner, _OWNER_MARKER, (SETUP_OWNER,),
@@ -468,7 +623,13 @@ def translate_cross_account(hypothesis_or_task, asm, expectations, sessions, val
                               _CONTROL_OBJECT),),
         cleanup_steps=tuple(cleanup),
         extracted_values=(owner_value, other_value),
-        assertions=(f"declared {declared}: '{name}' created by {owner_pid} must not be readable "
+        assertions=(f"declared {declared}: '{name}' created by {owner_pid} may be read by "
+                    f"{other_pid}; no cross read is an authorization failure (attack 2xx or "
+                    f"401/403/404 = controlled negative); baseline and control must both be 2xx"
+                    if declared == "allowed" else
+                    (f"inferred {declared} (an assumption from self-observed ownership, not an "
+                     f"operator declaration): " if inferred else f"declared {declared}: ") +
+                    f"'{name}' created by {owner_pid} must not be readable "
                     f"by {other_pid}; attack 401/403/404 = controlled negative, attack 2xx "
                     f"carrying the owner's marker = authorization failure, anything else "
                     f"inconclusive; baseline and control must both be 2xx"),
@@ -760,8 +921,17 @@ async def run_experiment(experiment: Experiment, run_context, *, ledger,
                    .replace("~1", "/").replace("~0", "~"),
                    owner_tag=bound.get(_TAG_OWNER, ""))
     outcome, reason, fact = judged.outcome, judged.reason, None
+    declared = str(experiment.access_expectation.get("expectation", ""))
+    inferred = bool(experiment.access_expectation.get("inferred"))
+    if declared == "allowed" and outcome in (CONFIRMED, NEGATIVE):
+        # HU-1: the operator said this read is permitted. The same traffic that would
+        # confirm under owner_only is the expected behaviour here, and an allowed
+        # read establishes no ownership boundary, so no fact is recorded.
+        outcome = NEGATIVE
+        reason = (f"declared allowed ({experiment.access_expectation.get('source', '')}): "
+                  f"the cross-account read is expected; observed: {judged.reason}")
 
-    if outcome in (CONFIRMED, NEGATIVE):
+    if outcome in (CONFIRMED, NEGATIVE) and declared != "allowed":
         ref = object_reference(_bind(experiment.read_url_template, result.values),
                                run_id=run_context.run_id)
         session = getattr(getattr(run_context, "sessions", None), "get", lambda _r: None)(
@@ -789,8 +959,8 @@ async def run_experiment(experiment: Experiment, run_context, *, ledger,
             # verdict is persisted. A read that merely worked never does this.
             fact = ledger.record(OwnershipFact(
                 object_ref=ref, owner_principal_id=owner_pid,
-                provenance=f"declared private_to_creator; created-as:{owner_pid} "
-                           f"via {experiment.create_key}"))
+                provenance=f"{'inferred' if inferred else 'declared'} {declared}; "
+                           f"created-as:{owner_pid} via {experiment.create_key}"))
         if outcome == CONFIRMED and ledger.authorization(other, ref) != AuthzDecision.UNAUTHORIZED:
             outcome, reason, fact = INCONCLUSIVE, (
                 "the ownership ledger does not establish the read as an unauthorized crossing"), None
@@ -805,7 +975,9 @@ async def run_experiment(experiment: Experiment, run_context, *, ledger,
         baseline_artifact_id=art.get(BASELINE, ""), attack_artifact_id=art.get(ATTACK, ""),
         control_artifact_ids=(art[CONTROL],) if art.get(CONTROL) else (),
         expected_invariant=experiment.assertions, observed_result=reason,
-        limitation=f"cleanup: {cleanup}", executed=any(art.values()))
+        limitation=(f"{INFERRED_LIMITATION} ({experiment.access_expectation.get('basis', '')}); "
+                    if inferred else "") + f"cleanup: {cleanup}",
+        executed=any(art.values()))
     ok, why = store.persist_proof_record(proof)
     if not ok:
         outcome, reason = INCONCLUSIVE, f"proof was not persisted: {why}"
@@ -964,12 +1136,30 @@ def experiment_applicability(plan: Experiment, run_context, values=None) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
+class RunSessions(list):
+    """run_sessions' list, also carrying the run's SelfOwnership (or None), so a
+    translation reached through any caller can infer an expectation from it."""
+    self_ownership = None
+
+
+def _carry(sessions) -> list:
+    carried = RunSessions(sessions or [])
+    carried.self_ownership = getattr(sessions, "self_ownership", None)
+    return carried
+
+
 def run_sessions(run_context) -> list:
     """The run's authenticated sessions as (session ref, principal id), in
-    registration order. The anonymous session is never an experiment identity."""
-    return [(s.session_id, s.principal_id) for s in run_context.sessions.all()
-            if s.headers and s.session_id != "anonymous" and s.principal_id not in ("", ANON)
-            and s.health != "expired"]
+    registration order. The anonymous session is never an experiment identity.
+    The list carries the run's self-observed ownership as `.self_ownership`."""
+    found = RunSessions(
+        SessionIdentity(s.session_id, s.principal_id,
+                        s.role or getattr(getattr(s, "principal", None), "role", ""))
+        for s in run_context.sessions.identities()
+        if s.headers and s.session_id != "anonymous" and s.principal_id not in ("", ANON)
+        and s.health != "expired")
+    found.self_ownership = getattr(run_context, "self_ownership", None)
+    return found
 
 
 def _resolve_value_needs(state, name: str) -> None:
@@ -1041,7 +1231,7 @@ async def run_experiment_loop(state, run_context, *, ledger, expectations, sessi
     if asm is None:
         return {"completed": [], "failed": [], "blocked": {}, "deferred": [], "runs": 0,
                 "planner": counts, "skipped": "no application semantic model"}
-    ctx = {"expectations": expectations or [], "sessions": list(sessions or []),
+    ctx = {"expectations": expectations or [], "sessions": _carry(sessions),
            "base_url": base_url, "id_pointers": {}, "run_context": run_context}
     asked: set = set()
     _replan(state, asm, ctx)
@@ -1171,10 +1361,20 @@ def project_proofs(state, run_context):
         events = store.ledger_events_for(case['case_id'])
         event = next((e for e in events if (e.get('data') or {}).get('artifact_id') == proof['attack_artifact_id']), None)
         url = (event or {}).get('data', {}).get('request', '')
-        findings.append(dict(vulnerability_class=('dom_xss' if proof['validator'] == BROWSER_HASH else 'stored_xss' if proof['validator'] == BROWSER_STORED else 'idor'), severity='high', confidence=1.0,
+        # A crossing judged against an INFERRED expectation is a confirmation with a
+        # stated assumption (basis "assumed"), never the same as a declared one.
+        inferred = INFERRED_LIMITATION in str(proof.get('limitation') or '')
+        finding = dict(vulnerability_class=('dom_xss' if proof['validator'] == BROWSER_HASH else 'stored_xss' if proof['validator'] == BROWSER_STORED else 'idor'), severity='high',
+            confidence=0.8 if inferred else 1.0,
             confirmed=True, confirmed_by_leg=proof['validator'], validator=proof['validator'],
             case_id=case['case_id'], proof_id=proof['proof_id'], url=url,
-            summary=proof['observed_result'], basis='derived'))
+            summary=(f"{proof['observed_result']} -- assumption: {INFERRED_LIMITATION}; "
+                     f"confirm the object is private before relying on this"
+                     if inferred else proof['observed_result']),
+            basis='assumed' if inferred else 'derived')
+        if inferred:
+            finding['confirmation_assumption'] = str(proof.get('limitation') or '').split('; cleanup:')[0]
+        findings.append(finding)
     cases.extend({"proof_id": ref, "status": "unresolved", "executed": False,
                   "reason": "referenced attempt missing from owning run store"} for ref in sorted(references - found))
     return {"cases": cases, "findings": findings}

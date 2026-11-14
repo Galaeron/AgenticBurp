@@ -114,16 +114,34 @@ class LightCappedSqlmapTests(_AccountingFixture, unittest.TestCase):
 
     def test_negative_control_other_endpoints_keep_the_full_scan(self):
         self.env["I05D_REQUESTS"] = "12"
-        exchange = HttpExchange(url=f"{self.target.base}/api/Users/7", method="PUT",
+        # A POST that creates nothing (no 201, no new id, not a collection path).
+        # PUT/PATCH/DELETE are write endpoints with their own cap (test_b1_sqlmap_repro).
+        exchange = HttpExchange(url=f"{self.target.base}/api/lookup", method="POST",
                                 request_headers={"Content-Type": "application/json"},
                                 request_body='{"email":"a@b.c"}', response_status=200,
-                                response_body='{"id": 7}')
+                                response_body='{"found": false}')
         result, run = self._run_create(cap=5, exchange=exchange, level=2, risk=2)
-        self.assertEqual(len(self._tool_requests()), 12, "an update endpoint was capped")
+        self.assertEqual(len(self._tool_requests()), 12, "a non-create POST was capped")
         args = self.launched[0]
         self.assertEqual(args[args.index("--level") + 1], "2")
         self.assertNotIn("--technique", args)
         self.assertNotIn("light sqlmap", result.limitation)
+
+    def test_the_waf_probe_is_skipped_and_the_other_flags_are_unchanged(self):
+        """r7: sqlmap's WAF/IPS probe (a UNION ALL SELECT in a random parameter) was
+        hard-denied by the gate on every scan; the launched command now skips it."""
+        self.env["I05D_REQUESTS"] = "2"
+        exchange = HttpExchange(url=f"{self.target.base}/api/lookup?q=1", method="GET",
+                                request_headers={}, response_status=200, response_body="{}")
+        self._run_create(exchange=exchange, level=2, risk=2)
+        args = self.launched[0]
+        self.assertEqual(args.count("--skip-waf"), 1)
+        # Control: the rest of the fixed command line is as it was.
+        tail = args[args.index("--batch"):]
+        self.assertEqual(tail[:13], ["--batch", "--level", "2", "--risk", "2", "--threads", "1",
+                                     "--timeout", "10", "--retries", "1", "--flush-session",
+                                     "--disable-coloring"])
+        self.assertEqual(tail[13], "--skip-waf")
 
     def test_removing_the_cap_is_detected(self):
         """Fault injection: a proxy that ignores the cap lets every request through."""

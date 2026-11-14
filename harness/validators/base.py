@@ -69,6 +69,10 @@ class ValidationResult:
     # accounting never counts such a proof as confirmed or proof-bound. "" = the
     # validator's own observation.
     evidence_source: str = ""
+    # An incomplete result whose cause may clear by itself (the identity's session
+    # expired mid-scan, the route was paused after 5xx answers). The execution
+    # registry keeps a retry for it however many requests the attempt was answered.
+    transient_stop: bool = False
 
     def with_artifacts(self, *, baseline=None, attack=None, controls=()) -> "ValidationResult":
         """Name the sends behind this verdict; each is an ExecutionOutcome, a

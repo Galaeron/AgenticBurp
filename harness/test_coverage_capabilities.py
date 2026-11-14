@@ -379,9 +379,12 @@ class ReadinessInputTests(unittest.TestCase):
         self.assertEqual(self.decide('WSTG-CRYP-04',method='GET')['reason_code'],'missing_jwt')
         self.assertEqual(self.decide('WSTG-ATHZ-04',method='GET')['reason_code'],'missing_object_id')
         self.assertEqual(self.decide('WSTG-ATHZ-04',url='http://fixture.invalid/objects/7',method='GET')['status'],'ready')
-        self.assertEqual(self.decide('WSTG-INPV-06')['reason_code'],'unsupported_boundary')
-        self.assertEqual(self.decide('WSTG-INPV-06',url='http://fixture.invalid/login',method='GET')['status'],'unsupported')
-        self.assertEqual(self.decide('WSTG-INPV-06',url='http://fixture.invalid/login')['status'],'ready')
+        # r7: a non-login request is tested on its own parameters, not refused.
+        self.assertEqual(self.decide('WSTG-INPV-06')['mechanism_id'],'nosql.operator_differential')
+        self.assertEqual(self.decide('WSTG-INPV-06',body='{}')['reason_code'],'missing_parameter')
+        self.assertEqual(self.decide('WSTG-INPV-06',url='http://fixture.invalid/login',method='GET')['reason_code'],'missing_parameter')
+        self.assertEqual(self.decide('WSTG-INPV-06',url='http://fixture.invalid/login?u=a',method='GET')['status'],'ready')
+        self.assertEqual(self.decide('WSTG-INPV-06',url='http://fixture.invalid/login')['mechanism_id'],'nosql.login_operator')
 
     def test_unavailable_adapter_protocol_and_disable_dispositions(self):
         for check in ('WSTG-CONF-06','WSTG-INFO-02','WSTG-INFO-05'):

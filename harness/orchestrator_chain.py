@@ -27,6 +27,7 @@ from harness.run_context import transport_for, ExecutionOutcome, case_scope, cou
 from harness.execution_registry import ExecutionRegistry
 from harness.validators.injection_targets import REQUEST_LEVEL_INPUTS, case_target
 from harness import run_journal
+from harness import review_overlap
 # FR-6: need the module too (the driver scope reads its ambient run) -- aliased for the
 # same shadowing reason as above (several methods below have a `run_context` parameter).
 from harness import run_context as _run_context_mod
@@ -336,11 +337,24 @@ def _missing_auth_class(vc: str, method: str) -> bool:
     return "unauthenticated" in low or (("expos" in low or "disclos" in low) and "admin" in low)
 
 
-def _access_control_shape_gap(exchange) -> str:
-    """Why neither cross-identity nor idor-read can test this request ('' if one can)."""
-    from harness.validators.cross_identity_validator import CrossIdentityValidator
+def _access_control_shape_gap(exchange, xval=None) -> str:
+    """Why neither cross-identity nor idor-read can test this request ('' if one can).
+
+    A captured object write (PUT/PATCH/DELETE) is testable by `xval`'s write leg
+    when that validator was built with mutating replay permitted (B1-T2). r7: this
+    gate predated the write leg and refused every non-GET, so a write-method BOLA
+    finding never reached cross_identity even with allow_mutating_replay on."""
+    from harness.validators.cross_identity_validator import CrossIdentityValidator, _WRITE_METHODS
     from harness.validators.idor_read_validator import _locate_id
     method = (exchange.method or "GET").upper()
+    if method in _WRITE_METHODS:
+        if xval is None or not xval.write_admitted(method):
+            return (f"cross-identity write authorization for a {method} request needs "
+                    f"validators.allow_mutating_replay (and, for DELETE, a "
+                    f"delete_restore_method=PUT contract); idor-read replays GET reads only")
+        if CrossIdentityValidator.shape_applies(exchange):
+            return ""
+        return f"no object identifier in this {method} request to test write authorization on"
     if method != "GET":
         return f"cross-identity and idor-read replay GET reads only; this is a {method} request"
     if CrossIdentityValidator.shape_applies(exchange) or _locate_id(exchange) is not None:
@@ -1039,7 +1053,10 @@ class ChainMixin:
 
     # Roles registered as replay identities below are owned by this engagement
     # and released when it ends (never leak into a later engagement on the host).
+    # A capture review left running beside the later phases is cancelled and awaited
+    # when the engagement ends, however it ends (harness/review_overlap.py).
     @identity_headers.leased
+    @review_overlap.reaps_review_overlaps
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
                                      discovery_max_endpoints: int | None = None,
@@ -1198,6 +1215,7 @@ class ChainMixin:
                     for unit, payload in _journal.units("review:").items()}, {})
                             if _resuming else None),
                 "on_review": lambda key, payload: _journal_put(f"review:{key}", payload),
+                "journal_key": _journal.exchange_key,
                 "summary_out": _review_summary}
         # engagement.retry_rounds (off by default): record what every sweep and review
         # settles, so the time left after the coverage drive goes to the work they left.
@@ -1388,6 +1406,7 @@ class ChainMixin:
             # establishes is what that validator consults.
             ownership = self._experiment_ownership(state, run_context, base_url)
         _xid_cfg = (self.config.get("validators", {}) or {}).get("cross_identity", {}) or {}
+        from harness.config_schema import parse_validators_flags
         _xval = CrossIdentityValidator(
             allowed_hosts=self.allowed_hosts,
             timeout=float(_xid_cfg.get("timeout", 10.0)),
@@ -1395,7 +1414,12 @@ class ChainMixin:
             run_context=run_context,
             # WL-04: the registry's declared-ownership source (D1 seam); None means
             # a cross-identity match is a `supported` lead, never a confirmation.
-            ownership=ownership)
+            ownership=ownership,
+            # B1-T2: the same write policy the registry builds with, so what
+            # applies()/write_admitted() admit is what this path executes.
+            delete_restore_method=str(_xid_cfg.get("delete_restore_method", "")),
+            allow_writes=parse_validators_flags(
+                self.config.get("validators", {}) or {})["allow_mutating_replay"])
         # Single-principal IDOR read-differential: swap the object id (no second
         # account needed). Seed it with foreign ids observed elsewhere in the run
         # (other users mentioned in public content, ids seen in links) so a
@@ -1731,13 +1755,15 @@ class ChainMixin:
                     return
             elif (access_control_gate._is_access_control_class(vc)
                   and not _authentication_only_class(vc)):
-                _gap = _access_control_shape_gap(exchange)
+                _gap = _access_control_shape_gap(exchange, _xval)
                 if _gap:
                     # No baseline GET to a POST route, no replay of a list read.
                     _record_no_applicable_leg(finding, "cross-identity", _gap)
                     return
                 # populate the candidate baseline: the probe role's own response.
-                if exchange.response_status is None and scope_discovery.is_host_allowed(exchange.url, self.allowed_hosts):
+                # A write takes its own owner baseline inside the write leg.
+                if (_method == "GET" and exchange.response_status is None
+                        and scope_discovery.is_host_allowed(exchange.url, self.allowed_hosts)):
                     # W-16: baseline read through the single TargetTransport (this run's
                     # when present, else a standalone one). send_creds forwards the probe
                     # role's own credentials; max_redirects=0 == follow_redirects=False.
@@ -2221,16 +2247,36 @@ class ChainMixin:
         if _investigation_deadline is not None:
             _review_deadline = min(_review_deadline or _investigation_deadline,
                                    _investigation_deadline)
+        _review_budget = _review_deadline
         # phase_slices: review gets its share of what is left, so the chain rounds
         # after it are not starved; an explicit capture_review_seconds still binds.
         _review_deadline = _schedule.deadline_for("capture_review", _review_deadline)
+        # engagement.review_overlap: when that share would stop a model-bound review
+        # short of its own deadline, the review keeps going in the background while
+        # the request-bound phases below send theirs, and is drained before the retry
+        # rounds (harness/review_overlap.py). Otherwise it runs inline as before.
+        _overlap = None
         if not (stop_on_confirm and _early_confirmed):
-            await review_captured_exchanges(
-                self, state, _all_captured, run_context=run_context,
-                seen=_reviewed_captures, errors=_errors, stats=_review_stats,
-                max_reviews=self.capture_review_limit, deadline=_review_deadline,
-                **_review_kwargs)
-            _journal_phase("review")
+            if (_review_deadline is not None
+                    and (_review_budget is None or _review_deadline < _review_budget)
+                    and review_overlap.enabled(self.config)
+                    and review_overlap.review_uses_model(self)):
+                async def _overlap_review(captured, **bounds):
+                    return await review_captured_exchanges(
+                        self, state, captured, run_context=run_context,
+                        seen=_reviewed_captures, errors=_errors, stats=_review_stats,
+                        max_reviews=self.capture_review_limit, **bounds, **_review_kwargs)
+
+                _overlap = review_overlap.ReviewOverlap(
+                    _overlap_review, deadline=_review_budget).start(list(_all_captured))
+                await _overlap.hold(_review_deadline)
+            else:
+                await review_captured_exchanges(
+                    self, state, _all_captured, run_context=run_context,
+                    seen=_reviewed_captures, errors=_errors, stats=_review_stats,
+                    max_reviews=self.capture_review_limit, deadline=_review_deadline,
+                    **_review_kwargs)
+                _journal_phase("review")
 
         # R19: supply link_findings the RESPONSE MAP it needs to detect a leaked
         # credential (url -> {headers, body}), built from the real captured
@@ -2285,7 +2331,9 @@ class ChainMixin:
                 discovery_max_probes=discovery_max_probes, run_context=run_context,
                 **self._discovery_ffuf_kw())
             outs2, new_findings = await _investigate(st2, derived, deadline=_chain_deadline)
-            if not (stop_on_confirm and any(f.get("confirmed") for f in new_findings)):
+            _review_round = not (stop_on_confirm and any(f.get("confirmed") for f in new_findings))
+            _round_in_background = _review_round and _overlap is not None and _overlap.accepting
+            if _review_round and not _round_in_background:
                 await review_captured_exchanges(
                     self, st2, getattr(rc2, "captured", None), run_context=run_context,
                     seen=_reviewed_captures, errors=_errors, stats=_review_stats,
@@ -2298,6 +2346,8 @@ class ChainMixin:
             # in the final summary/worklist/coverage/report -- not just in a local
             # list. Also feed the re-crawl's responses into credential detection.
             state.merge_from(st2)
+            if _round_in_background:   # reviewed into the merged state, in the background
+                _overlap.extend(list(getattr(rc2, "captured", None) or []))
             _responses.update(_responses_from(getattr(rc2, "captured", None)))
             link = chain_linker.link_findings(state, all_findings, responses=_responses)
             chains = list(link["chain_findings"])
@@ -2464,6 +2514,8 @@ class ChainMixin:
         _instr.phases.begin("coverage_drive")
         _requests_before_coverage = getattr(_run_budget, "used", None)
         if _coverage_hold:
+            if _overlap is not None:   # the reserve is the drive's: the review stops here
+                await _overlap.drain("coverage request reserve")
             _run_budget.release_hold()
         _coverage_deadline = (time.monotonic() + self.coverage_drive_seconds
                               if self.coverage_drive_seconds > 0 else None)
@@ -2643,12 +2695,32 @@ class ChainMixin:
                 # worked out ONCE here rather than per check. Only requests that were
                 # observed as that identity count; nothing is built for an identity
                 # that was never probed or captured on the endpoint.
-                from harness.engagement import capture_identity_key, replayable_variants
+                from harness.engagement import (capture_identity_key, identity_variants,
+                                                replayable_variants)
                 _identity_role = {_pid(r): r.role for r in roles}
                 _replayable = {
                     (ep_key, identity): replayable_variants(ep, capture_identity_key(headers))
                     for ep_key, ep in state.endpoints.items() if ep.capture_variants
                     for identity, headers in _role_headers.items()}
+                # Captures merged into one replay (replay_dedupe), for the report.
+                _replay_merge = {"captures": 0, "replays": 0, "endpoints": set()}
+                for (ep_key, identity), kept in _replayable.items():
+                    every = identity_variants(state.endpoints[ep_key],
+                                              capture_identity_key(_role_headers[identity]))
+                    _replay_merge["captures"] += len(every)
+                    _replay_merge["replays"] += len(kept)
+                    if len(kept) < len(every):
+                        _replay_merge["endpoints"].add(ep_key)
+                # Per-(endpoint, check) wall-time bound while the drive is time-bound:
+                # one slow endpoint (a long-poll route captured 23 times in r9) must
+                # not take the time every other endpoint's checks needed. Access-control
+                # checks compare identities, so each identity gets its own share.
+                _share = float(getattr(self, "coverage_endpoint_check_share", 0.0) or 0.0)
+                _endpoint_check_cap = (self.coverage_drive_seconds * _share
+                                       if self.coverage_drive_seconds > 0 and _share > 0 else None)
+                _endpoint_check_spent: dict = {}
+                _endpoint_check_capped: dict = {}
+                _PER_IDENTITY_SHARE = frozenset({"cross_identity", "idor_read"})
 
                 def _captured_readiness(identity, method, path, check):
                     if check.id == "WSTG-CRYP-01":
@@ -2721,7 +2793,9 @@ class ChainMixin:
                         return _VR(check.confirmation, "inconclusive", check.vulnerability_class,
                                    summary="missing_principal: capture the request as this identity")
                     selected_roles = [r for r in roles if _pid(r) == identity]
-                    outcomes = []
+                    outcomes, held_back = [], []
+                    share_key = (ep_key, check.id) + (
+                        (identity,) if check.confirmation in _PER_IDENTITY_SHARE else ())
                     for node in worklist_investigator.captured_nodes(
                             dict(ep.to_dict(), capture_variants=variants), base_url, selected_roles,
                             include_probes=True):
@@ -2729,9 +2803,34 @@ class ChainMixin:
                         if problem:
                             outcomes.append(_VR(check.confirmation, "inconclusive", check.vulnerability_class,
                                                 summary=problem + ": supply a complete authorized capture"))
+                        elif (_endpoint_check_cap is not None
+                              and _endpoint_check_spent.get(share_key, 0.0) >= _endpoint_check_cap):
+                            # A started replay always finishes; only the next one waits.
+                            capped = _endpoint_check_capped.setdefault(share_key, {
+                                "endpoint": ep_key, "check": check.id,
+                                "identity": identity if len(share_key) > 2 else None,
+                                "seconds_spent": 0.0, "replays_not_run": 0})
+                            capped["seconds_spent"] = round(_endpoint_check_spent[share_key], 1)
+                            capped["replays_not_run"] += 1
+                            held_back.append(_VR(
+                                check.confirmation, "inconclusive", check.vulnerability_class,
+                                summary=("endpoint_check_time_share: this check used its "
+                                         f"{_endpoint_check_cap:.1f} s share of the coverage drive "
+                                         "on this endpoint; this capture was not replayed")))
                         else:
-                            outcomes.append(await _run_captured_leg(identity, method, path, check, case_key,
-                                                                    node, remainder_only=remainder_only))
+                            started = time.monotonic()
+                            try:
+                                outcomes.append(await _run_captured_leg(
+                                    identity, method, path, check, case_key, node,
+                                    remainder_only=remainder_only))
+                            finally:
+                                _endpoint_check_spent[share_key] = (
+                                    _endpoint_check_spent.get(share_key, 0.0)
+                                    + time.monotonic() - started)
+                    # A replay the time share held back leaves the cell open, unless
+                    # another capture of it already confirmed (that proof was recorded).
+                    if not any(r is not None and r.confirmed for r in outcomes):
+                        outcomes += held_back
                     # A passive leg judges each captured response on its own; one it
                     # skips (a redirect, a body that was not kept) says nothing about
                     # the cell, so it never hides another capture's verdict.
@@ -2775,6 +2874,18 @@ class ChainMixin:
                                     "error": "coverage drive time budget reached: "
                                              f"{coverage.get('queued_not_attempted', 0)} queued "
                                              "leg(s) not attempted"})
+                if _replay_merge["replays"] < _replay_merge["captures"]:
+                    coverage["replay_merge"] = {
+                        "captures": _replay_merge["captures"], "replays": _replay_merge["replays"],
+                        "endpoints": sorted(_replay_merge["endpoints"])}
+                if _endpoint_check_capped:
+                    capped = sorted(_endpoint_check_capped.values(),
+                                    key=lambda c: (c["endpoint"], c["check"], c["identity"] or ""))
+                    coverage["endpoint_check_time_capped"] = capped
+                    _errors.append({"phase": "coverage_drive",
+                                    "error": "per-endpoint check time share reached: "
+                                             f"{sum(c['replays_not_run'] for c in capped)} captured "
+                                             f"replay(s) not run on {len(capped)} endpoint check(s)"})
             else:
                 coverage = coverage_tracker.build_coverage(state, roles,
                                                            investigated_keys=investigated_keys)
@@ -2859,6 +2970,14 @@ class ChainMixin:
             log.warning("investigate_engagement: server-error follow-up failed: %s", e)
             _errors.append({"phase": "server_errors", "error": f"{type(e).__name__}: {e}"})
 
+        # The request-bound phases are over: a background capture review stops taking
+        # captures (the one in flight finishes); the retry rounds review what is left.
+        if _overlap is not None:
+            await _overlap.drain()
+            if _overlap.error:
+                _errors.append({"phase": "capture_review", "error": _overlap.error})
+            _journal_phase("review")
+
         # engagement.retry_rounds: until reserve_seconds before the deadline, sweep the
         # worklist and review captures again with growing budgets, for the nodes and
         # captures earlier passes left (harness/retry_rounds.py). Off by default.
@@ -2903,18 +3022,18 @@ class ChainMixin:
             log.info("investigate_engagement: retry rounds -- %d round(s), stopped by %s",
                      len(_retry_report.get("rounds") or []), _retry_report.get("stopped_by"))
 
-        if _retry_ledger is not None and _retry_report.get("rounds"):
-            try:   # the server errors the rounds' own sends drew
+        if (_retry_ledger is not None and _retry_report.get("rounds")) or _overlap is not None:
+            try:   # the server errors the rounds' (or the background review's) sends drew
                 _server_error_changed += await _server_error_pass()
             except Exception as e:
                 log.warning("investigate_engagement: server-error follow-up failed: %s", e)
                 _errors.append({"phase": "server_errors", "error": f"{type(e).__name__}: {e}"})
         if run_context is not None and _server_error_report["enabled"]:
             _server_error_report["ledger"] = run_context.server_errors.report()
-        # The matrix was built before the rounds and the server-error follow-up: record
-        # what they found into it.
-        if coverage and (_server_error_changed or (_retry_ledger is not None
-                                                   and _retry_report.get("rounds"))):
+        # The matrix was built before the rounds and the server-error follow-up (and
+        # while a background review was still running): record what they found into it.
+        if coverage and (_server_error_changed or _overlap is not None
+                         or (_retry_ledger is not None and _retry_report.get("rounds"))):
             try:
                 if _coverage_trackers:
                     coverage = coverage_tracker.refresh_after_retry_rounds(
@@ -3030,6 +3149,7 @@ class ChainMixin:
                 "spa_views": getattr(rc, "spa_views", None) or [],
                 "recrawl": _recrawl_report,
                 "phase_schedule": _schedule.report() if _schedule.active else None,
+                "review_overlap": _overlap.report() if _overlap is not None else None,
                 "retry_rounds": _retry_report,
                 "session_events": list(getattr(run_context.freshness(), "events", []) or [])
                                   if run_context is not None and hasattr(run_context, "freshness") else [],

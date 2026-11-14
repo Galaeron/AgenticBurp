@@ -253,6 +253,131 @@ class PlaywrightSpaCrawlTests(unittest.TestCase):
         self.assertEqual(res.stopped_by, "max_views")
 
 
+class _FailingSpa(_FakeSpa):
+    """Opening a listed view raises the given exception."""
+
+    def __init__(self, views, failures):
+        super().__init__(views)
+        self.failures = failures
+
+    async def open(self, url):
+        exc = self.failures.get(view_key(url))
+        if exc is not None:
+            raise exc
+        await super().open(url)
+
+
+class CrawlErrorDetailTests(unittest.TestCase):
+    """r7: crawl errors read "view /#/search: Error" -- Playwright's own `Error`
+    type with its message dropped."""
+
+    def _crawl(self, failures):
+        spa = _FailingSpa({"/#/home": (["#/search", "#/basket", "#/away"], [])}, failures)
+        return asyncio.run(crawl_views(spa, "http://shop.test/#/home",
+                                       in_scope=lambda u: "shop.test" in u))
+
+    def test_an_error_carries_its_type_and_first_message_line_without_query_values(self):
+        class Error(Exception):     # what Playwright raises, by name
+            pass
+        res = self._crawl({"/#/search": Error(
+            "Page.goto: net::ERR_ABORTED at http://shop.test/x?token=s3cr3t\nCall log:\n  - nav")})
+        self.assertEqual(res.errors, ["view /#/search: Error: Page.goto: net::ERR_ABORTED at "
+                                      "http://shop.test/x?..."])
+
+    def test_an_empty_message_falls_back_to_its_cause(self):
+        try:
+            try:
+                raise TimeoutError("waiting for load")
+            except TimeoutError as inner:
+                raise RuntimeError() from inner
+        except RuntimeError as exc:
+            res = self._crawl({"/#/search": exc})
+        self.assertEqual(res.errors, ["view /#/search: RuntimeError (TimeoutError: waiting for load)"])
+
+    def test_a_refused_view_is_not_an_error(self):
+        from harness.spa_navigation import ViewRefused
+        res = self._crawl({"/#/away": ViewRefused("redirect to https://x.test refused (scope)")})
+        self.assertEqual(res.errors, [])
+        self.assertEqual(res.refused, ["view /#/away: redirect to https://x.test refused (scope)"])
+        self.assertEqual(res.skipped.get("refused_redirect"), 1)
+
+    def test_control_views_that_open_record_nothing(self):
+        res = self._crawl({})
+        self.assertEqual((res.errors, res.refused), ([], []))
+        self.assertEqual(len(res.views), 4)
+
+
+_REDIRECT_PAGE = r"""<!doctype html><html><body>
+<a href="/out?to=elsewhere">Out</a> <a href="#/search">Search</a>
+<script>
+function load() {
+  const view = (location.hash.replace(/^#\//, '') || 'home').split('/')[0];
+  fetch('/api/' + view);
+}
+window.addEventListener('hashchange', load);
+load();
+</script></body></html>"""
+
+
+class _RedirectHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        self.server.received.append(path)
+        if path == "/out" and self.server.redirect:
+            self.send_response(302)
+            self.send_header("Location", "https://elsewhere.example/landing")
+            data = b""
+        elif path in ("/", "/out"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            data = _REDIRECT_PAGE.encode()
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            data = b"{}"
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+@unittest.skipUnless(playwright_available(), "Playwright Chromium is not installed")
+class PlaywrightRefusedRedirectTests(unittest.TestCase):
+    """r7: a view whose navigation redirected out of scope was reported as
+    "view /redirect: Error", and the next hash view then failed in the dying
+    document ("view /#/search: Error")."""
+
+    def _crawl(self, redirect):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectHandler)
+        httpd.received, httpd.redirect = [], redirect
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        scope = ScopePolicy(allowed_hosts=frozenset({"127.0.0.1"}))
+        res = asyncio.run(PlaywrightDriver().crawl_spa(f"{base}/", wait_ms=300, headers={},
+                                                       scope=scope))
+        return res, base, httpd.received
+
+    def test_an_out_of_scope_redirect_is_refused_and_the_crawl_goes_on(self):
+        res, base, received = self._crawl(redirect=True)
+        self.assertEqual(res.errors, [])
+        self.assertEqual(len(res.refused), 1, res.refused)
+        self.assertIn("view /out: redirect to https://elsewhere.example refused", res.refused[0])
+        self.assertNotIn("to=elsewhere", res.refused[0])
+        self.assertIn(f"{base}/#/search", res.views)
+        self.assertIn("/api/search", received)
+
+    def test_control_without_the_redirect_the_view_simply_opens(self):
+        res, base, _ = self._crawl(redirect=False)
+        self.assertEqual((res.errors, res.refused), ([], []))
+        self.assertIn(f"{base}/out?to=elsewhere", res.views)
+
+
 def _two_users():
     return [RoleSession("anonymous", {}),
             RoleSession("user", {"Authorization": "Bearer U1"}, name="eval-user-1"),
@@ -672,6 +797,21 @@ class PhaseScheduleTests(unittest.TestCase):
         clock.now = 600.0
         self.assertEqual(sched.deadline_for("chain_rounds"), 1000.0)
 
+    def test_final_passes_keeps_a_share_after_the_chain_rounds(self):
+        # r6: the chain rounds, the last sliced phase, held the run to its deadline,
+        # so the server-error pass (no lead started past the deadline) sent nothing.
+        clock = _FakeClock()
+        sched = PhaseSchedule(1000.0, {"chain_rounds": 1, "final_passes": 1}, clock=clock)
+        clock.now = 600.0
+        self.assertEqual(sched.deadline_for("chain_rounds"), 800.0)
+        self.assertEqual(sched.report()["granted_seconds"], {"chain_rounds": 200.0})
+
+    def test_control_without_final_passes_the_chain_rounds_reach_the_deadline(self):
+        clock = _FakeClock()
+        sched = PhaseSchedule(1000.0, {"chain_rounds": 1}, clock=clock)
+        clock.now = 600.0
+        self.assertEqual(sched.deadline_for("chain_rounds"), 1000.0)
+
     def test_an_explicit_cap_still_binds(self):
         sched = PhaseSchedule(1000.0, {"capture_review": 1, "chain_rounds": 1},
                               clock=_FakeClock())
@@ -832,17 +972,37 @@ class CrawlLoopCallerTests(unittest.TestCase):
         self.assertEqual(result["crawl_loop"]["recrawl"]["rounds"], 0)
 
     def test_phase_slices_keep_time_for_review_and_the_chain_rounds(self):
-        _, seen = self._investigate({"investigation_seconds": 900, "phase_slices": {
+        # The inline review (review_overlap off) stops at its slice.
+        _, seen = self._investigate({"investigation_seconds": 900, "review_overlap": False,
+                                     "phase_slices": {
             "worklist": 1, "capture_review": 1, "chain_rounds": 1}})
         worklist_deadline = seen["worklist"][0][1]
         self.assertAlmostEqual(worklist_deadline - seen["started"], 300, delta=30)
         self.assertLess(seen["review_deadline"], seen["started"] + 900 - 300 + 30)
         self.assertGreater(seen["review_deadline"], worklist_deadline)
 
+    def test_with_review_overlap_the_slice_no_longer_ends_the_review(self):
+        # review_overlap on (the default): the slice only bounds how long the
+        # engagement waits; the review itself keeps the investigation deadline.
+        result, seen = self._investigate({"investigation_seconds": 900, "phase_slices": {
+            "worklist": 1, "capture_review": 1, "chain_rounds": 1}})
+        self.assertAlmostEqual(seen["review_deadline"] - seen["started"], 900, delta=30)
+        self.assertIsNotNone(result["crawl_loop"]["review_overlap"])
+
     def test_control_without_slices_the_worklist_gets_the_whole_bound(self):
         _, seen = self._investigate({"investigation_seconds": 900})
         self.assertAlmostEqual(seen["worklist"][0][1] - seen["started"], 900, delta=30)
         self.assertEqual(seen["review_deadline"], seen["worklist"][0][1])
+
+    def test_a_final_passes_share_is_kept_out_of_the_sliced_phases(self):
+        _, seen = self._investigate({"investigation_seconds": 900, "phase_slices": {
+            "worklist": 1, "final_passes": 2}})
+        self.assertAlmostEqual(seen["worklist"][0][1] - seen["started"], 300, delta=30)
+
+    def test_control_without_final_passes_the_last_sliced_phase_gets_the_whole_bound(self):
+        _, seen = self._investigate({"investigation_seconds": 900, "phase_slices": {
+            "worklist": 1}})
+        self.assertAlmostEqual(seen["worklist"][0][1] - seen["started"], 900, delta=30)
 
     def test_an_explicit_review_cap_still_binds_under_slices(self):
         _, seen = self._investigate({"investigation_seconds": 900, "capture_review_seconds": 5,

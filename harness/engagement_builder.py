@@ -24,10 +24,18 @@ the fusion. Deterministic given the same live responses.
 from __future__ import annotations
 
 import logging
+import re
 from urllib.parse import urlsplit
 
 from harness import engagement
 from harness import role_crawl
+
+# A cookie name that may carry a session or credential. An undeclared cookie so
+# named keeps a capture from binding to a role that declares no cookies (it could
+# be another principal's session); any other undeclared cookie is a preference
+# (consent, language, theme) and carries no identity.
+_SESSION_LIKE_COOKIE = re.compile(r"sess|sid|token|auth|jwt|login|remember|credential|identity",
+                                  re.IGNORECASE)
 from harness.role_crawl import RoleSession
 
 log = logging.getLogger("harness.engagement_builder")
@@ -124,6 +132,7 @@ async def build_engagement(
                         spa_views.append({"principal": role.principal_id(),
                                           "views": len(crawl.views),
                                           "exchanges": len(crawl.exchanges),
+                                          "refused": list(getattr(crawl, "refused", []) or []),
                                           "stopped_by": crawl.stopped_by})
                         seed_errors.extend("browser spa crawl: " + e for e in crawl.errors)
                         continue
@@ -150,18 +159,27 @@ async def build_engagement(
             if sep and name.strip():
                 pairs.add((name.strip(), val.strip()))
         return pairs
+    any_declared_cookie = {name for role in roles
+                           for name, _ in cookie_pairs(credentials(role.headers).get("cookie"))}
+    def identity_cookies(pairs):
+        # Cookies that may identify someone: a name some supplied role declares, or
+        # a session-like name. Preference cookies (consent, language) are neither.
+        return {(n, v) for n, v in pairs
+                if n in any_declared_cookie or _SESSION_LIKE_COOKIE.search(n)}
     def owns(role_headers, capture_headers):
         # AR-ID: a browser sends the declared session cookie next to cookies it or
         # the server set, in any order. A role that declares cookies owns a capture
         # carrying all of them; a role that declares none (anonymous, bearer-only)
-        # still needs a cookie-free capture, so an undeclared session is never
-        # relabelled. Every other identity header must match exactly.
+        # owns a capture whose cookies are all preferences, so an undeclared
+        # session is never relabelled. Every other identity header must match exactly.
         declared, seen = credentials(role_headers), credentials(capture_headers)
         declared_cookies = cookie_pairs(declared.pop("cookie", ""))
         seen_cookies = cookie_pairs(seen.pop("cookie", ""))
         if declared != seen:
             return False
-        return declared_cookies <= seen_cookies if declared_cookies else not seen_cookies
+        if declared_cookies:
+            return declared_cookies <= seen_cookies
+        return not identity_cookies(seen_cookies)
     for item in supplied:
         try:
             ex = item if isinstance(item, HttpExchange) else HttpExchange(**item)

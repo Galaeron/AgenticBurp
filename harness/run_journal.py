@@ -19,6 +19,12 @@ Credentials are never written. Request headers go through security.redact_header
 redaction stored captures use), the headers a role supplied are replaced by a pointer to
 the role (`$role:<principal id>`) that the resumed run fills from its own roles, and any
 role credential value left anywhere in a payload is withheld.
+
+Unit keys hold no credential value either (worklist_investigator.node_key,
+RunJournal.exchange_key): a resumed run whose roles logged in again, with new token
+values, still finds the units an earlier attempt finished. The discovery unit records
+each principal's identity key (a digest), so restore_discovery moves the principal's
+stored captures to the identity key of its current credentials.
 """
 from __future__ import annotations
 
@@ -55,6 +61,7 @@ class RunJournal:
         self.path = Path(path)
         self.root_job_id = str(root_job_id)
         self.context_key = str(context_key)
+        self._roles = tuple(roles or ())
         secrets = {str(value) for role in roles or ()
                    for name, value in (getattr(role, "headers", None) or {}).items()
                    if security.is_credential_header(name) and len(str(value)) >= _MIN_SECRET_LENGTH}
@@ -85,6 +92,21 @@ class RunJournal:
         for secret in self._secrets:
             text = text.replace(secret, security.SECRET_VALUE_PLACEHOLDER)
         return text
+
+    def exchange_key(self, exchange) -> str:
+        """The journal key of one capture's review: the exchange as
+        assessment_health.observation_key sees it, with each role-supplied credential
+        header as a pointer to its role (pack_exchange) and any role credential left
+        in it withheld. A resumed run whose roles logged in again (new token values)
+        finds the review an earlier attempt finished; observation_key alone hashes the
+        token values and never matches."""
+        data = pack_exchange(exchange, self._roles)
+        record = [data.get("method"), data.get("url"),
+                  {k.lower(): v for k, v in (data.get("request_headers") or {}).items()},
+                  data.get("request_body"), data.get("response_status"),
+                  {k.lower(): v for k, v in (data.get("response_headers") or {}).items()},
+                  data.get("response_body")]
+        return _digest(self._withhold_credentials(json.dumps(record, sort_keys=True, default=str)))
 
     def put(self, unit: str, payload: dict) -> None:
         """Write (or replace) one unit in a single short transaction."""
@@ -188,11 +210,53 @@ def unpack_exchange(data: dict, roles) -> dict:
     return out
 
 
+def identity_keys(roles) -> dict:
+    """{principal id: engagement.capture_identity_key of its headers}. A digest, never
+    the credential; restore_discovery uses it to move a principal's captures to the
+    identity key of its current credentials."""
+    from harness.engagement import capture_identity_key
+    return {role.principal_id(): capture_identity_key(getattr(role, "headers", None) or {})
+            for role in roles or ()}
+
+
+def rekey_captures(state, stored_identities: dict, roles) -> int:
+    """Move each capture variant recorded under a principal's earlier credentials to
+    the identity key of that principal's current ones (it logged in again between the
+    attempts). Without this the restored captures match no role: the worklist skips
+    them as missing_principal and the coverage drive has no replay template for the
+    principal. An identity key two principals shared, or a principal this run does
+    not have, is left as it is. Returns how many variants moved."""
+    from harness.engagement import rekey_variant
+    current = identity_keys(roles)
+    targets: dict = {}
+    for principal, old in (stored_identities or {}).items():
+        if principal in current and current[principal] != old:
+            targets.setdefault(old, set()).add(current[principal])
+    shared = {old for principal, old in (stored_identities or {}).items()
+              if list((stored_identities or {}).values()).count(old) > 1}
+    moves = {old: next(iter(new)) for old, new in targets.items()
+             if len(new) == 1 and old not in shared}
+    moved = 0
+    for ep in (getattr(state, "endpoints", None) or {}).values():
+        variants, ids = [], set()
+        for variant in ep.capture_variants:
+            if variant.get("identity_key") in moves:
+                variant = rekey_variant(variant, moves[variant["identity_key"]])
+                moved += 1
+            if variant.get("capture_id") not in ids:
+                ids.add(variant.get("capture_id"))
+                variants.append(variant)
+        ep.capture_variants = variants
+    return moved
+
+
 def discovery_payload(state, rc, roles) -> dict:
-    """The "discovery" unit: the engagement state, and the parts of the crawl result
-    `rc` that investigate_engagement reads after discovery (captures, sensitive-file
-    evidence, the crawled endpoints, the candidate and IDOR lists, errors)."""
+    """The "discovery" unit: the engagement state, the parts of the crawl result `rc`
+    that investigate_engagement reads after discovery (captures, sensitive-file
+    evidence, the crawled endpoints, the candidate and IDOR lists, errors), and each
+    principal's identity key (identity_keys)."""
     return {
+        "identities": identity_keys(roles),
         "state": state.to_dict(),
         "rc": {
             "errors": list(getattr(rc, "errors", None) or []),
@@ -227,7 +291,12 @@ def restore_discovery(payload: dict, roles):
         withheld_operations=list(stored.get("withheld_operations") or []),
         discovery_bounds=list(stored.get("discovery_bounds") or []),
         identity_probes=[])
-    return EngagementState.from_dict(payload["state"]), rc
+    state = EngagementState.from_dict(payload["state"])
+    moved = rekey_captures(state, payload.get("identities") or {}, roles)
+    if moved:
+        log.info("restore_discovery: %d capture variant(s) moved to the current "
+                 "credentials of their principal", moved)
+    return state, rc
 
 
 def resume_finding(finding: dict, root_job_id: str, *, proofs_for_case=None, resolves=None) -> dict:
