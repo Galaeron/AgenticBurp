@@ -319,11 +319,124 @@ def _base_of_backup(name: str) -> str | None:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# Log content: access logs, error logs and logs that carry secrets. Only counts
+# are kept; no log line, address, path or value reaches the evidence.
+# --------------------------------------------------------------------------- #
+
+_LOG_SCAN_CHARS = 65536
+_LOG_SCAN_LINES = 500
+# "app.log", rotated "access.log.2026-11-14" / "error.log.1" / "app.log-20240101",
+# Apache's "access_log" / "error_log".
+_LOG_NAME = re.compile(r"(?i)(?:\.log(?:[._-][\w.-]*)?|[._-]log(?:[._-][\w.-]*)?)$")
+# Common / combined log format (Apache, nginx, morgan "combined"): client, ident,
+# user, [time], "METHOD target HTTP/x", status.
+_ACCESS_LINE = re.compile(
+    r"^\s*\S+ \S+ \S+ \[\d{1,2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}(?: [+-]\d{4})?\] "
+    r"\"[A-Z]{3,10} [^\s\"]+(?: HTTP/[\d.]+)?\" \d{3}\b")
+_ACCESS_USER_AGENT = re.compile(r"\"[^\"]*\" \"[^\"]+\"\s*$")
+# One JSON object per line with a method, a target and a status (pino, bunyan,
+# nginx/envoy JSON access logs).
+_JSON_ACCESS_LINE = re.compile(
+    r"^\s*\{.*\"(?:method|verb|request_method|httpMethod)\"\s*:\s*\"[A-Z]{3,10}\""
+    r".*\"(?:url|uri|path|request_uri|originalUrl|requestUrl)\"\s*:\s*\"(?:/|https?://)"
+    r".*\"(?:status|statusCode|status_code|response_status)\"\s*:\s*\"?\d{3}\b")
+_JSON_LOG_LINE = re.compile(
+    r"^\s*\{.*\"(?:time|timestamp|@timestamp|ts|date|datetime)\"\s*:"
+    r".*\"(?:level|severity|lvl|msg|message)\"\s*:"
+    r"|^\s*\{.*\"(?:level|severity|lvl|msg|message)\"\s*:"
+    r".*\"(?:time|timestamp|@timestamp|ts|date|datetime)\"\s*:")
+_W3C_FIELDS = re.compile(r"(?im)^#Fields:.*\bcs-method\b.*\bcs-uri-stem\b")
+_STACK_FRAME = re.compile(
+    r"^\s+at [\w$.<>\[\]/ -]+\([^()]*:\d+(?::\d+)?\)\s*$"               # JS / Java "at f (file:1:2)"
+    r"|^\s+at (?:file://|/|[A-Za-z]:\\|node:)\S*:\d+:\d+\s*$"             # JS "at /app/x.js:1:2"
+    r"|^\s+at [\w$.<>]+\((?:Native Method|Unknown Source)\)"              # Java
+    r"|^\s*File \"[^\"]+\", line \d+(?:, in \S+)?\s*$"                     # Python
+    r"|^#\d+ (?:/|[A-Za-z]:\\)\S+\(\d+\): "                                # PHP
+    r"|^\s+at \S+\(.*\) in \S.*:line \d+\s*$"                              # .NET
+    r"|^\s+from \S+\.rb:\d+:in ")                                          # Ruby
+_LOG_SECRET = re.compile(
+    r"(?P<jwt>eyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]*)"
+    r"|(?i:\bbearer\s+(?P<bearer>[\w\-.~+/]{16,}=*))"
+    r"|(?i:(?:^|[?&;\s\"'{,])(?:access_?token|id_?token|refresh_?token|auth_?token|token|jwt|"
+    r"session_?id|session|sid|jsessionid|phpsessid|connect\.sid|api_?key|apikey|password|passwd|"
+    r"pwd|secret|client_?secret)[\"']?\s*[=:]\s*"
+    r"(?:[\"'](?P<q>[^\"'\r\n]*)[\"']|(?P<b>[^\s&\"',;}<>]+)))"
+    r"|(?i:\b(?:authorization|cookie|set-cookie|x-api-key)\s*[:=]\s*[\"']?(?P<h>[^\s\"']{8,}))")
+_REDACTED_VALUE = re.compile(r"(?i)redact|filtered|masked|hidden|removed|omitted|^\*+$|^x{3,}$|^-+$")
+
+
+def _log_secret_line(line: str) -> bool:
+    for match in _LOG_SECRET.finditer(line):
+        if match["jwt"] or match["bearer"]:
+            return True
+        value = (match["q"] if match["q"] is not None else match["b"] or match["h"] or "").strip()
+        if (len(value) >= 6 and not any(c.isspace() for c in value)
+                and not _PLACEHOLDER.match(value) and not _REDACTED_VALUE.search(value)):
+            return True
+    return False
+
+
+def _log_sensitivity(name: str, body: str) -> Sensitivity | None:
+    """Why a body is a sensitive log, judged by its content. An HTTP access log
+    (client addresses, request targets, statuses), an error log (stack frames), or
+    any log whose lines carry a token, session id or credential. A log-named file
+    with timestamped lines is a plain log. Benign prose, a changelog and a single
+    JSON document are not logs. Returns None when nothing here applies."""
+    from harness.api_surface_discovery import _LOG_LINE
+    text = (body or "")[:_LOG_SCAN_CHARS]
+    lines = [ln for ln in text.splitlines()[:_LOG_SCAN_LINES] if ln.strip()]
+    if not lines:
+        return None
+    log_named = bool(_LOG_NAME.search(name or ""))
+    w3c = bool(_W3C_FIELDS.search(text))
+    access = stamped = frames = secret = agents = 0
+    for line in lines:
+        is_access = bool(_ACCESS_LINE.match(line) or _JSON_ACCESS_LINE.match(line)
+                         or (w3c and not line.startswith("#")))
+        is_stamped = bool(_LOG_LINE.match(line) or _JSON_LOG_LINE.match(line))
+        if is_access:
+            access += 1
+            agents += bool(_ACCESS_LINE.match(line) and _ACCESS_USER_AGENT.search(line))
+        if is_access or is_stamped:
+            stamped += 1
+            secret += _log_secret_line(line)
+        elif _STACK_FRAME.match(line):
+            frames += 1
+    # W3C directive lines ("#Fields: ...") are headers, not entries.
+    total = len(lines) - (sum(ln.startswith("#") for ln in lines) if w3c else 0)
+    one_line_ok = log_named and total <= 2
+    access_shaped = access >= 1 and (access >= 0.3 * total) and (access >= 2 or one_line_ok)
+    log_shaped = stamped >= 1 and (stamped >= 0.3 * total) and (stamped >= 2 or one_line_ok)
+    error_shaped = frames >= 2 and (log_shaped or log_named or frames >= 0.5 * total)
+    if secret and (access_shaped or log_shaped or error_shaped):
+        kind = "access log" if access_shaped else "error log" if error_shaped else "log"
+        return Sensitivity("log_with_secrets", "high",
+                           f"a served {kind} with {secret} line(s) carrying a token, session id, "
+                           f"credential or authorization value (values redacted)")
+    if access_shaped:
+        what = "client addresses, request targets and statuses" + (
+            ", and user agents" if agents else "")
+        return Sensitivity("access_log", "medium",
+                           f"an HTTP access log: {access} request line(s) with {what}")
+    if error_shaped:
+        return Sensitivity("error_log", "medium",
+                           f"an error log with {frames} stack-trace frame(s) (internal file paths "
+                           f"and code structure)")
+    if log_shaped and log_named and not (name or "").lower().endswith(".log"):
+        # A rotated log ("app.log.1"); a plain ".log" name keeps its existing rules.
+        return Sensitivity("log_file", "medium", f"{stamped} timestamped log line(s) in a log file")
+    return None
+
+
 def _classify_by_name_and_body(name: str, body: str) -> Sensitivity | None:
     from harness.api_surface_discovery import sensitive_file_verdict
     low = name.lower()
     if _PRIVATE_KEY.search(body):
         return Sensitivity("private_key", "high", "body carries a PEM/PGP private-key block")
+    logged = _log_sensitivity(name, body)
+    if logged is not None:
+        return logged
     verdict = sensitive_file_verdict(name, 200, body)
     if verdict.structure and verdict.structure != "directory_listing":
         severity = ("high" if verdict.structure in ("private_key", "aws_credentials", "cloud_credentials_json",
