@@ -58,6 +58,19 @@ SPEC_PATHS = (
     "/api-docs", "/api/docs", "/v3/api-docs", "/swagger/v1/swagger.json",
     "/.well-known/openapi.json", "/api/schema", "/api/spec",
 )
+# A spec path that answers an API documentation PAGE (Swagger UI, ReDoc) instead of
+# the document: the page's own scripts embed the spec (swagger-ui-express writes it
+# into its init script as `"swaggerDoc": {...}`) or name the document's URL
+# (`SwaggerUIBundle({url: ...})`, `<redoc spec-url=...>`). _spec_behind_ui reads at
+# most _MAX_UI_SCRIPTS of the page's same-origin scripts (the UI library's own
+# bundles skipped) and follows at most _MAX_UI_SPEC_URLS same-origin references.
+_UI_PAGE_MARKERS = ("swagger-ui", "swaggeruibundle", "redoc")
+_UI_SCRIPT_SRC = re.compile(r"""<script\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']""", re.I)
+_UI_LIBRARY_SCRIPT = re.compile(r"(?:bundle|standalone|preset|polyfill|vendor)[^/]*\.js$", re.I)
+_EMBEDDED_SPEC = re.compile(r"""["']?\b(?:swaggerDoc|spec)["']?\s*:\s*(?=\{)""")
+_SPEC_URL_REF = re.compile(r"""["']?\b(?:url|spec-url)["']?\s*[:=]\s*["']([^"'\s<>]+)["']""")
+_MAX_UI_SCRIPTS = 3
+_MAX_UI_SPEC_URLS = 4
 
 # A compact, generic REST + support-app vocabulary. Callers can extend with terms
 # mined from the app (response bodies, JS) for better hit rates.
@@ -378,6 +391,70 @@ class SurfaceDiscovery:
                 and target.path == here.path + "/":
             self._dir_redirects.add(path + "/")
 
+    def _origin_path(self, url: str) -> str | None:
+        """`url` as a path _probe can send (relative to base_url), or None when it is
+        on another origin or outside base_url's own path."""
+        try:
+            target, here = urlsplit(url), urlsplit(self.base_url)
+        except ValueError:
+            return None
+        if (target.scheme, target.netloc) != (here.scheme, here.netloc):
+            return None
+        own = here.path.rstrip("/")
+        path = target.path or "/"
+        if own:
+            if path != own and not path.startswith(own + "/"):
+                return None
+            path = path[len(own):] or "/"
+        return path + ("?" + target.query if target.query else "")
+
+    async def _spec_behind_ui(self, path: str, status: int, body: str) -> str | None:
+        """The spec behind an API documentation page served at a spec path (see
+        _UI_PAGE_MARKERS): embedded in the page or one of its same-origin scripts,
+        or the same-origin document a script or the page names. A directory
+        redirect the client did not follow (`/api-docs` -> `/api-docs/`) is read
+        at its target. None when the answer is no such page or names no spec."""
+        page = self._redirected_to.get(path) or path
+        if 300 <= status < 400 and f"{path}/" in self._dir_redirects:
+            page = path + "/"
+            r = await self._raw("GET", page)
+            if not r:
+                return None
+            status, body = r[0], r[1]
+        if status != 200 or not body or not any(m in body.lower() for m in _UI_PAGE_MARKERS):
+            return None
+        found = _embedded_spec(body)
+        if found is not None:
+            return found
+        page_url = self.base_url + page
+        texts, scripts = [body], []
+        for src in _UI_SCRIPT_SRC.findall(body):
+            target = self._origin_path(urljoin(page_url, src))
+            if target and not _UI_LIBRARY_SCRIPT.search(target.split("?", 1)[0]) \
+                    and target not in scripts:
+                scripts.append(target)
+        for script in scripts[:_MAX_UI_SCRIPTS]:
+            r = await self._raw("GET", script)
+            if not r or r[0] != 200:
+                continue
+            found = _embedded_spec(r[1])
+            if found is not None:
+                return found
+            texts.append(r[1])
+        tried: set[str] = set()
+        for text in texts:
+            for ref in _SPEC_URL_REF.findall(text[:2_000_000]):
+                target = self._origin_path(urljoin(page_url, ref))
+                if not target or target in tried or target == page:
+                    continue
+                if len(tried) >= _MAX_UI_SPEC_URLS:
+                    return None
+                tried.add(target)
+                r = await self._raw("GET", target)
+                if r and r[0] == 200 and _looks_like_spec(r[1]):
+                    return r[1]
+        return None
+
     async def _probe(self, method: str, path: str):
         """One live request. A method seam so tests inject a canned responder and
         never touch the network. Returns (status, body, allow) or None on error.
@@ -621,7 +698,13 @@ class SurfaceDiscovery:
             if self._phase_limit - self._probes <= 3:
                 break
             r = await self._raw("GET", sp)
-            if r and not _is_not_found(r[0], r[1]) and r[0] == 200 and _looks_like_spec(r[1]):
+            if not r or _is_not_found(r[0], r[1]):
+                continue
+            spec = r[1] if r[0] == 200 and _looks_like_spec(r[1]) else None
+            if spec is None:
+                # A documentation page in the document's place: its spec.
+                spec = await self._spec_behind_ui(sp, r[0], r[1])
+            if spec is not None:
                 result.spec_found = sp
                 # W-21: keep the METHODS the spec documents for each path (a spec
                 # route used to be recorded with methods=(), throwing away the
@@ -630,10 +713,11 @@ class SurfaceDiscovery:
                 # openapi_ingest.operations_from_spec for callers that target
                 # parameters -- the reach win over a bare path list.
                 from harness import openapi_ingest
-                methods_by_path = openapi_ingest.methods_by_path(r[1])
-                for path in _paths_from_spec(r[1]):
-                    self._seen.setdefault(path, Route(
-                        path=path, status=0,
+                methods_by_path = openapi_ingest.methods_by_path(spec)
+                base = _spec_base_path(spec, self.base_url)
+                for path in _paths_from_spec(spec):
+                    self._seen.setdefault(_under_base(base, path), Route(
+                        path=_under_base(base, path), status=0,
                         methods=methods_by_path.get(path, ()), source="spec"))
                 break
 
@@ -1324,6 +1408,65 @@ def _paths_from_spec(body: str) -> list[str]:
         return [p for p in paths.keys() if isinstance(p, str) and p.startswith("/")]
     except (ValueError, TypeError, AttributeError):
         return []
+
+
+def _embedded_spec(text: str) -> str | None:
+    """An OpenAPI 3 / Swagger 2 document a page or script embeds as a JSON object
+    value (`"swaggerDoc": {...}`, `spec: {...}`), re-serialised; else None."""
+    decoder = json.JSONDecoder()
+    head = (text or "")[:5_000_000]
+    for m in _EMBEDDED_SPEC.finditer(head):
+        try:
+            doc, _end = decoder.raw_decode(head, m.end())
+        except ValueError:
+            continue
+        if isinstance(doc, dict) and isinstance(doc.get("paths"), dict) \
+                and ("openapi" in doc or "swagger" in doc):
+            return json.dumps(doc)
+    return None
+
+
+def _spec_base_path(spec: str, base_url: str) -> str:
+    """The path a spec's paths are relative to on base_url's origin: the first
+    OpenAPI 3 `servers[].url` that is relative or on this origin, else a Swagger 2
+    `basePath` (when its `host`, if any, is this one). A templated server URL
+    (`{variable}`) is skipped. "" when the spec names none or names only other
+    origins, so its paths are used as they are."""
+    try:
+        doc = json.loads(spec)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(doc, dict):
+        return ""
+    here = urlsplit(base_url)
+    candidates = []
+    for server in doc.get("servers") or ():
+        url = server.get("url") if isinstance(server, dict) else None
+        if isinstance(url, str) and url.strip():
+            candidates.append(url.strip())
+    base_path, host = doc.get("basePath"), doc.get("host")
+    if isinstance(base_path, str) and base_path.strip() and (not host or host == here.netloc):
+        candidates.append(base_path.strip())
+    for url in candidates:
+        if "{" in url:
+            continue
+        try:
+            target = urlsplit(urljoin(base_url.rstrip("/") + "/", url))
+        except ValueError:
+            continue
+        if (target.scheme, target.netloc) != (here.scheme, here.netloc):
+            continue
+        path, own = target.path.rstrip("/"), here.path.rstrip("/")
+        if own and (path == own or path.startswith(own + "/")):
+            path = path[len(own):]
+        return path
+    return ""
+
+
+def _under_base(base: str, path: str) -> str:
+    """A spec path under its base path (see _spec_base_path): OpenAPI appends each
+    path to the server URL, and Swagger 2 to basePath."""
+    return base + path if base else path
 
 
 # ---------------------------------------------------------------------------
