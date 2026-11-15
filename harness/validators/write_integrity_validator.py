@@ -306,6 +306,19 @@ class _Made:
     check: object = None
     restored: bool | None = None   # None: nothing was created, nothing to undo
     done: bool = False
+    # The exact body text when it is not json.dumps(body): a duplicate-key body.
+    raw: str | None = None
+    left: bool = False             # created and deliberately left in place (opt-in)
+    # Login read-back of a self-service sign-up (opt-in path only): the login body
+    # with the credentials this create submits, the before/after/wrong-password
+    # login outcomes, and what they showed: "stored" (fails before, succeeds after,
+    # a wrong password fails), "existing" (already logs in before the create),
+    # "not_stored" (fails before and after), "unsure" (with `login_why`).
+    login: dict | None = None
+    logins: dict = dc_field(default_factory=dict)
+    login_result: str = ""
+    login_why: str = ""
+    account: str = ""              # how a stored account with no object URL is named
 
     @property
     def status(self):
@@ -323,6 +336,9 @@ class _Case:
     headers: dict
     body: dict
     others: list = dc_field(default_factory=list)
+    # A self-service create with no DELETE route, run only under the owner's opt-in
+    # (validators.write_integrity.allow_unrestorable_self_service_creates).
+    unrestorable: bool = False
 
 
 @dataclass
@@ -334,6 +350,67 @@ class _Plan:
     forged: object = None
     own: object = None
     other: dict | None = None
+    # cross_identity_write: parameter-pollution forms of the attack, each sent only
+    # when no earlier attack landed and the case's mutating headroom still pays for
+    # it and the deletes it may need. `sent` lists those sent, `unsent` why not.
+    variants: list = dc_field(default_factory=list)
+    sent: list = dc_field(default_factory=list)
+    unsent: list = dc_field(default_factory=list)
+    # create_validation on the opt-in path: the observed login a refused or
+    # unreadable sign-up is read back through, or why none was used.
+    login_url: str = ""
+    login_source: str = ""
+    login_note: str = ""
+    login_keys: tuple = ()         # (identifier key, password key) of the login body
+
+
+# A login among the routes a run observed (the route inventory or a captured
+# exchange); a path is never guessed. Registration and logout paths are not logins.
+_LOGIN_PATH = re.compile(r"(?:^|/)(?:log[-_]?in|sign[-_]?in|log[-_]?on|authenticate|sessions?)(?:/|$|\.)",
+                         re.I)
+_NOT_LOGIN_PATH = re.compile(r"regist|sign[-_]?up|log[-_]?out|sign[-_]?out|reset|forgot|change", re.I)
+_LOGIN_SENDS = 3   # before the create, after it, and the wrong-password control
+
+
+def _login_session(outcome) -> str:
+    """What a 2xx login issued -- "a token in the JSON field 'token'", "a session
+    cookie (sid)" -- or "" when it issued neither. Never the value."""
+    if not _ok2xx(outcome):
+        return ""
+    from types import SimpleNamespace
+    from .auth_sequence_validator import _SESSION_COOKIE_RE, _login_token
+    headers = {str(k).lower(): v for k, v in (getattr(outcome, "headers", None) or {}).items()}
+    minted = _login_token(SimpleNamespace(text=outcome.body or "", headers=headers))
+    if minted is not None:
+        return "a token in " + minted[0].removeprefix("the ")
+    names = re.findall(r"(?:^|,\s*|\n)([^=;,\s]+)=", str(headers.get("set-cookie") or ""))
+    session = [n for n in names if _SESSION_COOKIE_RE.search(n)]
+    return f"a session cookie ({', '.join(session)})" if session else ""
+
+
+def _login_refused(outcome) -> bool:
+    """An answered login that issued no session or token (a 5xx or no answer is
+    not a refusal: it says nothing about the credentials)."""
+    return (outcome is not None and outcome.ok and outcome.status is not None
+            and outcome.status < 500 and not _login_session(outcome))
+
+
+_VARIANT_WORDS = {
+    "dup-own-first": "a duplicate key (the writer's value first, the foreign value last)",
+    "dup-foreign-first": "a duplicate key (the foreign value first, the writer's value last)",
+    "array": "an array holding both values",
+}
+_PASSWORD_KEY = re.compile(r"^(password|passwd|pwd|passphrase|pass|newpassword)$")
+
+
+def _polluted(body: dict, key: str, first, last) -> str:
+    """`body` as JSON text carrying `key` twice: `first` in the key's own place and
+    `last` appended as the final member. json.dumps cannot write a duplicate key,
+    so the second member is spliced in as text; the result is valid JSON whose
+    meaning depends on which duplicate the server's parser (and its checks) keep."""
+    head = json.dumps({**body, key: first})
+    tail = f"{json.dumps(key)}: {json.dumps(last)}"
+    return head[:-1] + (", " if len(head) > 2 else "") + tail + "}"
 
 
 def _run_identities(run) -> list[dict]:
@@ -416,6 +493,11 @@ class WriteIntegrityValidator(Validator):
         if kind == BUSINESS_RULE_TAMPER and method in ("PUT", "PATCH") and _ends_with_id(exchange.url):
             async with _object_lock(exchange.url):
                 return await self._update_tamper(case)
+        if kind == FORGED_AUTHORSHIP and method in ("PUT", "PATCH"):
+            if not _ends_with_id(exchange.url):
+                return self._skip(fc, self._no_update_object(case))
+            async with _object_lock(exchange.url):
+                return await self._update_authorship(case)
         if not _is_create(exchange):
             return self._skip(fc, f"write_integrity {kind} needs a POST create to a collection "
                                   f"(got {method} {urlsplit(exchange.url).path}); nothing was written")
@@ -424,25 +506,34 @@ class WriteIntegrityValidator(Validator):
                    BUSINESS_RULE_TAMPER: self._plan_tamper,
                    MASS_ASSIGNMENT_CREATE: self._plan_mass_assignment,
                    CREATE_VALIDATION: self._plan_validation}[kind]
+        # The owner's opt-in (off by default): a self-service registration with no
+        # DELETE route may run and leave its throwaway accounts in place, named.
+        case.unrestorable = (self._self_service(case) and self._allows_unrestorable()
+                             and not self._restore_route(exchange.url))
         plan = planner(case)
         if isinstance(plan, str):
             return self._skip(fc, f"write_integrity {kind}: {plan}; nothing was written")
         refusal = self._refusal(case, plan)
         if refusal:
             return self._skip(fc, f"write_integrity {kind}: {refusal}; nothing was written")
+        if case.unrestorable and kind == CREATE_VALIDATION:
+            self._plan_logins(case, plan)
         return await self._run_creates(case, plan)
 
     # -- what may be written -----------------------------------------------------
 
-    def _known_routes(self) -> set[tuple[str, str]]:
+    def _route_entries(self) -> list:
         routes = list(self.restore_routes)
         if callable(self.route_inventory):
             try:
                 routes += list(self.route_inventory() or ())
             except Exception:
                 log.debug("write_integrity: route inventory failed", exc_info=True)
+        return routes
+
+    def _known_routes(self) -> set[tuple[str, str]]:
         known = set()
-        for route in routes:
+        for route in self._route_entries():
             parts = str(route).split(None, 1)
             if len(parts) == 2:
                 known.add((parts[0].upper(), parts[1].strip().rstrip("/").lower()))
@@ -458,13 +549,17 @@ class WriteIntegrityValidator(Validator):
         """Why this plan must not start, or ""."""
         run, creates = self.run_context, 1 + len(plan.attacks)
         urls = {plan.control.url} | {m.url for m in plan.attacks}
-        for url in urls:
+        for url in urls if not case.unrestorable else ():
             if not self._restore_route(url):
                 from harness.engagement import normalize_path
+                hint = ("; a self-service registration with no DELETE route is left in place only "
+                        "under the owner's opt-in validators.write_integrity."
+                        "allow_unrestorable_self_service_creates (off by default)"
+                        if self._self_service(case) else "")
                 return (f"no restore path known for objects created at {urlsplit(url).path} "
                         f"(needs DELETE {normalize_path(_item_url(url, '1'))} in the route inventory or "
-                        f"validators.write_integrity.restore_routes)")
-        need = 2 * creates
+                        f"validators.write_integrity.restore_routes){hint}")
+        need = creates if case.unrestorable else 2 * creates
         headroom, _, ceiling = run.gate.mutating_headroom(case.case_ref, self.name)
         if headroom < need:
             return (f"{creates} create(s) and their verified deletes need {need} mutating sends "
@@ -474,14 +569,184 @@ class WriteIntegrityValidator(Validator):
             return f"the run's request budget cannot pay for {creates} create(s), read-backs and deletes"
         for made in [plan.control] + plan.attacks:
             decision = run.gate.authorize(validator_name=self.name, method="POST", url=made.url,
-                                          body=json.dumps(made.body))
+                                          body=made.raw if made.raw is not None else json.dumps(made.body))
             if not decision.allowed:
                 return "write preflight refused: " + decision.reason
+        # An optional variant the gate refuses is dropped, never the whole plan.
+        for made in list(plan.variants):
+            decision = run.gate.authorize(validator_name=self.name, method="POST", url=made.url,
+                                          body=made.raw if made.raw is not None else json.dumps(made.body))
+            if not decision.allowed:
+                plan.variants.remove(made)
+                plan.unsent.append(f"{made.label} (preflight refused: {decision.reason})")
+        if case.unrestorable:
+            return ""
         decision = run.gate.authorize(validator_name=self.name, method="DELETE",
                                       url=_item_url(plan.control.url, "1"))
         if not decision.allowed:
             return "restore preflight refused: " + decision.reason
         return ""
+
+    def _self_service(self, case: _Case) -> bool:
+        """An anonymous registration-shaped create: a unique email/username and a
+        password, sent with no session (a throwaway account anyone may make)."""
+        return (case.actor is None and case.kind in (MASS_ASSIGNMENT_CREATE, CREATE_VALIDATION)
+                and bool(_unique_keys(case.body))
+                and any(_PASSWORD_KEY.match(_flat(k)) for k in case.body))
+
+    def _allows_unrestorable(self) -> bool:
+        """The owner's opt-in to leave self-service throwaway accounts in place when no
+        DELETE route exists. Off unless the run's config sets it to true."""
+        cfg = getattr(self.run_context, "config", None) or {}
+        wi = ((cfg.get("validators") or {}).get("write_integrity") or {}) if isinstance(cfg, dict) else {}
+        return wi.get("allow_unrestorable_self_service_creates", False) is True
+
+    # -- login read-back of a self-service sign-up (opt-in path only) ----------------
+    # A sign-up the server answers 4xx (or 2xx with nothing readable) may still have
+    # stored the account. Logging in with the credentials that create submitted reads
+    # it back: it must fail before the create, succeed after it with a session or a
+    # token, and a wrong password must still fail.
+
+    @staticmethod
+    def _login_keys(body: dict) -> tuple[str, str]:
+        """(identifier key, password key) of a login or sign-up body ("" when absent)."""
+        ident = next((k for k in body if _UNIQUE_KEY.match(_flat(k))), "")
+        password = next((k for k in body if _PASSWORD_KEY.match(_flat(k))), "")
+        return ident, password
+
+    def _login_target(self, case: _Case) -> tuple[str, dict | None, str]:
+        """(url, captured login body or None, where it was observed) of a login the
+        run observed on the sign-up's origin: a captured login exchange first, then a
+        POST route in the route inventory. ("", None, "") when it observed none."""
+        parts = urlsplit(case.exchange.url)
+        origin = f"{parts.scheme}://{parts.netloc}"
+
+        def is_login(path: str) -> bool:
+            return bool(_LOGIN_PATH.search(path)) and not _NOT_LOGIN_PATH.search(path)
+
+        context = getattr(self.run_context, "experiment_context", None)
+        captured = (context.get("captured") if isinstance(context, dict) else None) or ()
+        for item in list(captured)[:500]:
+            def get(key, _item=item):
+                return _item.get(key) if isinstance(_item, dict) else getattr(_item, key, None)
+            p = urlsplit(str(get("url") or ""))
+            if (str(get("method") or "").upper() != "POST" or f"{p.scheme}://{p.netloc}" != origin
+                    or not is_login(p.path)):
+                continue
+            body = _json_object(get("request_body"))
+            if body and all(self._login_keys(body)):
+                return (urlunsplit((p.scheme, p.netloc, p.path, p.query, "")), body,
+                        f"a captured login (POST {p.path})")
+        for route in self._route_entries():
+            bits = str(route).split(None, 1)
+            if len(bits) != 2 or bits[0].upper() != "POST":
+                continue
+            path = bits[1].strip()
+            if path.lower().startswith(("http://", "https://")):
+                p = urlsplit(path)
+                if f"{p.scheme}://{p.netloc}" != origin:
+                    continue
+                path = p.path
+            if path.startswith("/") and "{" not in path and is_login(path):
+                return origin + path, None, f"the route inventory (POST {path})"
+        return "", None, ""
+
+    def _plan_logins(self, case: _Case, plan: _Plan) -> None:
+        """Arm the login read-back for each attack whose credential pair no other create
+        of this case submits (a login cannot tell two creates with one pair apart),
+        while the case's mutating headroom pays for every create plus three logins each."""
+        url, template, source = self._login_target(case)
+        id_key, pw_key = self._login_keys(case.body)
+        if not url or not id_key or not pw_key:
+            plan.login_note = ("a refused or unreadable sign-up was not read back by logging in: the "
+                               "run observed no login route (none in the route inventory or its "
+                               "captured exchanges)" if not url else
+                               "a refused or unreadable sign-up was not read back by logging in: the "
+                               "sign-up has no identifier and password pair to log in with")
+            return
+        plan.login_url, plan.login_source = url, source
+        plan.login_keys = self._login_keys(template) if template else (id_key, pw_key)
+        t_id, t_pw = plan.login_keys
+        everyone = [plan.control] + plan.attacks
+
+        def pair(m):
+            return m.body.get(id_key), m.body.get(pw_key)
+
+        run, armed = self.run_context, 0
+        headroom, _, ceiling = run.gate.mutating_headroom(case.case_ref, self.name)
+        for m in plan.attacks:
+            if sum(pair(x) == pair(m) for x in everyone) > 1:
+                m.login_why = ("it submits the same credentials as another create of this case, so a "
+                               "login cannot tell which of them stored the account")
+                continue
+            if not all(isinstance(v, str) for v in pair(m)):
+                continue
+            need = len(everyone) + _LOGIN_SENDS * (armed + 1)
+            if headroom < need or (run.budget.remaining is not None
+                                   and run.budget.remaining < 4 * len(everyone) + 2 + _LOGIN_SENDS * (armed + 1)):
+                m.login_why = (f"its login read-back needs {need} mutating sends for this case "
+                               f"(validators.mutating_ceiling_by_check.write_integrity; ceiling is {ceiling})")
+                continue
+            body = {**(template or {}), t_id: m.body[id_key], t_pw: m.body[pw_key]}
+            decision = run.gate.authorize(validator_name=self.name, method="POST", url=url,
+                                          body=json.dumps(body))
+            if not decision.allowed:
+                m.login_why = "its login read-back was refused by the preflight: " + decision.reason
+                continue
+            m.login = body
+            armed += 1
+
+    async def _login(self, case: _Case, plan: _Plan, body: dict):
+        """One login through a fresh ephemeral session: its own cookie jar, never one
+        of the run's identities, so a session it is issued reaches no other send."""
+        sid = "wi-login-" + secrets.token_hex(6)
+        p = urlsplit(plan.login_url)
+        self.run_context.sessions.register(sid, sid, {}, allowed_origins=[f"{p.scheme}://{p.netloc}"],
+                                           role="negative-control", ephemeral=True)
+        return await self._send(case, "POST", plan.login_url, body, ident={"session_ref": sid})
+
+    async def _login_before(self, case: _Case, plan: _Plan, m: _Made) -> None:
+        if m.login is None:
+            return
+        m.logins["before"] = before = await self._login(case, plan, m.login)
+        issued = _login_session(before)
+        if issued:
+            m.login_result = "existing"
+            m.login_why = (f"a login with the credentials it submits already succeeded before the "
+                           f"create (HTTP {before.status}, {issued}), so an account with them exists")
+        elif not _login_refused(before):
+            m.login_result = "unsure"
+            m.login_why = f"the login before the create got no usable answer (HTTP {before.status})"
+
+    async def _login_after(self, case: _Case, plan: _Plan, m: _Made) -> None:
+        if (m.login is None or m.login_result or m.sent is None or not m.sent.ok
+                or m.sent.status is None or (_ok2xx(m.sent) and m.obj is not None)):
+            return   # not armed, settled before the create, unanswered, or read back directly
+        before = m.logins["before"]
+        m.logins["after"] = after = await self._login(case, plan, m.login)
+        issued = _login_session(after)
+        if not issued:
+            m.login_result = "not_stored" if _login_refused(after) else "unsure"
+            m.login_why = (f"a login with the credentials it submitted failed before (HTTP "
+                           f"{before.status}) and after it (HTTP {after.status})"
+                           if m.login_result == "not_stored" else
+                           f"the login after the create got no usable answer (HTTP {after.status})")
+            return
+        t_id, t_pw = plan.login_keys
+        m.logins["wrong"] = wrong = await self._login(
+            case, plan, {**m.login, t_pw: "wi-wrong-" + secrets.token_hex(8)})
+        if not _login_refused(wrong):
+            m.login_result = "unsure"
+            m.login_why = (f"a login with its credentials succeeded after the create, but the "
+                           f"wrong-password control did not fail (HTTP {wrong.status}), so that login "
+                           f"does not show the credentials were checked")
+            return
+        m.login_result, m.left = "stored", True
+        m.account = (f"the account {t_id}={m.login[t_id]!r} (logs in at POST "
+                     f"{urlsplit(plan.login_url).path})")
+        m.login_why = (f"a login with the credentials it submitted failed before the create (HTTP "
+                       f"{before.status}) and succeeded after it (HTTP {after.status}, {issued}), "
+                       f"while a wrong password was refused (HTTP {wrong.status})")
 
     # -- per-class plans ---------------------------------------------------------
 
@@ -528,9 +793,21 @@ class WriteIntegrityValidator(Validator):
                 ctl_body, ctl_marker = _uniquify(case.body, "c" + secrets.token_hex(4))
                 atk_body, atk_marker = _uniquify(case.body, "a" + secrets.token_hex(4))
                 atk_body[key] = forged
+                # Parameter pollution: an ownership check and the code that stores the
+                # reference may read different members of a duplicate key, or one
+                # element of an array, so the same foreign reference is also tried
+                # alongside the writer's own one, in both orders.
+                variants = []
+                for label, first, last in (("dup-own-first", value, forged),
+                                           ("dup-foreign-first", forged, value)):
+                    v_body, v_marker = _uniquify(case.body, "v" + secrets.token_hex(4))
+                    raw = _polluted(v_body, key, first, last)
+                    variants.append(_Made(label, url, json.loads(raw), v_marker, raw=raw))
+                v_body, v_marker = _uniquify(case.body, "v" + secrets.token_hex(4))
+                variants.append(_Made("array", url, {**v_body, key: [value, forged]}, v_marker))
                 return _Plan(_Made("control", url, ctl_body, ctl_marker),
                              [_Made("attack", url, atk_body, atk_marker)], field=key,
-                             forged=forged, own=value, other=other,
+                             forged=forged, own=value, other=other, variants=variants,
                              detail=f"{key}: {value!r} -> {_pid(other)}'s {stem} {forged!r}")
             parts = urlsplit(url)
             segments = parts.path.split("/")
@@ -559,26 +836,8 @@ class WriteIntegrityValidator(Validator):
         if case.actor is None:
             return "needs the capture to be an authenticated, registered session"
         for key, value in case.body.items():
-            base = _flat(_ID_SUFFIX.sub("", str(key)) if _ref_stem(key) else key)
-            if base not in _PERSON_STEMS or value in (None, "") or isinstance(value, bool):
-                continue
-            forged, whose = None, ""
-            if _number(value) is not None or (isinstance(value, str) and value.isdigit()):
-                for other in case.others:
-                    ids = [i for i in self._account_ids(_pid(other)) if str(i) != str(value)]
-                    if ids:
-                        forged = int(ids[0]) if isinstance(value, int) and ids[0].isdigit() else ids[0]
-                        whose = _pid(other)
-                        break
-            elif isinstance(value, str):
-                other = case.others[0] if case.others else None
-                name = (other or {}).get("name") or ""
-                if _EMAILISH.match(value):
-                    forged = name if _EMAILISH.match(name) else f"wi-{secrets.token_hex(4)}@example.com"
-                else:
-                    forged = name if name and name != value else f"wi-{secrets.token_hex(4)}"
-                whose = _pid(other) if forged == name else "a fabricated identity"
-            if forged is None or _same_value(forged, value):
+            forged, whose = self._forge_author(case, key, value)
+            if forged is None:
                 continue
             ctl_body, ctl_marker = _uniquify(case.body, "c" + secrets.token_hex(4))
             atk_body, atk_marker = _uniquify(case.body, "a" + secrets.token_hex(4))
@@ -589,6 +848,32 @@ class WriteIntegrityValidator(Validator):
                          detail=f"{key}: {value!r} -> {forged!r} ({whose})")
         return ("the create carries no author/owner/user field whose value can be replaced by "
                 "another principal's known identifier")
+
+    def _forge_author(self, case: _Case, key, value):
+        """(forged value, whose) for an author/owner/user field `key`, or (None, "")
+        when `key` is not one or no other identity's value is known."""
+        base = _flat(_ID_SUFFIX.sub("", str(key)) if _ref_stem(key) else key)
+        if base not in _PERSON_STEMS or value in (None, "") or isinstance(value, bool):
+            return None, ""
+        forged, whose = None, ""
+        if _number(value) is not None or (isinstance(value, str) and value.isdigit()):
+            for other in case.others:
+                ids = [i for i in self._account_ids(_pid(other)) if str(i) != str(value)]
+                if ids:
+                    forged = int(ids[0]) if isinstance(value, int) and ids[0].isdigit() else ids[0]
+                    whose = _pid(other)
+                    break
+        elif isinstance(value, str):
+            other = case.others[0] if case.others else None
+            name = (other or {}).get("name") or ""
+            if _EMAILISH.match(value):
+                forged = name if _EMAILISH.match(name) else f"wi-{secrets.token_hex(4)}@example.com"
+            else:
+                forged = name if name and name != value else f"wi-{secrets.token_hex(4)}"
+            whose = _pid(other) if forged == name else "a fabricated identity"
+        if forged is None or _same_value(forged, value):
+            return None, ""
+        return forged, whose
 
     @staticmethod
     def _tamper_field(obj: dict) -> tuple[str, str]:
@@ -649,12 +934,12 @@ class WriteIntegrityValidator(Validator):
     # -- the create engine ---------------------------------------------------------
 
     async def _send(self, case: _Case, verb: str, url: str, body=None, *, ident="actor",
-                    cleanup: bool = False):
+                    cleanup: bool = False, raw: str | None = None):
         from harness.run_context import TypedRequest
         who = case.actor if ident == "actor" else ident
+        text = raw if raw is not None else json.dumps(body) if body is not None else None
         return await self.run_context.executor().execute(
-            TypedRequest(verb, url, headers=dict(case.headers),
-                         body=json.dumps(body) if body is not None else None),
+            TypedRequest(verb, url, headers=dict(case.headers), body=text),
             capability=self.name, session_ref=(who or {}).get("session_ref"),
             case_ref=case.case_ref, allow_cancelled_cleanup=cleanup)
 
@@ -689,7 +974,7 @@ class WriteIntegrityValidator(Validator):
         return ""
 
     async def _create(self, case: _Case, made: _Made) -> None:
-        made.sent = await self._send(case, "POST", made.url, made.body)
+        made.sent = await self._send(case, "POST", made.url, made.body, raw=made.raw)
         if not _ok2xx(made.sent):
             return
         oid = _created_id(made.sent)
@@ -702,15 +987,23 @@ class WriteIntegrityValidator(Validator):
             if made.obj is not None:
                 return
 
-    async def _undo(self, case: _Case, made: _Made) -> None:
+    async def _undo(self, case: _Case, made: _Made, first: dict | None = None) -> None:
         """Delete what `made` created and verify it is gone. Leaves `restored` None
-        when nothing was created, True when a read shows it gone, False otherwise."""
+        when nothing was created, True when a read shows it gone, False otherwise.
+        With `first` (the principal the read-back shows owns the object), that
+        principal's sessions delete first, and a principal whose delete was refused
+        is not asked again through its other sessions: at most one delete per
+        principal, which is what the variant headroom check reserves."""
         if made.done:
             return
         made.done = True
         sent = made.sent
         if sent is None or not getattr(sent, "executed", False) or _refused(sent):
             return   # never sent, or the server refused it: nothing was created
+        if case.unrestorable:
+            # The owner's opt-in: a self-service create with no DELETE route stays.
+            made.left = _ok2xx(sent)
+            return
         if not made.item:
             made.item = await self._find_by_marker(case, made, cleanup=True)
         if not made.item:
@@ -720,7 +1013,14 @@ class WriteIntegrityValidator(Validator):
             return
         from harness import run_handoff
         made.restored = False
-        for who in self._readers(case):
+        order = self._readers(case)
+        if first is not None:
+            lead = _pid(first)
+            order = [i for i in order if _pid(i) == lead] + [i for i in order if _pid(i) != lead]
+        denied: set[str] = set()
+        for who in order:
+            if first is not None and _pid(who) in denied:
+                continue
             with run_handoff.restore_scope(f"{case.case_ref}:write_integrity_restore"):
                 made.undo = await self._send(case, "DELETE", made.item, ident=who, cleanup=True)
                 made.check = await self._send(case, "GET", made.item, ident=who, cleanup=True)
@@ -729,6 +1029,8 @@ class WriteIntegrityValidator(Validator):
                 return
             if not _refused(made.undo) and getattr(made.undo, "executed", False) is False:
                 return   # refused by the gate or the ceiling: no other deleter will fare better
+            if _refused(made.undo):
+                denied.add(_pid(who))
 
     def _record(self, case: _Case, made: _Made) -> None:
         artifact = getattr(made.sent, "artifact_id", "") if made.sent is not None else ""
@@ -753,17 +1055,22 @@ class WriteIntegrityValidator(Validator):
             await self._create(case, plan.control)
             if not _ok2xx(plan.control.sent):
                 return
-            # Prove the restore path on the control before any attack is sent.
-            await self._undo(case, plan.control)
-            if plan.control.restored is not True:
-                return
+            if not case.unrestorable:
+                # Prove the restore path on the control before any attack is sent.
+                await self._undo(case, plan.control)
+                if plan.control.restored is not True:
+                    return
             for leg in plan.attacks:
                 made.append(leg)
+                await self._login_before(case, plan, leg)
                 await self._create(case, leg)
+                await self._login_after(case, plan, leg)
+            if plan.variants and not any(self._landed(plan, m) for m in plan.attacks):
+                await self._send_variants(case, plan, made)
 
         async def cleanup():
             for m in made:
-                await self._undo(case, m)
+                await self._undo(case, m, first=self._deleter(case, plan, m))
 
         try:
             await attempt()
@@ -788,13 +1095,25 @@ class WriteIntegrityValidator(Validator):
             self._record(case, m)
         restore_ok = all(m.restored is not False for m in made)
         sent_restores = [m for m in made if m.restored is not None]
+        left = [m for m in made if m.left]
         evidence = (f"kind={case.kind}; target=POST {case.exchange.url}; writer={_pid(case.actor)}; "
                     + (f"other={_pid(plan.other)}; " if plan.other else "")
                     + f"change={plan.detail}; legs="
                     + ",".join(f"{m.label}:{m.status}" for m in made)
-                    + f"; restore={'sent' if sent_restores else 'not_needed'}; restored="
+                    + (f"; variants_unsent={' | '.join(plan.unsent)}" if plan.unsent else "")
+                    + (f"; login={plan.login_source}" if plan.login_url else "")
+                    + "".join(f"; login_{m.label}=" + ",".join(f"{k}:{getattr(v, 'status', None)}"
+                                                              for k, v in m.logins.items())
+                              + f"->{m.login_result or 'unread'}" for m in made if m.logins)
+                    + f"; restore={'sent' if sent_restores else 'left_in_place' if left else 'not_needed'}; restored="
                     + ",".join(f"{m.label}:{'ok' if m.restored else 'FAILED'}" for m in sent_restores)
+                    + (f"; left_in_place={' | '.join(m.item or m.account or m.label for m in left)}"
+                       if left else "")
                     + f"; restore_succeeded={str(restore_ok).lower()}")
+        if left:
+            log.warning("write_integrity: %d self-service create(s) left in place by the owner's opt-in "
+                        "(validators.write_integrity.allow_unrestorable_self_service_creates): %s",
+                        len(left), ", ".join(m.item or m.account or m.url for m in left))
         fc = case.finding.vulnerability_class
         if not restore_ok:
             left = [m.item or f"an object created at {m.url} (not located)" for m in made if m.restored is False]
@@ -815,24 +1134,118 @@ class WriteIntegrityValidator(Validator):
             return self._result("inconclusive", fc,
                                 f"Positive control failed: the legitimate create returned HTTP "
                                 f"{control.status}; no attack was sent", evidence=evidence)
+        undone = " Every created object was deleted and its removal verified."
+        if left:
+            undone = (f" {len(left)} throwaway account(s) were created and NOT deleted (no DELETE route; "
+                      f"validators.write_integrity.allow_unrestorable_self_service_creates is on): "
+                      + ", ".join(m.item or m.account or f"an object created at {urlsplit(m.url).path}"
+                                  for m in left)
+                      + ".")
         if control.obj is None:
             return self._result("inconclusive", fc,
-                                "Positive control created an object that could not be read back; it "
-                                "was deleted and no attack was sent", evidence=evidence)
-        judge = {CROSS_IDENTITY_WRITE: self._judge_reference, FORGED_AUTHORSHIP: self._judge_reference,
+                                "Positive control created an object that could not be read back; no "
+                                "attack was sent." + undone, evidence=evidence)
+        judge = {CROSS_IDENTITY_WRITE: self._judge_cross_identity, FORGED_AUTHORSHIP: self._judge_reference,
                  BUSINESS_RULE_TAMPER: self._judge_reference,
                  MASS_ASSIGNMENT_CREATE: self._judge_mass_assignment,
                  CREATE_VALIDATION: self._judge_validation}[case.kind]
         status, summary, control_outcome = judge(case, plan)
-        undone = " Every created object was deleted and its removal verified."
-        controls = [control.read, control.check] + [x for m in plan.attacks for x in (m.read, m.check)]
-        attack = next((m.sent for m in plan.attacks if _ok2xx(m.sent)), plan.attacks[0].sent)
+        tried = plan.attacks + plan.sent
+        controls = [control.read, control.check] + [x for m in tried for x in (m.read, m.check)]
+        landed = next((m for m in tried if case.kind == CROSS_IDENTITY_WRITE and self._landed(plan, m)), None)
+        attack = landed.sent if landed is not None else next(
+            (m.sent for m in tried if _ok2xx(m.sent)), plan.attacks[0].sent)
         return self._result(status, fc, summary + undone, evidence=evidence,
                             confirmed=status == "confirmed",
                             confidence=0.9 if status == "confirmed" else 0.4 if status == "supported" else 0.0,
                             control_outcome=control_outcome
                             ).with_artifacts(baseline=control.sent, attack=attack,
                                              controls=[c for c in controls if c is not None])
+
+    # -- cross-identity parameter pollution ------------------------------------------
+
+    @staticmethod
+    def _stored_ref(plan: _Plan, obj: dict):
+        """(found, value) of the reference field `plan` forged, in a read-back."""
+        found, stored = _field_of(obj, plan.field)
+        if not found:
+            stem = naming.object_key(_ID_SUFFIX.sub("", plan.field) or plan.field)
+            found, stored = next(((True, v) for k, v in obj.items() if _ref_stem(k) == stem),
+                                 (False, None))
+        return found, stored
+
+    def _landed(self, plan: _Plan, made: _Made) -> bool:
+        """The read-back of `made` stores the foreign reference: the object landed on
+        the other principal's object (the only confirmation a variant gets)."""
+        if made.obj is None or plan.other is None:
+            return False
+        found, stored = self._stored_ref(plan, made.obj)
+        return bool(found) and _same_value(stored, plan.forged)
+
+    def _deleter(self, case: _Case, plan: _Plan, made: _Made):
+        """Whose sessions delete `made` first: the other principal when the object
+        landed on its object, the writer for a variant, else the default order."""
+        if case.kind == CROSS_IDENTITY_WRITE and self._landed(plan, made):
+            return plan.other
+        return case.actor if any(made is v for v in plan.sent) else None
+
+    async def _send_variants(self, case: _Case, plan: _Plan, made: list) -> None:
+        """Send the pollution variants one at a time, each only while the case's
+        mutating headroom pays for its create and one delete per principal, deleting
+        each one that did not land before the next (a unique rule would refuse it)."""
+        for m in plan.attacks:   # the plain attack's object, bound to the writer's own
+            await self._undo(case, m, first=case.actor)
+            if m.restored is False:
+                plan.unsent += [f"{v.label} (an earlier create could not be removed)" for v in plan.variants]
+                return
+        need = 1 + len({_pid(r) for r in self._readers(case)})
+        for i, v in enumerate(plan.variants):
+            headroom, _, ceiling = self.run_context.gate.mutating_headroom(case.case_ref, self.name)
+            if headroom < need:
+                plan.unsent += [f"{x.label} (mutating headroom {headroom} < {need}; ceiling {ceiling})"
+                                for x in plan.variants[i:]]
+                return
+            made.append(v)
+            plan.sent.append(v)
+            await self._create(case, v)
+            if self._landed(plan, v):
+                return
+            await self._undo(case, v, first=case.actor)
+            if v.restored is False:
+                plan.unsent += [f"{x.label} (an earlier create could not be removed)"
+                                for x in plan.variants[i + 1:]]
+                return
+
+    def _judge_cross_identity(self, case: _Case, plan: _Plan):
+        status, summary, outcome = self._judge_reference(case, plan)
+        if status == "confirmed" or not (plan.sent or plan.unsent):
+            return status, summary, outcome
+        plain = plan.attacks[0]
+        landed = next((v for v in plan.sent if self._landed(plan, v)), None)
+        if landed is not None:
+            _, stored = self._stored_ref(plan, landed.obj)
+            how = (f"refused (HTTP {plain.status})" if _refused(plain.sent) else
+                   "bound to the writer's own object" if _ok2xx(plain.sent) else
+                   f"answered HTTP {plain.status}")
+            return ("confirmed", f"Cross-identity write by parameter pollution: {_pid(case.actor)!r} "
+                                 f"created an object bound to {_pid(plan.other)!r}'s object by sending "
+                                 f"{_VARIANT_WORDS.get(landed.label, landed.label)} ({plan.detail}; "
+                                 f"HTTP {landed.status}); the read-back stores {plan.field}={stored!r}, "
+                                 f"while the plain foreign reference was {how}", "")
+        notes = []
+        if plan.sent:
+            notes.append("parameter-pollution variants did not land ("
+                         + ", ".join(f"{v.label}: HTTP {v.status}" for v in plan.sent) + ")")
+        if plan.unsent:
+            notes.append("not sent: " + "; ".join(plan.unsent))
+        lead = next((v for v in plan.sent if _ok2xx(v.sent) and v.obj is None), None)
+        if lead is not None:
+            return ("supported", f"LEAD: the server accepted {_VARIANT_WORDS.get(lead.label, lead.label)} "
+                                 f"carrying {_pid(plan.other)!r}'s reference ({plan.detail}) but the "
+                                 f"created object could not be read back; " + "; ".join(notes), "")
+        # The plain reference's verdict stands; the summary names what else was tried
+        # and what the headroom could not pay for.
+        return status, summary + "; " + "; ".join(notes), outcome
 
     # -- verdicts --------------------------------------------------------------------
 
@@ -917,8 +1330,11 @@ class WriteIntegrityValidator(Validator):
                 (accepted if first.obj is not None and second.obj is not None else lead).append(
                     f"a duplicate of a unique create was stored as a second object ({second.item})")
             elif _ok2xx(first.sent):
-                notes.append(f"the duplicate was refused (HTTP {second.status})")
+                notes.append(f"the duplicate was refused (HTTP {second.status})"
+                             + (f" (not read back by logging in: {second.login_why})"
+                                if plan.login_url and second.login_why else ""))
         empty = next(m for m in plan.attacks if m.label == "empty")
+        unsettled = []
         if _ok2xx(empty.sent):
             if empty.obj is not None:
                 # Only a field the read-back returns as "" counts: a field it never
@@ -927,17 +1343,33 @@ class WriteIntegrityValidator(Validator):
                 (accepted if blanks else lead).append(
                     f"a create with every string field empty was stored"
                     + (f" (read-back: {', '.join(blanks)} empty)" if blanks else ""))
+            elif empty.login_result == "stored":
+                accepted.append(f"a create with every string field empty was stored although its "
+                                f"HTTP {empty.status} answer named no readable object: {empty.login_why}")
             else:
                 lead.append("a create with every string field empty was accepted (HTTP "
-                            f"{empty.status}) but could not be read back")
+                            f"{empty.status}) but could not be read back"
+                            + (f" ({empty.login_why})" if empty.login_why else ""))
         elif empty.sent is not None:
-            notes.append(f"the empty create was refused (HTTP {empty.status})")
+            if empty.login_result == "stored":
+                accepted.append(f"a create with every string field empty was stored despite HTTP "
+                                f"{empty.status}: {empty.login_why}")
+            elif empty.login_result in ("existing", "unsure"):
+                unsettled.append(f"the empty create's HTTP {empty.status} cannot be counted as a refusal: "
+                                 f"{empty.login_why}")
+            else:
+                notes.append(f"the empty create was refused (HTTP {empty.status})"
+                             + (f" and {empty.login_why}" if empty.login_result == "not_stored" else
+                                f" (not read back by logging in: {empty.login_why})" if empty.login_why
+                                else ""))
         if accepted:
             return "confirmed", "Weak create validation: " + "; ".join(accepted + lead), ""
         if lead:
             return "supported", "LEAD: " + "; ".join(lead), ""
-        return ("not_confirmed", "The server enforces create validation: " + "; ".join(notes),
-                "control_held")
+        if unsettled:
+            return "inconclusive", "Create validation not settled: " + "; ".join(unsettled + notes), ""
+        return ("not_confirmed", "The server enforces create validation: " + "; ".join(notes)
+                + (f"; {plan.login_note}" if plan.login_note else ""), "control_held")
 
     # -- update tamper (business_rule_tamper on PUT/PATCH) --------------------------------
 
@@ -1065,4 +1497,188 @@ class WriteIntegrityValidator(Validator):
                             f"The tamper returned HTTP {attack.status} but the read-back stores "
                             f"{key}={stored!r}, not {_TAMPER_VALUE}." + undone, evidence=evidence,
                             control_outcome="control_held" if _ok2xx(attack) else ""
+                            ).with_artifacts(**artifacts)
+
+    # -- forged authorship on an update (PUT/PATCH of one object) --------------------
+
+    def _no_update_object(self, case: _Case) -> str:
+        """Why an author-carrying PUT/PATCH with no object id in its path cannot run."""
+        ex = case.exchange
+        method = (ex.method or "").upper()
+        path = urlsplit(ex.url).path or "/"
+        status = ex.response_status
+        from types import SimpleNamespace
+        oid = _created_id(SimpleNamespace(body=ex.response_body or "", headers=ex.response_headers or {}))
+        if oid:
+            answer = (f" (its answer names object {oid}, but a {method} to the collection adds an "
+                      f"object rather than updating one)")
+        else:
+            answer = f" and its answer (HTTP {status}) names none" if status is not None else " and names none"
+        adds = ""
+        if status == 201 or oid:
+            if not self._restore_route(ex.url):
+                from harness.engagement import normalize_path
+                adds = (f", and no DELETE route is known for what it adds (DELETE "
+                        f"{normalize_path(_item_url(ex.url, '1'))})")
+        return (f"write_integrity forged_authorship: the {method} to {path} does not end in an "
+                f"object id{answer}, so there is no object to snapshot, read back or write back"
+                f"{adds}; nothing was written")
+
+    async def _update_authorship(self, case: _Case) -> ValidationResult:
+        """Snapshot one object, re-write its author/owner field with the writer's own
+        value (control), then with another identity's, read it back, and write the
+        snapshot back (as the forged identity too if the writer can no longer)."""
+        fc, run, url = case.finding.vulnerability_class, self.run_context, case.exchange.url
+        method = (case.exchange.method or "").upper()
+        tag = "write_integrity forged_authorship"
+        if case.actor is None:
+            return self._skip(fc, f"{tag}: needs the capture to be an authenticated, registered "
+                                  f"session; nothing was written")
+        key = forged = None
+        whose = ""
+        for k, v in case.body.items():
+            f, w = self._forge_author(case, k, v)
+            if f is not None:
+                key, forged, whose = k, f, w
+                break
+        if key is None:
+            return self._skip(fc, f"{tag}: the update carries no author/owner/user field whose value "
+                                  f"can be replaced by another principal's known identifier; nothing "
+                                  f"was written")
+        headroom, _, ceiling = run.gate.mutating_headroom(case.case_ref, self.name)
+        if headroom < 3 or (run.budget.remaining is not None and run.budget.remaining < 10):
+            return self._skip(fc, f"{tag}: the control, the forged update and the write-back need 3 "
+                                  f"mutating sends (validators.mutating_ceiling_by_check.write_integrity "
+                                  f">= 3; ceiling is {ceiling}); nothing was written")
+        snapshot = await self._send(case, "GET", url)
+        original = _object_of(snapshot)
+        if original is None:
+            return self._skip(fc, f"{tag}: a read of {urlsplit(url).path} returned no object (HTTP "
+                                  f"{getattr(snapshot, 'status', None)}) to snapshot, so nothing could be "
+                                  f"read back or written back; nothing was written")
+        found, before = _field_of(original, key)
+        if not found:
+            return self._skip(fc, f"{tag}: the object's read does not return {key!r}, so a forged value "
+                                  f"could not be read back; nothing was written")
+        if _same_value(before, forged):
+            return self._skip(fc, f"{tag}: the object's {key} already reads {before!r}; nothing was written")
+        if method == "PUT" and _masked_paths(original):
+            return self._skip(fc, f"{tag}: the object's read is not safely round-trippable (masked "
+                                  f"value); nothing was written")
+        stored_key = next((k for k in original if _flat(k) == _flat(key)), key)
+
+        def payload(value):
+            return {**original, stored_key: value} if method == "PUT" else {key: value}
+
+        restore_body = original if method == "PUT" else {key: before}
+        for body in (payload(before), payload(forged), restore_body):
+            decision = run.gate.authorize(validator_name=self.name, method=method, url=url,
+                                          body=json.dumps(body))
+            if not decision.allowed:
+                return self._skip(fc, f"{tag}: write/restore preflight refused: " + decision.reason)
+        other = next((o for o in case.others if _pid(o) == whose), None)
+        control = control_read = attack = attack_read = undo = check = None
+        restorer = ""
+        failure, cancelled = "", False
+
+        def restored() -> bool:
+            obj = _object_of(check)
+            return _ok2xx(undo) and obj is not None and _stable(obj) == _stable(original)
+
+        async def restore():
+            nonlocal undo, check, restorer
+            from harness import run_handoff
+            with run_handoff.restore_scope(f"{case.case_ref}:write_integrity_restore"):
+                undo = await self._send(case, method, url, restore_body, cleanup=True)
+            check = await self._send(case, "GET", url, cleanup=True)
+            restorer = _pid(case.actor)
+            if restored() or other is None or not _ok2xx(attack):
+                return
+            # The forged author may own the object now: write it back as that identity.
+            if run.gate.mutating_headroom(case.case_ref, self.name)[0] < 1:
+                return
+            with run_handoff.restore_scope(f"{case.case_ref}:write_integrity_restore"):
+                undo = await self._send(case, method, url, restore_body, ident=other, cleanup=True)
+            check = await self._send(case, "GET", url, ident=other, cleanup=True)
+            restorer = _pid(other)
+
+        try:
+            control = await self._send(case, method, url, payload(before))
+            control_read = await self._send(case, "GET", url)
+            if _ok2xx(control) and _object_of(control_read) is not None:
+                attack = await self._send(case, method, url, payload(forged))
+                attack_read = await self._send(case, "GET", url)
+                if _object_of(attack_read) is None and other is not None:
+                    attack_read = await self._send(case, "GET", url, ident=other)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as exc:
+            failure = f"probe raised {type(exc).__name__}: {exc}"
+        finally:
+            if any(getattr(x, "executed", False) for x in (control, attack)):
+                task = asyncio.ensure_future(restore())
+                try:
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        await task
+                except Exception as exc:
+                    failure += f"; restore raised {type(exc).__name__}: {exc}"
+        restore_sent = undo is not None
+        restore_ok = (not restore_sent and not any(getattr(x, "executed", False) for x in (control, attack))) \
+            or restored()
+        detail = (f"write_integrity restore {'verified' if restore_ok else 'NOT verified'} "
+                  f"(restore HTTP {getattr(undo, 'status', None)} as {restorer or 'nobody'}) on {url}")
+        try:
+            from harness import run_handoff
+            ids = [getattr(x, "artifact_id", "") for x in (control, attack) if x is not None]
+            run_handoff.mark_restore(run, [i for i in ids if i], ok=restore_ok, detail=detail)
+        except Exception:
+            log.debug("write_integrity: mark_restore failed", exc_info=True)
+        stored = _field_of(_object_of(attack_read), key)[1] if attack_read is not None else None
+        evidence = (f"kind={case.kind}; target={method} {url}; writer={_pid(case.actor)}; "
+                    f"change={key}: {before!r} -> {forged!r} ({whose}); "
+                    f"control_status={getattr(control, 'status', None)}; "
+                    f"attack_status={getattr(attack, 'status', None)}; stored={stored!r}; "
+                    f"restore={'sent' if restore_sent else 'not_needed'}; "
+                    f"restore_status={getattr(undo, 'status', None)}; restored_by={restorer or '-'}; "
+                    f"restore_succeeded={str(restore_ok).lower()}")
+        if not restore_ok:
+            message = (f"RESTORE FAILED: write_integrity could not write {key}={before!r} back on {url} "
+                       f"and verify it -- restore it manually. " + evidence
+                       + (" " + failure if failure else ""))
+            log.error(message)
+            if cancelled:
+                raise asyncio.CancelledError(message)
+            return self._result("error", fc, message, evidence=evidence)
+        if cancelled:
+            raise asyncio.CancelledError
+        undone = " The snapshot was written back and verified." if restore_sent else ""
+        if failure:
+            return self._result("error", fc, "write_integrity probe incomplete." + undone + " " + failure,
+                                evidence=evidence)
+        artifacts = dict(baseline=control, attack=attack,
+                         controls=[c for c in (snapshot, control_read, attack_read, check) if c is not None])
+        if attack is None:
+            return self._result("inconclusive", fc,
+                                f"Positive control failed: re-writing the object's own {key}={before!r} "
+                                f"returned HTTP {getattr(control, 'status', None)} and did not read back; "
+                                f"no forged value was sent." + undone, evidence=evidence)
+        if _refused(attack):
+            return self._result("not_confirmed", fc,
+                                f"The server refused an update setting {key} to {forged!r} ({whose}) "
+                                f"(HTTP {attack.status}) after accepting the object's own value."
+                                + undone, evidence=evidence,
+                                control_outcome="control_held").with_artifacts(**artifacts)
+        if _ok2xx(attack) and _same_value(stored, forged):
+            return self._result("confirmed", fc,
+                                f"Forged authorship on update: {_pid(case.actor)!r} rewrote {key} of "
+                                f"{urlsplit(url).path} to {stored!r} ({whose}), not the writer; the "
+                                f"read-back stores it (it was {before!r})." + undone,
+                                evidence=evidence, confirmed=True, confidence=0.9).with_artifacts(**artifacts)
+        return self._result("not_confirmed", fc,
+                            f"The update returned HTTP {attack.status} but the server kept authorship "
+                            f"bound: the read-back stores {key}={stored!r}, not {forged!r}." + undone,
+                            evidence=evidence, control_outcome="control_held" if _ok2xx(attack) else ""
                             ).with_artifacts(**artifacts)
