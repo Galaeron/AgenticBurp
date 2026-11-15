@@ -21,24 +21,40 @@ regardless of the exact wording used.
 
 Repeated success alone is still only a LEAD, never a confirmation: plenty of
 mutating operations are legitimately repeatable. Confirming needs a state
-read-back showing more effects than a one-time limit allows. The generic burst
-has no read-back, so it reports not_confirmed with the burst as lead evidence
-(``limitation`` names the gap); only the email-race path, which reads the
-account back, can confirm. Session/token-issuing endpoints (login, token
+read-back showing more effects than a one-time limit allows. Without one the
+generic burst reports not_confirmed with the burst as lead evidence
+(``limitation`` names the gap). Session/token-issuing endpoints (login, token
 grants) are skipped as not applicable -- concurrent logins succeeding is the
 designed behaviour.
+
+Generic state read-back (oracle gap): when the request names an object (an
+id-like body key or path segment), a GET that reads it -- a same-origin GET the
+run captured whose answer carries the id, else the object under the request URL
+or its parent, the path up to an id segment, or the request URL itself -- is
+read twice before the burst (fields that differ between the two reads are
+volatile and dropped), once after it, and once after ONE sequential repeat of
+the request (kept inside the gate's burst allowance). The burst confirms when
+that object recorded the effect 2..N times (a counter moved, an array grew,
+ideally by a duplicate entry) and the sequential repeat was then refused or
+changed nothing: the operation is limited to once, and the burst exceeded the
+limit. A read-back showing exactly one effect is a negative (the limit held);
+a repeat that is accepted and moves the state again means the operation is
+repeatable, and the lead stays a lead, as it does with no reader at all. The
+email-race path keeps its own account read-back.
 """
 
 from __future__ import annotations
 import asyncio
+import collections
 import html
+import json
 import logging
 import re
 import time
 import uuid
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
 
 import httpx
 
@@ -76,6 +92,284 @@ def is_session_issuing(exchange) -> bool:
     if any(_SESSION_ISSUING_SEGMENT.match(seg) for seg in path.split("/") if seg):
         return True
     return bool(_GRANT_TYPE.search(exchange.request_body or ""))
+
+
+# --- generic state read-back (see the module docstring) ----------------------
+_ID_KEY = re.compile(r"^(?:_?id|uuid|guid)$", re.IGNORECASE)
+_ID_SUFFIX_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:Id|ID|_id|_ID|Uuid|_uuid)$")
+_ID_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+_ID_SEGMENT = re.compile(r"^(?:\d{1,19}|(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9][A-Za-z0-9_-]{3,79})$")
+_VERSION_SEGMENT = re.compile(r"^v\d+$", re.IGNORECASE)
+_UNSAFE_READER = re.compile(r"log-?out|sign-?out|delete|remove|destroy|reset|unsubscribe",
+                            re.IGNORECASE)
+_MAX_REFS = 3
+_MAX_READER_PROBES = 4
+_MAX_CAPTURES_SCANNED = 500
+_MAX_JSON_NODES = 5000
+# A sequential repeat answered with one of these never exercised the limit.
+_CONTROL_UNDECIDED = {401, 407, 408, 425, 429}
+
+
+def _is_id_key(key) -> bool:
+    return isinstance(key, str) and bool(_ID_KEY.match(key) or _ID_SUFFIX_KEY.match(key))
+
+
+def _id_of(value) -> str | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value) if value >= 0 else None
+    if isinstance(value, str) and _ID_TOKEN.match(value):
+        return value
+    return None
+
+
+def object_refs(exchange) -> list[tuple[str, str]]:
+    """(key, value) of the objects a request names: id-like keys of its JSON or
+    form body (top level, then one level down), then id-like path segments (key
+    "#<segment index>"); at most _MAX_REFS, one per value."""
+    found: list[tuple[str, str]] = []
+
+    def add(key, value):
+        if value is not None and value not in {v for _, v in found}:
+            found.append((key, value))
+
+    body = (exchange.request_body or "").strip()
+    data = None
+    if body[:1] in ("{", "["):
+        try:
+            data = json.loads(body)
+        except ValueError:
+            data = None
+    if isinstance(data, dict):
+        for obj in [data] + [v for v in data.values() if isinstance(v, dict)]:
+            for key, value in obj.items():
+                if _is_id_key(key):
+                    add(key, _id_of(value))
+    elif data is None and "=" in body:
+        for key, value in parse_qsl(body, keep_blank_values=False):
+            if _is_id_key(key):
+                add(key, _id_of(value))
+    for index, segment in enumerate((urlsplit(exchange.url or "").path or "").split("/")):
+        segment = unquote(segment)
+        if segment and _ID_SEGMENT.match(segment) and not _VERSION_SEGMENT.match(segment):
+            add(f"#{index}", segment)
+    return found[:_MAX_REFS]
+
+
+def _capture(item) -> tuple[str, str, Any, str]:
+    """(method, url, status, response body) of one capture, an HttpExchange or a dict."""
+    get = item.get if isinstance(item, dict) else (lambda k: getattr(item, k, None))
+    return (str(get("method") or "GET").upper(), str(get("url") or ""),
+            get("response_status"), str(get("response_body") or ""))
+
+
+def _origin_key(url: str) -> tuple[str, str]:
+    parts = urlsplit(url or "")
+    return (parts.scheme or "").lower(), (parts.netloc or "").lower()
+
+
+def _mentions(text: str, value: str) -> bool:
+    """True when a JSON answer carries `value` as a string or a whole number."""
+    if f'"{value}"' in text:
+        return True
+    return value.isdigit() and re.search(
+        rf"(?<![\w.\"]){re.escape(value)}(?![\w.\"])", text) is not None
+
+
+def _shared_segments(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip([s for s in urlsplit(a).path.split("/") if s],
+                    [s for s in urlsplit(b).path.split("/") if s]):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def reader_candidates(exchange, refs, captured=()) -> list[str]:
+    """GET URLs that may read the object `refs` name, best first: same-origin 2xx
+    GETs the run captured whose answer carries one of the ids (nearest path
+    first), then the object under the request URL or its parent, the path up to
+    an id segment, and the request URL itself (a collection)."""
+    url = exchange.url or ""
+    parts = urlsplit(url)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    out: list[str] = []
+
+    def add(candidate: str) -> None:
+        if (candidate and candidate not in out
+                and not _UNSAFE_READER.search(urlsplit(candidate).path or "")):
+            out.append(candidate)
+
+    ranked = []
+    for order, item in enumerate(list(captured or ())[:_MAX_CAPTURES_SCANNED]):
+        try:
+            method, curl, status, body = _capture(item)
+            if status is not None and not 200 <= int(status) < 300:
+                continue
+        except Exception:
+            continue
+        if method != "GET" or not curl or _origin_key(curl) != _origin_key(url):
+            continue
+        if any(_mentions(body, value) for _, value in refs):
+            ranked.append((-_shared_segments(curl, url), order, curl))
+    for _, _, curl in sorted(ranked):
+        add(curl)
+    path = (parts.path or "/").rstrip("/")
+    segments = (parts.path or "").split("/")
+    for key, value in refs:
+        if key.startswith("#"):
+            add(origin + "/".join(segments[:int(key[1:]) + 1]))
+            continue
+        add(f"{origin}{path}/{quote(value, safe='')}")
+        parent = path.rsplit("/", 1)[0]
+        if parent:
+            add(f"{origin}{parent}/{quote(value, safe='')}")
+    add(origin + (parts.path or "/"))
+    return out
+
+
+def _json_doc(text: str | None):
+    try:
+        return json.loads(text or "")
+    except ValueError:
+        return None
+
+
+def _walk(doc):
+    """Every dict and list of a JSON document, shallowest first, bounded."""
+    if not isinstance(doc, (dict, list)):
+        return
+    queue, seen = collections.deque([doc]), 0
+    while queue and seen < _MAX_JSON_NODES:
+        node = queue.popleft()
+        seen += 1
+        yield node
+        children = node.values() if isinstance(node, dict) else node
+        queue.extend(c for c in children if isinstance(c, (dict, list)))
+
+
+def _scalar(value) -> bool:
+    return value is not None and not isinstance(value, (dict, list, bool))
+
+
+def locate_object(doc, refs) -> tuple[dict | None, tuple[str, str] | None]:
+    """(object, (key, value)) of the JSON object in `doc` that a ref names: a dict
+    whose id-like key holds the ref's value -- the request's own key name first,
+    then a plain id key, then any id-like key. (None, None) when absent."""
+    best, anchor, rank = None, None, -1
+    for node in _walk(doc):
+        if not isinstance(node, dict):
+            continue
+        for key, value in node.items():
+            if not (_scalar(value) and _is_id_key(key)):
+                continue
+            for ref_key, ref_value in refs:
+                if str(value) != ref_value:
+                    continue
+                score = 2 if key == ref_key else (1 if _ID_KEY.match(key) else 0)
+                if score > rank:
+                    best, anchor, rank = node, (key, ref_value), score
+    return best, anchor
+
+
+def _find(doc, anchor) -> dict | None:
+    key, value = anchor
+    for node in _walk(doc):
+        if isinstance(node, dict) and _scalar(node.get(key)) and str(node[key]) == value:
+            return node
+    return None
+
+
+def state_fields(obj: dict) -> dict:
+    """The counters (numbers) and arrays (canonical entries) of one JSON object and
+    of the objects directly inside it; ids are not state."""
+    out: dict = {}
+
+    def take(name, value):
+        if isinstance(value, bool):
+            return
+        if isinstance(value, (int, float)):
+            out[name] = value
+        elif isinstance(value, list):
+            out[name] = [json.dumps(v, sort_keys=True, default=str) for v in value]
+
+    for key, value in obj.items():
+        if _is_id_key(key):
+            continue
+        if isinstance(value, dict):
+            for inner, inner_value in value.items():
+                if not _is_id_key(inner):
+                    take(f"{key}.{inner}", inner_value)
+        else:
+            take(key, value)
+    return out
+
+
+def state_effects(before: dict, after: dict, limit: int) -> list[tuple[str, int, int, bool]]:
+    """(field, effects, new duplicate entries, is array) for each field whose change
+    the burst could explain -- a counter that moved by 1..limit or an array that
+    grew by 1..limit -- most telling first: duplicates, then arrays, then size."""
+    out = []
+    for name, old in before.items():
+        new = after.get(name)
+        if isinstance(old, list) and isinstance(new, list):
+            n = len(new) - len(old)
+            dups = max(0, (len(new) - len(set(new))) - (len(old) - len(set(old))))
+            is_array = True
+        elif isinstance(old, (int, float)) and isinstance(new, (int, float)):
+            delta = new - old
+            if delta != int(delta):
+                continue
+            n, dups, is_array = abs(int(delta)), 0, False
+        else:
+            continue
+        if 1 <= n <= limit:
+            out.append((name, n, dups, is_array))
+    out.sort(key=lambda e: (-e[2], -int(e[3]), -e[1]))
+    return out
+
+
+def _assigned_names(exchange) -> set[str]:
+    """Lower-cased key names a JSON or form request body assigns (two levels)."""
+    body = (exchange.request_body or "").strip()
+    names: set[str] = set()
+    data = None
+    if body[:1] in ("{", "["):
+        try:
+            data = json.loads(body)
+        except ValueError:
+            data = None
+    if isinstance(data, dict):
+        for obj in [data] + [v for v in data.values() if isinstance(v, dict)]:
+            names.update(str(k).lower() for k in obj)
+    elif data is None and "=" in body:
+        names.update(k.lower() for k, _ in parse_qsl(body, keep_blank_values=True))
+    return names
+
+
+def _change(name: str, old, new, dups: int) -> str:
+    if isinstance(old, list):
+        return (f"`{name}` grew from {len(old)} to {len(new)} entries"
+                + (f", {dups} of them duplicates of an existing entry" if dups else ""))
+    return f"`{name}` went from {old} to {new}"
+
+
+@dataclass
+class _ReadBack:
+    """The pre-burst read of the object a request names."""
+    url: str
+    anchor: tuple[str, str]
+    read: Callable
+    stable: dict
+    baseline_artifact: str = ""
+    volatile: list = field(default_factory=list)
+    control: bool = False
+
+    @property
+    def where(self) -> str:
+        return urlsplit(self.url).path or "/"
 
 
 @dataclass
@@ -201,6 +495,16 @@ class RaceConditionValidator(Validator):
                     evidence="", raw_output="[]",
                 )
             effective_burst_size = gate_decision.allowed_burst_size
+            # Read the named object back before the burst; when a reader exists, one
+            # copy of the authorized allowance is kept for the sequential repeat
+            # (the control), so the leg never sends more than the gate allowed.
+            readback = None
+            if self.run_context is not None:
+                readback = await self._open_readback(exchange, headers)
+            burst_copies = effective_burst_size
+            if readback is not None and effective_burst_size >= 3:
+                burst_copies = effective_burst_size - 1
+                readback.control = True
 
             failures = SendFailures()
             label = SendFailures.label(exchange.method, exchange.url)
@@ -244,7 +548,7 @@ class RaceConditionValidator(Validator):
                                                headers=result.headers)
                     return send
 
-                sends = [prepare_one() for _ in range(effective_burst_size)]
+                sends = [prepare_one() for _ in range(burst_copies)]
                 raw_responses, dispatch = await self._fire_together(sends, on_error=send_failed)
             else:
                 # One shared client sized for the whole burst instead of a
@@ -262,7 +566,7 @@ class RaceConditionValidator(Validator):
                                 exchange.method, exchange.url,
                                 headers=headers, content=body_bytes)
                         return send
-                    sends = [prepare_fallback() for _ in range(effective_burst_size)]
+                    sends = [prepare_fallback() for _ in range(burst_copies)]
                     raw_responses, dispatch = await self._fire_together(sends, on_error=send_failed)
             responses = [r for r in raw_responses if r is not None]
             dispatch_note = self._dispatch_note(dispatch)
@@ -273,7 +577,7 @@ class RaceConditionValidator(Validator):
                 return ValidationResult(
                     validator=self.get_name(), status="error",
                     finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
-                    summary=f"Only {len(responses)}/{effective_burst_size} burst requests completed -- "
+                    summary=f"Only {len(responses)}/{burst_copies} burst requests completed -- "
                             "too few to draw a conclusion, target may be rate-limiting the burst itself",
                     evidence=dispatch_note, raw_output="[]",
                 )
@@ -294,11 +598,22 @@ class RaceConditionValidator(Validator):
 
             # Repeated success is only a LEAD: many operations are legitimately
             # repeatable. Confirmation needs a state read-back showing more effects
-            # than a one-time limit allows, and this generic burst has no such
-            # read-back (only the email-race path does), so it never confirms.
+            # than a one-time limit allows; without a reader the burst never confirms.
             repeated = clean_successes >= 2
             if failures.failures and not repeated:
                 return failures.result(self.get_name(), finding.vulnerability_class, "Race burst")
+            readback_note = ""
+            if readback is not None and repeated:
+                verdict = await self._readback_verdict(
+                    readback, finding, exchange, headers, completed=len(responses),
+                    clean=clean_successes,
+                    evidence=f"Status code distribution across burst: {status_counts}; {dispatch_note}",
+                    raw={"burst_size": burst_copies, "requested_burst_size": self.burst_size,
+                         "completed": len(responses), "clean_successes": clean_successes,
+                         "status_counts": status_counts, "dispatch": dispatch})
+                if isinstance(verdict, ValidationResult):
+                    return verdict
+                readback_note = verdict
             limitation = ""
             if repeated:
                 detail = (
@@ -309,8 +624,9 @@ class RaceConditionValidator(Validator):
                 )
                 limitation = (
                     "Lead only: repeated success does not show a one-time limit was exceeded. "
-                    "No state read-back of the operation's effect (balance, redemption count, "
-                    "stock) was available to prove more effects than allowed.")
+                    + (f"The state read-back did not decide it: {readback_note}." if readback_note else
+                       "No state read-back of the operation's effect (balance, redemption count, "
+                       "stock) was available to prove more effects than allowed."))
             else:
                 detail = (
                     f"{clean_successes} of {len(responses)} concurrent requests looked like clean "
@@ -325,18 +641,21 @@ class RaceConditionValidator(Validator):
                 finding_class=finding.vulnerability_class,
                 confidence=0.3 if repeated else 0.2,
                 confirmed=False,
-                summary=(f"Lead, not confirmed (no state read-back): {detail}"
-                         if repeated else detail),
+                summary=(f"Lead, not confirmed ("
+                         f"{'state read-back not decisive' if readback_note else 'no state read-back'}"
+                         f"): {detail}" if repeated else detail),
                 limitation=limitation,
                 manual_verification=(
                     "Read back the operation's effect (e.g. balance, coupon use count, stock) "
                     "after the burst; confirm only if it exceeds the one-time limit."
                     if repeated else ""),
-                evidence=f"Status code distribution across burst: {status_counts}; {dispatch_note}",
-                raw_output=str({"burst_size": effective_burst_size, "requested_burst_size": self.burst_size,
+                evidence=(f"Status code distribution across burst: {status_counts}; {dispatch_note}"
+                          + (f"; read-back {readback.where}: {readback_note}" if readback_note else "")),
+                raw_output=str({"burst_size": burst_copies, "requested_burst_size": self.burst_size,
                                  "completed": len(responses),
                                  "clean_successes": clean_successes, "status_counts": status_counts,
-                                 "dispatch": dispatch}),
+                                 "dispatch": dispatch}
+                               | ({"readback": readback.where} if readback is not None else {})),
             )
         except Exception as e:
             log.error(f"Race condition validation error: {e}")
@@ -345,6 +664,160 @@ class RaceConditionValidator(Validator):
                 finding_class=finding.vulnerability_class, confidence=0.0, confirmed=False,
                 summary=f"Race condition validation failed: {e}", evidence="", raw_output=str(e),
             )
+
+    async def _open_readback(self, exchange: HttpExchange, headers: dict) -> _ReadBack | None:
+        """Read the object the request names before the burst, through the run's
+        transport and the request's own session: the first reader candidate whose
+        JSON answer holds the object, read a second time so fields that move on
+        their own are dropped. None when the request names no object or no
+        candidate answers with it (the burst then stays a lead)."""
+        refs = object_refs(exchange)
+        if not refs:
+            return None
+        from harness.run_context import TypedRequest
+        from .transport import bind_session
+        context = getattr(self.run_context, "experiment_context", None)
+        captured = (context.get("captured") if isinstance(context, dict) else None) or ()
+        try:
+            session_ref, bound = bind_session(self.run_context, headers)
+            executor = self.run_context.executor()
+        except Exception as e:
+            log.debug(f"Read-back preparation failed: {e}")
+            return None
+        read_headers = {k: v for k, v in bound.items() if k.lower() not in ("content-type", "accept")}
+        read_headers["Accept"] = "application/json, */*;q=0.5"
+
+        async def read(url: str):
+            try:
+                result = await executor.execute(TypedRequest("GET", url, headers=read_headers),
+                                                capability=self.get_name(), session_ref=session_ref)
+            except Exception as e:
+                log.debug(f"Read-back GET failed: {e}")
+                return None, None
+            if not getattr(result, "ok", False) or not 200 <= (result.status or 0) < 300:
+                return None, result
+            return _json_doc(result.body), result
+
+        for url in reader_candidates(exchange, refs, captured)[:_MAX_READER_PROBES]:
+            doc, _first = await read(url)
+            obj, anchor = locate_object(doc, refs)
+            if obj is None:
+                continue
+            doc2, second = await read(url)
+            again = _find(doc2, anchor)
+            if again is None:
+                continue
+            first_fields, second_fields = state_fields(obj), state_fields(again)
+            stable = {k: v for k, v in first_fields.items() if second_fields.get(k) == v}
+            if stable:
+                return _ReadBack(url=url, anchor=anchor, read=read, stable=stable,
+                                 baseline_artifact=getattr(second, "artifact_id", "") or "",
+                                 volatile=sorted(set(first_fields) - set(stable)))
+        return None
+
+    async def _readback_verdict(self, rb: _ReadBack, finding: Finding, exchange: HttpExchange,
+                                headers: dict, *, completed: int, clean: int, evidence: str,
+                                raw: dict):
+        """A confirmation, or a negative, from the object read back after the burst
+        and after one sequential repeat; else a note on why the read-back could not
+        decide (the caller keeps the lead)."""
+        from harness.run_context import TypedRequest
+        from .transport import bind_session
+        where = rb.where
+        doc, after_result = await rb.read(rb.url)
+        after_obj = _find(doc, rb.anchor)
+        if after_obj is None:
+            return f"the read of {where} after the burst no longer returned the object"
+        after = state_fields(after_obj)
+        # A field the request itself assigns changes by assignment, not by
+        # accumulated effects, so it never counts.
+        assigned = _assigned_names(exchange)
+        effects = [e for e in state_effects(rb.stable, after, completed)
+                   if e[0].rsplit(".", 1)[-1].lower() not in assigned]
+        if not effects:
+            moved = [k for k, v in rb.stable.items() if after.get(k) != v]
+            if moved:
+                return (f"fields of the object moved by more than the {completed} completed copies "
+                        f"explain ({', '.join(moved[:3])})")
+            return ("the object's counters and arrays did not change, so they may not record "
+                    "this operation")
+        name, n, dups, _is_array = effects[0]
+        change = _change(name, rb.stable[name], after[name], dups)
+        anchor = f"{rb.anchor[0]}={rb.anchor[1]}"
+        raw = dict(raw, readback=where, anchor=anchor, effects=n, duplicates=dups,
+                   volatile=rb.volatile)
+        if n == 1:
+            return ValidationResult(
+                validator=self.get_name(), status="not_confirmed",
+                finding_class=finding.vulnerability_class, confidence=0.2, confirmed=False,
+                summary=(f"{clean} of {completed} concurrent copies looked successful, but the object "
+                         f"read back from {where} recorded the effect once ({change}): no more "
+                         f"effects than a single request makes, so no limit was exceeded."),
+                evidence=f"{evidence}; read-back {where} ({anchor}): {change}",
+                raw_output=str(raw))
+        if not rb.control:
+            return (f"the object recorded the effect {n} times ({change}), but the gate's burst "
+                    f"allowance left no sequential repeat to show the operation is once-only")
+        try:
+            session_ref, bound = bind_session(self.run_context, headers)
+            control = await self.run_context.executor().execute(
+                TypedRequest(exchange.method, exchange.url, headers=bound,
+                             body=exchange.request_body or None),
+                capability=self.get_name(), session_ref=session_ref)
+        except Exception as e:
+            return (f"the object recorded the effect {n} times ({change}), but the sequential "
+                    f"repeat failed ({e.__class__.__name__})")
+        status = getattr(control, "status", None) or 0
+        if not getattr(control, "ok", False) or not status:
+            return (f"the object recorded the effect {n} times ({change}), but the sequential "
+                    f"repeat went unanswered")
+        if status in _CONTROL_UNDECIDED or status >= 500 or 300 <= status < 400:
+            return (f"the object recorded the effect {n} times ({change}), but the sequential "
+                    f"repeat answered HTTP {status}, which does not exercise the limit")
+        refused = status >= 400 or bool(_REJECTION_MARKERS.search(getattr(control, "body", "") or ""))
+        doc3, final_result = await rb.read(rb.url)
+        final_obj = _find(doc3, rb.anchor)
+        if final_obj is None:
+            return (f"the object recorded the effect {n} times ({change}), but the read after "
+                    f"the sequential repeat no longer returned it")
+        final = state_fields(final_obj)
+        moved = [k for k in rb.stable if final.get(k) != after.get(k)]
+        if moved and refused:
+            return (f"the object recorded the effect {n} times ({change}), but it moved again "
+                    f"while the sequential repeat was refused ({', '.join(moved[:3])}), so other "
+                    f"activity may explain the change")
+        if moved:
+            return (f"the object recorded the effect {n} times ({change}), and the sequential "
+                    f"repeat was accepted (HTTP {status}) and changed it again: the operation is "
+                    f"repeatable, so {n} effects do not exceed a limit")
+        if not refused:
+            # An accepted repeat that changes nothing may be an idempotent "set"
+            # (the burst assigned a value rather than accumulating effects).
+            return (f"the object recorded the effect {n} times ({change}); the sequential repeat "
+                    f"was accepted (HTTP {status}) and changed nothing, which does not show the "
+                    f"app limits the operation to once")
+        how = f"was refused (HTTP {status})"
+        result = ValidationResult(
+            validator=self.get_name(), status="confirmed",
+            finding_class=finding.vulnerability_class, confidence=0.9 if dups else 0.8,
+            confirmed=True,
+            summary=(f"Race condition confirmed by state read-back: {clean} of {completed} concurrent "
+                     f"copies looked successful and the object read back from {where} recorded the "
+                     f"effect {n} times ({change}), while one sequential repeat afterwards {how}. "
+                     f"The operation is limited to once, and the concurrent burst exceeded that "
+                     f"limit (the check and the update are not atomic)."),
+            evidence=(f"{evidence}; read-back {where} ({anchor}) twice before the burst, once after "
+                      f"it and once after the sequential repeat: {change}; the repeat {how} and "
+                      f"left the object unchanged."
+                      + (f" Volatile fields ignored: {', '.join(rb.volatile[:5])}." if rb.volatile
+                         else "")),
+            raw_output=str(dict(raw, control_status=status, control_refused=refused)))
+        result.baseline_artifact_id = rb.baseline_artifact
+        result.attack_artifact_id = getattr(after_result, "artifact_id", "") or ""
+        result.control_artifact_ids = tuple(
+            a for a in (getattr(control, "artifact_id", "") or "",
+                        getattr(final_result, "artifact_id", "") or "") if a)
+        return result
 
     async def _fire_together(self, sends: list, on_error=None) -> tuple[list, dict]:
         """Release already-prepared sends together and time each one (SKL-1).
