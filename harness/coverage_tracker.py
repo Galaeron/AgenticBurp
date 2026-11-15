@@ -33,6 +33,7 @@ import hashlib
 import json
 import uuid
 from collections import deque
+from itertools import chain
 
 
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -59,6 +60,16 @@ def _fair_cells(items, unauthenticated=frozenset()):
     Within a pass, parameter-phase checks come first, then endpoint, then domain
     checks; an authorization check (WSTG-ATHZ) takes its write-method cells first,
     because a write is where a missing function-level check does harm."""
+    ordered = [queue for _cid, queue in _check_queues(items, unauthenticated)]
+    while ordered:
+        for queue in list(ordered):
+            yield queue.popleft()
+            if not queue:
+                ordered.remove(queue)
+
+
+def _check_queues(items, unauthenticated=frozenset()) -> list[tuple[str, deque]]:
+    """The per-check queues `_fair_cells` visits, as (check id, queue) in turn order."""
     queues: dict[str, deque] = {}
     turn: dict[str, tuple] = {}
     for item in _spread_cells(items, unauthenticated):
@@ -72,12 +83,33 @@ def _fair_cells(items, unauthenticated=frozenset()):
         if cid.startswith("WSTG-ATHZ"):
             queues[cid] = deque(sorted(queue, key=lambda it: str(it[1]).partition(" ")[0].upper()
                                        not in _WRITE_METHODS))
-    ordered = [queues[cid] for cid in sorted(queues, key=turn.__getitem__)]
-    while ordered:
-        for queue in list(ordered):
-            yield queue.popleft()
-            if not queue:
-                ordered.remove(queue)
+    return [(cid, queues[cid]) for cid in sorted(queues, key=turn.__getitem__)]
+
+
+def _time_fair_cells(items, unauthenticated=frozenset(), spent=None):
+    """`_fair_cells` for a time-bound drive: the next cell comes from the check that
+    has used the least drive time so far. `spent` (check id -> seconds) is read
+    before every pick, so the driver adds each dispatch's wall time to it as it
+    goes; ties go to the check served fewer cells, then to `_fair_cells` turn
+    order, so legs that take no time are visited exactly as `_fair_cells` would.
+
+    One cell per check per pass shares a COUNT, not time: in r10 every check got
+    about 172 cells before the 5 h deadline, sqlmap's 172 took most of the drive
+    (26,522 of 36,059 sends), and 912 cells of quick checks (CORS, cross-identity,
+    JWT forge, CSP) were left queued. A check whose queue is empty drops out, so
+    its unused share goes to the checks still waiting."""
+    spent = {} if spent is None else spent
+    queues = _check_queues(items, unauthenticated)
+    rank = {cid: n for n, (cid, _queue) in enumerate(queues)}
+    served = dict.fromkeys(rank, 0)
+    live = dict(queues)
+    while live:
+        cid = min(live, key=lambda c: (spent.get(c, 0.0), served[c], rank[c]))
+        queue = live[cid]
+        served[cid] += 1
+        yield queue.popleft()
+        if not queue:
+            del live[cid]
 
 
 def _spread_cells(items, unauthenticated=frozenset()):
@@ -267,6 +299,21 @@ def _passive_first(cells):
         check = cell[2] if isinstance(cell[2], Check) else CHECKS_BY_ID.get(cell[2])
         return getattr(check, "confirmation", "")
     return sorted(cells, key=lambda cell: confirmation(cell) not in _PASSIVE_LEG_CONFIRMATIONS)
+
+
+def _drive_order(items, unauthenticated, spent=None):
+    """The order a drive dispatches `items` in: passive legs first. Without a
+    time bound (`spent` None) the rest share the dispatch budget by count
+    (`_fair_cells`); with one, they share the drive's time (`_time_fair_cells`),
+    the driver adding each dispatch's seconds to `spent` as it goes."""
+    if spent is None:
+        return iter(_passive_first(_fair_cells(items, unauthenticated)))
+    passive = [item for item in items
+               if getattr(_check_of(item), "confirmation", "") in _PASSIVE_LEG_CONFIRMATIONS]
+    sending = [item for item in items
+               if getattr(_check_of(item), "confirmation", "") not in _PASSIVE_LEG_CONFIRMATIONS]
+    return chain(_fair_cells(passive, unauthenticated),
+                 _time_fair_cells(sending, unauthenticated, spent))
 
 # E7: a drive hands its checkpoint to `on_checkpoint` after every this many completed
 # legs, so a run that dies inside a long drive resumes from the last of them.
@@ -677,7 +724,9 @@ class CoverageTracker:
         pending = self.pending_leg_cells(driveable)
         self.queued.update((ident, ep_key, check.id) for ident, ep_key, check in pending)
         spent = 0
-        for (ident, ep_key, check) in _passive_first(_fair_cells(pending, self._unauthenticated())):
+        # Under a deadline each check's dispatch seconds steer the order (_drive_order).
+        seconds: dict[str, float] | None = {} if deadline is not None else None
+        for (ident, ep_key, check) in _drive_order(pending, self._unauthenticated(), seconds):
             passive = check.confirmation in _PASSIVE_LEG_CONFIRMATIONS
             if not passive and spent >= budget:
                 self.stopped_by = "leg budget"
@@ -691,6 +740,7 @@ class CoverageTracker:
             self.passive_judged += passive
             self.attempted.add((ident, ep_key, check.id))
             method, _, path = ep_key.partition(" ")
+            started = time.monotonic()
             try:
                 res = await run_leg(ident, method, path, check)
             except Exception as e:  # a leg blowing up must not sink coverage
@@ -699,6 +749,9 @@ class CoverageTracker:
                                    reason=f"validator dispatch failed: {type(e).__name__}",
                                    validator=check.confirmation, executed=False)
                 continue
+            finally:
+                if seconds is not None:
+                    seconds[check.id] = seconds.get(check.id, 0.0) + time.monotonic() - started
             if res is None:
                 self.matrix.record(ident, ep_key, check.id, status=CellStatus.INCONCLUSIVE,
                                    reason="validator dispatch returned no result", validator=check.confirmation)
@@ -809,7 +862,9 @@ class CoverageTracker:
         attempts = passive_attempts = 0
         self.driveable = set(_LEG_CONFIRMATIONS if driveable is None else driveable)
         self.queued.update(cells)
-        for (ident, ep_key, check_id) in _passive_first(_fair_cells(list(cells), self._unauthenticated())):
+        # Under a deadline each check's dispatch seconds steer the order (_drive_order).
+        seconds: dict[str, float] | None = {} if deadline is not None else None
+        for (ident, ep_key, check_id) in _drive_order(list(cells), self._unauthenticated(), seconds):
             cks = cells[(ident, ep_key, check_id)]
             passive = CHECKS_BY_ID[check_id].confirmation in _PASSIVE_LEG_CONFIRMATIONS
             if not passive and attempts - passive_attempts >= budget:
@@ -825,6 +880,7 @@ class CoverageTracker:
             self.attempted.add((ident, ep_key, check_id))
             targets = ([c for c in cks if c is not rep and case_target(check.confirmation, c)]
                        if rep.is_no_parameter else [])
+            started = time.monotonic()
             if targets:
                 attempts += await self._drive_parameter_cases(
                     run_case, ident, ep_key, check, cks, rep, targets, deadline,
@@ -833,6 +889,8 @@ class CoverageTracker:
                 attempts += 1
                 passive_attempts += passive
                 await self._drive_request_level(run_case, ident, ep_key, check, cks, rep)
+            if seconds is not None:
+                seconds[check_id] = seconds.get(check_id, 0.0) + time.monotonic() - started
         self.passive_judged += passive_attempts
         return attempts - passive_attempts
 
@@ -1003,7 +1061,19 @@ class CoverageTracker:
             out_of_budget = True
             self.stopped_by = "leg budget"
         negatives = (CellStatus.NOT_DETECTED, CellStatus.CONTROLLED_NEGATIVE)
-        if (not timed_out and not out_of_budget and others
+        declined = [r for c, r in others if c.coord_id() in tested and r.status == CellStatus.SKIPPED
+                    and not r.executed and not r.attempts]
+        if not timed_out and not out_of_budget and others and len(declined) == len(others):
+            # The leg ran on every input and declined each on its own precondition
+            # (r10: 226 cells whose replayed request lacked the inputs the endpoint
+            # template named), sending nothing. Like a request-level refusal, the
+            # representative says so, so the cell is not read as an unfinished drive.
+            self.matrix.record_case(
+                ident, ep_key, check_id, rep, status=CellStatus.SKIPPED,
+                reason=f"{check.confirmation} declined every input it was dispatched on "
+                       f"({len(declined)}), sending nothing: {declined[0].reason}"[:180],
+                validator=check.confirmation)
+        elif (not timed_out and not out_of_budget and others
                 and all(r.status in negatives for _c, r in others)):
             self.matrix.record_case(
                 ident, ep_key, check_id, rep, status=CellStatus.NOT_DETECTED,
