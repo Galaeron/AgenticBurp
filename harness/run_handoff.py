@@ -199,6 +199,27 @@ class ChangeLog:
             self._persist()
         return len(changed)
 
+    def note_object(self, artifact_ids, *, object_ref: str = "", detail: str = "") -> int:
+        """Name the object the writes made by `artifact_ids` created when the send's
+        own answer did not (`object_ref`), and why a write with no registered
+        cleanup was left in place (`detail`). The restore status is unchanged."""
+        ids = {a for a in (artifact_ids or ()) if a}
+        if not ids or not (object_ref or detail):
+            return 0
+        changed = 0
+        with self._lock:
+            for entry in self._entries:
+                if entry["artifact_id"] not in ids:
+                    continue
+                if object_ref and not entry["object_ref"]:
+                    entry["object_ref"] = object_ref[:300]
+                if detail and entry["restore_status"] == RESTORE_NONE:
+                    entry["restore_detail"] = detail[:300]
+                changed += 1
+        if changed:
+            self._persist()
+        return changed
+
     def entries(self) -> list[dict]:
         with self._lock:
             return [dict(e) for e in self._entries]
@@ -521,6 +542,25 @@ def mark_restore(run_context, artifact_ids, *, ok: bool, detail: str = "") -> in
             total += log_.mark_restore(artifact_ids, ok=ok, detail=detail)
         except Exception:
             log.debug("mark_restore failed", exc_info=True)
+    handoff = for_run(run_context)
+    if handoff is not None and total:
+        handoff.persist()
+    return total
+
+
+def note_object(run_context, artifact_ids, *, object_ref: str = "", detail: str = "") -> int:
+    """Name what the writes made by `artifact_ids` created, or why they stay."""
+    total = 0
+    seen = set()
+    for rc in (run_context, _run(None)):
+        log_ = getattr(rc, "change_log", None)
+        if log_ is None or id(log_) in seen:
+            continue
+        seen.add(id(log_))
+        try:
+            total += log_.note_object(artifact_ids, object_ref=object_ref, detail=detail)
+        except Exception:
+            log.debug("note_object failed", exc_info=True)
     handoff = for_run(run_context)
     if handoff is not None and total:
         handoff.persist()

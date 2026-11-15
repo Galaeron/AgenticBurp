@@ -276,9 +276,12 @@ class ValidatorRegistry:
         # headers. Active; does NOT send blind mutating methods (PUT/DELETE).
         vt_cfg = cfg.get("verb_tamper", {})
         if vt_cfg.get("enabled", True):
+            # An override POST the server ignores can create an object; the
+            # operator's declared restore routes say where it can be deleted.
             self.validators["verb_tamper"] = VerbTamperValidator(
                 allowed_hosts=_allowed, timeout=float(vt_cfg.get("timeout", 10.0)),
-                try_mutating_methods=bool(vt_cfg.get("try_mutating_methods", False)))
+                try_mutating_methods=bool(vt_cfg.get("try_mutating_methods", False)),
+                restore_routes=(cfg.get("write_integrity", {}) or {}).get("restore_routes") or ())
         # CSRF leg -- deterministic property check: replays a state-changing
         # request without the CSRF token and checks SameSite. Active; mutating
         # replay gated by allow_mutating_replay.

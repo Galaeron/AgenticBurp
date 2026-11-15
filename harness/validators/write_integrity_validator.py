@@ -249,6 +249,17 @@ def _created_id(outcome) -> str:
     return last[-1] if last and _ID_SEGMENT.match(last[-1]) else ""
 
 
+def route_set(routes) -> set[tuple[str, str]]:
+    """("METHOD", "/template") pairs from route strings such as
+    "DELETE /api/things/{id}" (the route inventory and restore_routes form)."""
+    known = set()
+    for route in routes or ():
+        parts = str(route).split(None, 1)
+        if len(parts) == 2:
+            known.add((parts[0].upper(), parts[1].strip().rstrip("/").lower()))
+    return known
+
+
 def _item_url(collection_url: str, oid: str) -> str:
     parts = urlsplit(collection_url)
     return urlunsplit((parts.scheme, parts.netloc,
@@ -532,12 +543,7 @@ class WriteIntegrityValidator(Validator):
         return routes
 
     def _known_routes(self) -> set[tuple[str, str]]:
-        known = set()
-        for route in self._route_entries():
-            parts = str(route).split(None, 1)
-            if len(parts) == 2:
-                known.add((parts[0].upper(), parts[1].strip().rstrip("/").lower()))
-        return known
+        return route_set(self._route_entries())
 
     def _restore_route(self, url: str) -> str:
         """The DELETE route that undoes a create at `url`, if one is known; ""."""
