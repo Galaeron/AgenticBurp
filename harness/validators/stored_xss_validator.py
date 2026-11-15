@@ -28,6 +28,13 @@ data-flow confirmation (#5): the value provably crosses requests.
                 escaped, or in a non-HTML content type, is NOT a candidate -- the
                 same precision line browser_xss draws (no HTML sink, no confirm)
                 -- unless a client view renders it:
+     A plant the server rejects (an error status) stored nothing. Writing the
+     payload into every string field also overwrites the ones the server checks
+     (a CAPTCHA answer, a token, an email), so a rejected plant is retried with
+     the payload in one string field at a time, the others at their captured
+     values (_MAX_FIELD_PLANTS fields, the most text-like first); the field that
+     is accepted carries the later payload shapes too. When every plant is
+     rejected nothing was stored, and the result is inconclusive, not a negative.
   4. VIEWS   -- a JSON render that holds the payload in one of its strings
                 (however the serializer escaped it) runs no script, but a page
                 script that fetches it may render it. The client views a crawl
@@ -44,6 +51,7 @@ from __future__ import annotations
 from harness import scope_lock
 
 import json
+import re
 import secrets
 from urllib.parse import urlsplit, urlunsplit
 
@@ -181,6 +189,29 @@ def _text_fieldish(v) -> bool:
     return isinstance(v, str)
 
 
+# The per-field retry of a rejected plant (see the module doc): at most this many
+# string fields, those whose name reads as a checked value last, then those whose
+# captured value is no prose (no whitespace), then the shorter.
+_MAX_FIELD_PLANTS = 4
+_CHECKED_FIELD = re.compile(
+    r"token|csrf|xsrf|captcha|nonce|signature|hash|pass(?:word|wd)?|secret|key|e-?mail|"
+    r"answer|code|otp|url|uri|href|date|time|uuid|(?:^|_|[a-z])id$|^id$", re.I)
+
+
+def _plant_field_order(items) -> list[str]:
+    """The string field names of `items` ((name, value) pairs), most text-like first."""
+    def text_like(item):
+        name, value = item
+        value = str(value or "")
+        return (bool(_CHECKED_FIELD.search(name or "")), not any(c.isspace() for c in value),
+                -len(value))
+    out: list[str] = []
+    for name, _value in sorted(items, key=text_like):
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
 class StoredXssValidator(Validator):
     name = "stored_xss"
     finding_classes = {"xss", "stored xss", "stored_xss", "persistent xss", "persistent_xss",
@@ -269,15 +300,57 @@ class StoredXssValidator(Validator):
                 seen.add(u); out.append(u)
         return out
 
-    def _plant_body(self, exchange: HttpExchange, payload: str):
+    def _plant_body(self, exchange: HttpExchange, payload: str, only: str | None = None):
+        """The write body with `payload` in every string field, or in the field
+        `only` alone (the others at their captured values)."""
         body = exchange.request_body or ""
         obj = self._json_object(body)
         if obj is not None:
-            planted = {k: (payload if _text_fieldish(v) else v) for k, v in obj.items()}
+            planted = {k: (payload if _text_fieldish(v) and (only is None or k == only) else v)
+                       for k, v in obj.items()}
             return json.dumps(planted), "application/json"
         from urllib.parse import parse_qsl, urlencode
-        pairs = [(k, payload) for k, _ in parse_qsl(body, keep_blank_values=True)]
+        pairs = [(k, payload if only is None or k == only else v)
+                 for k, v in parse_qsl(body, keep_blank_values=True)]
         return urlencode(pairs), "application/x-www-form-urlencoded"
+
+    def _plant_fields(self, exchange: HttpExchange) -> list[str]:
+        """The string fields a rejected plant is retried in, one at a time (see
+        _plant_field_order); none when the body has a single one."""
+        body = exchange.request_body or ""
+        obj = self._json_object(body)
+        if obj is not None:
+            items = [(k, v) for k, v in obj.items() if _text_fieldish(v)]
+        else:
+            from urllib.parse import parse_qsl
+            items = parse_qsl(body, keep_blank_values=True)
+        names = _plant_field_order(items)
+        return names[:_MAX_FIELD_PLANTS] if len(names) > 1 else []
+
+    async def _plant(self, client, exchange: HttpExchange, method: str, payload: str,
+                     headers: dict, attempts: list, write_path: str, chosen: list,
+                     rejected: list):
+        """Send the plant of `payload` and return the accepted response, or None.
+        `chosen` holds the variant an earlier payload landed with ([None] for every
+        string field, [name] for that one field) and is set by the first accepted
+        one; until then a rejected plant (an error status, recorded in `rejected`)
+        is retried field by field (_plant_fields). None also when a send got no
+        response (recorded by _request)."""
+        variants = list(chosen) or [None] + self._plant_fields(exchange)
+        for only in variants:
+            body, ctype = self._plant_body(exchange, payload, only)
+            planted_headers = dict(headers); planted_headers["Content-Type"] = ctype
+            stage = f"plant {method} {write_path}" + (f" (field {only})" if only else "")
+            resp = await self._request(client, method, exchange.url, attempts, stage,
+                                       headers=planted_headers, content=body)
+            if resp is None:
+                return None
+            if resp.status_code >= 400:
+                rejected.append(f"{stage} -> {resp.status_code}")
+                continue
+            chosen[:] = [only]
+            return resp
+        return None
 
     def _source_page_candidates(self, exchange: HttpExchange) -> list[str]:
         """Where the CSRF-bearing form that targets this write endpoint is most
@@ -446,15 +519,15 @@ class StoredXssValidator(Validator):
         # payload; no_browser is the note of a view no browser could load.
         viewed: list[tuple[str, str]] = []
         no_browser = ""
+        # The plant variant that landed (see _plant), and every rejected plant.
+        chosen: list = []
+        rejected: list[str] = []
         for payload in _payloads(a, b):
-            body, ctype = self._plant_body(exchange, payload)
-            planted_headers = dict(headers); planted_headers["Content-Type"] = ctype
             try:
                 async with GatedAsyncClient(gate, self.name, timeout=self.timeout,
                                             follow_redirects=False, verify=False) as client:
-                    if await self._request(client, method, exchange.url, attempts,
-                                           f"plant {method} {write_path}",
-                                           headers=planted_headers, content=body) is None:
+                    if await self._plant(client, exchange, method, payload, headers, attempts,
+                                         write_path, chosen, rejected) is None:
                         continue  # this payload never landed; try the next shape
                     json_renders: list[str] = []
                     for rurl in render_urls:
@@ -492,6 +565,14 @@ class StoredXssValidator(Validator):
             return self._unproven(method, write_path, *candidate)
         if any(kind != "ok" for kind, _ in attempts):
             return self._incomplete(attempts, method, write_path)
+        if not chosen and rejected:
+            return ValidationResult(
+                self.name, "inconclusive", "xss", confidence=0.0, confirmed=False,
+                summary=f"Stored-XSS check incomplete: the server rejected every plant "
+                        f"({len(rejected)}); nothing was stored, so this is not a negative result",
+                evidence=(f"Planted script-executable payloads via {method} {write_path}, in "
+                          f"every string field and then one field at a time; each write was "
+                          f"refused ({'; '.join(rejected[:4])})."))
         flagged = next(((v, n) for v, n in viewed if _CHECK_MANUALLY in n), None)
         if no_browser or flagged:
             view, note = flagged or ("", no_browser)
