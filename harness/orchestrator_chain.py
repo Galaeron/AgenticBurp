@@ -2659,7 +2659,8 @@ class ChainMixin:
                     "csrf": CsrfValidator(allowed_hosts=self.allowed_hosts,
                                            run_context=run_context),
                     "nosql": _nosql,
-                    "file_upload": FileUploadValidator(allowed_hosts=self.allowed_hosts),
+                    "file_upload": FileUploadValidator(allowed_hosts=self.allowed_hosts,
+                                                         run_context=run_context),
                 }
                 _sqlmap_inst = self.validator_registry.validators.get("sqlmap")
                 if _sqlmap_inst is not None:

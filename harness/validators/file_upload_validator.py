@@ -22,6 +22,12 @@ forbids is reported as a clearly labelled LEAD (not_confirmed, control_outcome
 stands.
 
 Active; the upload is a POST (mutating), gated by allow_mutating_replay.
+
+Bound to a run (`run_context`, set by the registry and the coverage drive), every
+send -- the source-form read, the upload, fetch-backs and the policy lead's
+control/over-size uploads -- goes through THAT run's executor, so its gate,
+scope, budget, cancellation and change log decide, never the process default
+gate. Unbound, the leg keeps the default-gate path it always had.
 """
 from __future__ import annotations
 from harness import scope_lock
@@ -155,9 +161,11 @@ class FileUploadValidator(Validator):
                        "file upload vulnerability", "unrestricted file upload"}
     active = True
 
-    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 15.0):
+    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 15.0,
+                 run_context=None):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
+        self.run_context = run_context
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         if not super().applies(finding, exchange):
@@ -258,7 +266,11 @@ class FileUploadValidator(Validator):
             return self._skip("endpoint does not accept file uploads")
         # The leg's verdict needs the mutating upload, so with mutating replay off it
         # sends nothing at all (not even the read-only source-form fetch).
-        if not get_default_gate().config.allow_mutating_replay:
+        # Bound to a run, the RUN's gate decides: an ambient or process-default gate
+        # that allows mutating replay must not override a run that does not.
+        run = self.run_context
+        gate = run.gate if run is not None else get_default_gate()
+        if not gate.config.allow_mutating_replay:
             return self._skip("mutating file upload not authorized (set validators.allow_mutating_replay)")
 
         url = exchange.url
@@ -275,8 +287,16 @@ class FileUploadValidator(Validator):
 
         try:
             await global_throttle.acquire()
-            async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
-                                        follow_redirects=True, verify=False) as client:
+            if run is not None:
+                # Every send through the bound run's executor (its gate, scope,
+                # budget, cancellation and change log), as verb_tamper's _request.
+                client_cm = GatedAsyncClient(run.gate, self.name, run_context=run,
+                                             timeout=self.timeout, follow_redirects=True,
+                                             verify=False)
+            else:
+                client_cm = GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                             follow_redirects=True, verify=False)
+            async with client_cm as client:
                 # Multipart uploads are commonly CSRF-token-bound and use a specific
                 # file-field name (e.g. `avatar`) alongside hidden fields (csrf,
                 # user). Replaying a bare `file` part with no token is rejected, so
@@ -308,7 +328,9 @@ class FileUploadValidator(Validator):
                               "upload": upload}
                 return await self._after_upload(client, resp, url, read_headers, marker, filename,
                                                 source_failures, policy_ctx=policy_ctx)
-        except SafetyGateBlocked:
+        except SafetyGateBlocked as e:
+            if run is not None:
+                return self._skip(f"file upload not sent: refused by the run ({e.decision.reason})")
             return self._skip("mutating file upload not authorized (set validators.allow_mutating_replay)")
         except httpx.HTTPError as e:
             return ValidationResult(

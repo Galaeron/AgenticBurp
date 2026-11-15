@@ -418,10 +418,14 @@ class GatedAsyncClient:
     httpx.AsyncClient directly and never needs this wrapper.
     """
 
-    def __init__(self, gate: SafetyGate, validator_name: str, **httpx_kwargs):
+    def __init__(self, gate: SafetyGate, validator_name: str, *, run_context=None,
+                 **httpx_kwargs):
         import httpx
         self._client = httpx.AsyncClient(**httpx_kwargs)
         self._gate = gate
+        # A validator bound to a run (registry/drive `run_context`) sends through
+        # THAT run even where no run is ambient, or a different gate is pushed.
+        self._run_context = run_context
         self._validator_name = validator_name
         self._headers = dict(httpx_kwargs.get("headers") or {})
         self._follow_redirects = bool(httpx_kwargs.get("follow_redirects", False))
@@ -440,7 +444,7 @@ class GatedAsyncClient:
         # trust and evidence policy. Without this, every validator built on this
         # client sent through a private (usually verify=False) httpx client.
         from harness.run_context import current_run_context
-        run = current_run_context()
+        run = self._run_context if self._run_context is not None else current_run_context()
         if run is not None:
             return await self._request_through_run(run, method, url, content=content,
                                                    headers=headers, **kwargs)
