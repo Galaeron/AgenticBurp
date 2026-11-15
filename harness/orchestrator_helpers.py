@@ -473,14 +473,12 @@ def _has_pickle_shape(exchange: HttpExchange) -> bool:
 
 
 def _has_client_trust_shape(exchange: HttpExchange) -> bool:
-    """A mutating request whose body carries a server-owned value field
-    (price/amount/total/...). Reuses ClientTrustValidator's own predicate
-    (applies()) so the routing decision and the leg's own targeting never drift."""
-    from harness.validators.client_trust_validator import _parse, _value_field
-    if (exchange.method or "").upper() not in ("POST", "PUT", "PATCH"):
-        return False
-    fields, _ = _parse(exchange.request_body or "")
-    return _value_field(fields) is not None
+    """A mutating request whose body carries a server-owned field: a price/amount/
+    total, a payment source, a plan/tier, a quantity, a currency, a coupon or a
+    role/status flag. Reuses ClientTrustValidator's own predicate (applies()) so
+    the routing decision and the leg's own targeting never drift."""
+    from harness.validators.client_trust_validator import has_trust_shape
+    return has_trust_shape(exchange)
 
 
 def _has_2fa_step_shape(exchange: HttpExchange) -> bool:
