@@ -9,6 +9,12 @@ XXE -- independent of whether the entity's content is reflected (blind XXE too).
 
 Fires on xxe findings, or on any endpoint whose captured request body is XML.
 Scope-gated; active (validators.active_enabled).
+
+An XML-bearing multipart file part (an .xml/.svg/... upload, a part typed as XML,
+or one whose content is an XML document) is an injection point too (oracle gap:
+an XML file upload was skipped as "does not take XML"): the same in-band file-read
+and out-of-band payloads replace that part's content, while every other part,
+the boundary and the multipart Content-Type are kept as captured.
 """
 from __future__ import annotations
 
@@ -24,13 +30,82 @@ from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBl
 from .base import Validator, ValidationResult
 
 
-def _looks_xml(exchange: HttpExchange) -> bool:
+def _content_type(exchange: HttpExchange) -> str:
     ct = ""
     for k, v in (exchange.request_headers or {}).items():
         if k.lower() == "content-type":
-            ct = (v or "").lower()
+            ct = (v or "")
+    return ct
+
+
+def _looks_xml(exchange: HttpExchange) -> bool:
+    ct = _content_type(exchange).lower()
+    if ct.startswith("multipart/"):
+        return False  # a multipart body is not one XML document; see multipart_xml_part
     body = (exchange.request_body or "").lstrip()
     return "xml" in ct or body.startswith("<?xml") or (body.startswith("<") and ">" in body)
+
+
+_XML_FILENAME = re.compile(
+    r"\.(?:xml|svg|xsd|xsl|xslt|rss|atom|xhtml|plist|gpx|kml|wsdl|xliff|xlf|dtd)$", re.I)
+_PART_NAME = re.compile(r'\bfilename="([^"]*)"', re.I)
+_PART_TYPE = re.compile(r"^content-type:\s*([^\r\n]+)", re.I | re.M)
+
+
+def _multipart_parts(exchange: HttpExchange):
+    """(boundary, [(head, content), ...]) of a captured multipart/form-data body,
+    or None."""
+    ct = _content_type(exchange)
+    boundary = re.search(r'boundary="?([^";]+)"?', ct, re.I)
+    if "multipart/" not in ct.lower() or not boundary:
+        return None
+    delimiter = "--" + boundary.group(1)
+    parts = []
+    for piece in (exchange.request_body or "").split(delimiter)[1:]:
+        if piece.startswith("--"):
+            break  # the closing delimiter
+        piece = piece[2:] if piece.startswith("\r\n") else piece.lstrip("\n")
+        head, sep, content = piece.partition("\r\n\r\n")
+        if not sep:
+            continue
+        parts.append((head, content[:-2] if content.endswith("\r\n") else content))
+    return (boundary.group(1), parts) if parts else None
+
+
+def multipart_xml_part(exchange: HttpExchange):
+    """(boundary, parts, index) of the first XML-bearing part of a multipart
+    body -- a file part named or typed as XML, or a part whose content is an XML
+    document -- or None."""
+    split = _multipart_parts(exchange)
+    if split is None:
+        return None
+    boundary, parts = split
+    for index, (head, content) in enumerate(parts):
+        name = _PART_NAME.search(head)
+        ptype = _PART_TYPE.search(head)
+        text = content.lstrip()
+        if ((name and _XML_FILENAME.search(name.group(1) or ""))
+                or (ptype and "xml" in ptype.group(1).lower())
+                or text.startswith("<?xml")
+                or (name and text.startswith("<") and text.rstrip().endswith(">"))):
+            return boundary, parts, index
+    return None
+
+
+def _part_label(multipart) -> str:
+    _, parts, index = multipart
+    head = parts[index][0]
+    name = re.search(r'\bname="([^"]*)"', head)
+    filename = _PART_NAME.search(head)
+    label = repr(name.group(1)) if name else f"#{index}"
+    return label + (f", file {filename.group(1)!r}" if filename else "")
+
+
+def _multipart_with(boundary: str, parts, index: int, content: str) -> str:
+    out = []
+    for i, (head, value) in enumerate(parts):
+        out.append(f"--{boundary}\r\n{head}\r\n\r\n{content if i == index else value}\r\n")
+    return "".join(out) + f"--{boundary}--\r\n"
 
 
 def _payload(callback: str) -> str:
@@ -93,7 +168,8 @@ class XxeValidator(Validator):
         return _collab.resolve(self._collab)
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
-        return super().applies(finding, exchange) or _looks_xml(exchange)
+        return (super().applies(finding, exchange) or _looks_xml(exchange)
+                or multipart_xml_part(exchange) is not None)
 
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "xxe", summary=why)
@@ -102,12 +178,24 @@ class XxeValidator(Validator):
         from harness.scope_lock import host_in_scope
         if self.allowed_hosts and not host_in_scope(exchange.url, self.allowed_hosts, active_mode=True):
             return self._skip("target origin is out of scope")
-        if not _looks_xml(exchange):
-            return self._skip("endpoint does not take XML -- nothing to inject an external entity into")
+        multipart = None if _looks_xml(exchange) else multipart_xml_part(exchange)
+        if multipart is None and not _looks_xml(exchange):
+            return self._skip("endpoint does not take XML (no XML body or XML-bearing multipart "
+                              "part) -- nothing to inject an external entity into")
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in ("host", "content-length")}
         headers.setdefault("Content-Type", "application/xml")
         method = (exchange.method or "POST").upper()
+
+        def document(build) -> str:
+            """The request body carrying `build(captured XML)`: the whole body, or
+            the XML-bearing multipart part with the rest kept as captured."""
+            if multipart is None:
+                return build(exchange.request_body or "")
+            boundary, parts, index = multipart
+            return _multipart_with(boundary, parts, index, build(parts[index][1]))
+        where = ("" if multipart is None else
+                 f" (in the multipart part {_part_label(multipart)})")
 
         # Bind and validate configuration before even the in-band probe.
         collab = self.collab() if self.oob_callbacks_enabled else None
@@ -120,7 +208,7 @@ class XxeValidator(Validator):
                                         follow_redirects=False, verify=False) as client:
                 resp = await client.request(
                     method, exchange.url, headers=headers,
-                    content=_inject_file_entity(exchange.request_body or ""))
+                    content=document(_inject_file_entity))
         except SafetyGateBlocked:
             return self._skip("mutating XML replay not authorized (set validators.allow_mutating_replay)")
         except httpx.HTTPError as e:
@@ -133,7 +221,7 @@ class XxeValidator(Validator):
                 # Prove the read WITHOUT dumping the file: report only that the
                 # /etc/passwd-format signature appeared, never the file body.
                 evidence=(f"POSTed an XML document declaring `<!ENTITY xxe SYSTEM \"{_FILE_URI}\">` to "
-                          f"{exchange.url}; the response contained a /etc/passwd-format line "
+                          f"{exchange.url}{where}; the response contained a /etc/passwd-format line "
                           f"(matched `root:*:0:0:`), proving external-entity file retrieval. The file "
                           f"contents are redacted here; the read is non-destructive."))
 
@@ -152,7 +240,9 @@ class XxeValidator(Validator):
             # (needs the allow_mutating_replay opt-in).
             async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
                                         follow_redirects=False, verify=False) as client:
-                await client.request(method, exchange.url, headers=headers, content=_payload(collab.url(token)))
+                callback = collab.url(token)
+                await client.request(method, exchange.url, headers=headers,
+                                     content=document(lambda _xml: _payload(callback)))
         except SafetyGateBlocked:
             return self._skip("mutating XML replay not authorized (set validators.allow_mutating_replay)")
         except httpx.HTTPError as e:
@@ -163,7 +253,8 @@ class XxeValidator(Validator):
                 summary="XXE confirmed: the XML parser resolved an external entity and fetched an "
                         "attacker-controlled URL out-of-band.",
                 evidence=f"POSTed an XML document declaring an external entity pointing at a unique "
-                         f"collaborator URL to {exchange.url}; the parser called back to it (blind-safe proof).")
+                         f"collaborator URL to {exchange.url}{where}; the parser called back to it "
+                         f"(blind-safe proof).")
         unavailable = _collab.unavailable_result(collab, exchange.url, self.name, "xxe")
         if unavailable is not None:
             return unavailable
