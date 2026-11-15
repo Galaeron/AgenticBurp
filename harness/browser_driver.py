@@ -479,10 +479,15 @@ _VIEW_TEXT_JS = """() => {
 }"""
 
 
-# _IdentityRouter.script_bodies (crawl_spa with declared_views): at most this many
-# same-origin scripts per crawl, each cut here (client_routes reads no more).
-_MAX_SCRIPT_BODIES = 6
+# _IdentityRouter.script_bodies (crawl_spa with declared_views): the same-origin
+# scripts of one crawl, each cut at _SCRIPT_BODY_BYTES (client_routes reads no
+# more), kept while their total stays within _SCRIPT_BYTES_TOTAL. The bound is in
+# bytes, not a count of six: a bundler's runtime, polyfills and small chunks load
+# (and finish) before the large script that holds the router config, and a count
+# spent on them dropped that config, so no declared view was ever visited.
+_MAX_SCRIPT_BODIES = 64
 _SCRIPT_BODY_BYTES = 5_000_000
+_SCRIPT_BYTES_TOTAL = 30_000_000
 # Request headers the router does not copy from the browser's request when it
 # sends that request itself (connection-level, or rebuilt by the router).
 _UNFORWARDED_REQUEST_HEADERS = frozenset({
@@ -573,6 +578,7 @@ class _IdentityRouter:
         # router config they declare. None (the default) keeps none.
         self.script_bodies: list[str] | None = None
         self._scripts_kept = 0
+        self._script_bytes_kept = 0
         # crawl_spa(file_uploads=True) while one file input's upload is tried: every
         # write the page issues is HELD and aborted, never sent (see _hold_write).
         self.hold: dict | None = None
@@ -703,9 +709,11 @@ class _IdentityRouter:
                         and 200 <= response.status_code < 300
                         and self._scripts_kept < _MAX_SCRIPT_BODIES
                         and ScopePolicy.origin_of(url) == self.run_origin):
-                    self._scripts_kept += 1
-                    self.script_bodies.append(
-                        bytes(response.content[:_SCRIPT_BODY_BYTES]).decode("utf-8", "replace"))
+                    kept = bytes(response.content[:_SCRIPT_BODY_BYTES])
+                    if self._script_bytes_kept + len(kept) <= _SCRIPT_BYTES_TOTAL:
+                        self._scripts_kept += 1
+                        self._script_bytes_kept += len(kept)
+                        self.script_bodies.append(kept.decode("utf-8", "replace"))
                 await route.fulfill(status=response.status_code, headers=fulfilled,
                                     body=response.content)
                 return
