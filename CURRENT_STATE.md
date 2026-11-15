@@ -57,7 +57,9 @@
 
 ## Open work (priority order)
 0. Owner: may real runs set `validators.write_integrity.allow_unrestorable_self_service_creates`
-   (sign-up accounts left, each named)? Leg gaps left: client-rendered stored XSS, weak creds.
+   (sign-up accounts left, each named)? Not leg gaps: stored XSS on client-rendered pages is
+   untested (the leg loads client views only from a crawl's route map; the oracle driver had
+   none), and default-credential guessing (ATHN-02) was declined in the backlog.
 1. WG-2 item 5: `_LEG_CONFIRMATIONS` gaps in harness/coverage_tracker.py (client_trust's
    wider fields only reach a run once it is listed there). Still open from
    the WSTG review: INJT-14 has no row, ATHN-04 has no bypass leg, WG-4 needs an owner
