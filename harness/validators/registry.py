@@ -604,10 +604,10 @@ class ValidatorRegistry:
             if check.id != "WSTG-IDNT-04" and (not password or not user):
                 return decision("needs_prerequisite", "missing_credentials", "captured username/password fields are required")
         if family == "nosql":
-            from .nosql_validator import _login_boundary, operator_targets
+            from .nosql_validator import _login_boundary, operator_targets, path_id_segments
             if _login_boundary(exchange):
                 mechanism = "nosql.login_operator"
-            elif operator_targets(exchange):
+            elif operator_targets(exchange) or path_id_segments(exchange):
                 # r7: the finding's own request, one parameter at a time.
                 mechanism = "nosql.operator_differential"
             else:

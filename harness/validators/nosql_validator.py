@@ -13,13 +13,30 @@ and body, with one parameter at a time replaced. `{"$ne": t}` must behave
 differently from `{"$eq": t}`, while `{"$eq": t}` behaves like the plain string
 `t`, and both operator responses must repeat. Every send goes through the run's
 transport, so the scope, active and mutating-replay gates apply.
+
+A backend that rejects `$eq` itself (an "unrecognised operator" error) leaves the
+leg without an equality control, so `{"$in": [t]}` stands in for it when `$eq` does
+not behave like the plain string. A response that reports how many objects it
+matched or changed (a count field or a result array) is compared by that count, so
+a write whose echoed objects differ between sends is still comparable; when no
+equality control works, an operator that matched more objects than the captured
+value did (and repeats) still confirms the widened match set.
+
+A GET/HEAD's id-like path segments are injection points too (a server-side
+`$where` / JavaScript filter built from a route parameter): each family of
+equal-length JavaScript boolean suffixes (`v' || '1'=='1` / `v' && '1'=='2`, the
+same quoted with `"`, and unquoted for numeric ids) must split into a true answer
+wider than a false one, the false answer must look like a missing id, the two
+neutral suffixes (`|| false`, `&& true`) must look like the captured id, and the
+true and false answers must repeat. A route that treats the segment as a plain
+string or strips its punctuation answers all four alike.
 """
 from __future__ import annotations
 
 import re
 import json
 import uuid
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from harness import global_throttle
 from harness.feature_workflow import extract_forms
@@ -31,8 +48,20 @@ from .injection_targets import (
 from .sqlmap import _content_type_of, _looks_like_json, _mutate_json_param
 
 _MAX_PARAMS = 3
-# $ne, $eq and the plain value, then $ne and $eq again: what one confirmation costs.
-_SENDS_PER_VERDICT = 5
+# $ne, the plain value, $eq (and {"$in": [t]} when the backend rejects $eq), then
+# $ne and the equality control again: what one confirmation of a write costs.
+_SENDS_PER_VERDICT = 6
+# Path probing is GET/HEAD only; at most this many id-like segments are tried.
+_MAX_PATH_SEGMENTS = 2
+_PATH_ID = re.compile(
+    r"^(?:\d{1,19}|(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9][A-Za-z0-9_-]{3,79})$")
+_VERSION_SEGMENT = re.compile(r"^v\d+$", re.I)
+# Fields a JSON response uses to say how many objects a filter matched or a write
+# changed; matched counts first, so a repeated no-op write still compares alike.
+_COUNT_KEYS = ("matchedCount", "matched", "nMatched", "n", "modifiedCount", "nModified",
+               "modified", "affectedRows", "affected", "deletedCount", "deleted", "count")
+_LIST_KEYS = ("data", "items", "results", "rows", "records", "docs", "documents",
+              "original", "updated")
 
 
 _USER = re.compile(r"(?:^|[_-])(user(?:name)?|login|email)(?:$|[_-])", re.I)
@@ -81,13 +110,21 @@ def operator_targets(exchange: HttpExchange) -> list[tuple[str, str]]:
 
 
 def _bracket_operator(pairs: list[tuple[str, str]], param: str, op: str | None,
-                      value: str) -> list[tuple[str, str]]:
-    key = f"{param}[{op}]" if op else param
-    return [(key, value) if k == param else (k, v) for k, v in pairs]
+                      value) -> list[tuple[str, str]]:
+    if op is None:
+        repl = [(param, value)]
+    elif isinstance(value, list):  # p[$in][0]=v: the qs-style array form
+        repl = [(f"{param}[{op}][{i}]", str(v)) for i, v in enumerate(value)]
+    else:
+        repl = [(f"{param}[{op}]", value)]
+    out: list[tuple[str, str]] = []
+    for k, v in pairs:
+        out.extend(repl if k == param else [(k, v)])
+    return out
 
 
 def operator_request(exchange: HttpExchange, loc: str, param: str, op: str | None,
-                     value: str) -> tuple[str, str] | None:
+                     value) -> tuple[str, str] | None:
     """(url, body) with `param` carrying `{op: value}` (or the plain `value` when
     `op` is None): a JSON object in a JSON body, a bracketed key (`p[$ne]=v`) in a
     query or form body. None when the request does not carry `param` there."""
@@ -108,10 +145,72 @@ def operator_request(exchange: HttpExchange, loc: str, param: str, op: str | Non
     return url, urlencode(_bracket_operator(pairs, param, op, value))
 
 
+def match_count(body: str | None) -> int | None:
+    """How many objects a JSON response says its request matched or changed: a
+    top-level array's length, a count field, or the length of a result array.
+    None when the body states no such number."""
+    try:
+        doc = json.loads(body or "")
+    except (TypeError, ValueError):
+        return None
+    if isinstance(doc, list):
+        return len(doc)
+    if not isinstance(doc, dict):
+        return None
+    for key in _COUNT_KEYS:
+        value = doc.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    for key in _LIST_KEYS:
+        if isinstance(doc.get(key), list):
+            return len(doc[key])
+    return None
+
+
 def _shape(outcome) -> tuple:
-    """A response's comparable shape: its status and a coarse body length (a
-    created object's id or timestamp must not read as a behaviour change)."""
+    """A response's comparable shape: its status and, when the body states how
+    many objects matched, that count; otherwise a coarse body length (a created
+    object's id or timestamp must not read as a behaviour change)."""
+    count = match_count(outcome.body)
+    if count is not None:
+        return (outcome.status, "matched", count)
     return (outcome.status, len((outcome.body or "").strip()) // 64)
+
+
+def path_id_segments(exchange: HttpExchange) -> list[int]:
+    """Indexes of a GET/HEAD's id-like path segments (a number, or a token of
+    letters, digits, '-' and '_' that holds a digit), rightmost first."""
+    if (exchange.method or "GET").upper() not in ("GET", "HEAD"):
+        return []
+    segments = urlsplit(exchange.url or "").path.split("/")
+    hits = [i for i, seg in enumerate(segments)
+            if seg and _PATH_ID.match(unquote(seg)) and not _VERSION_SEGMENT.match(seg)]
+    return list(reversed(hits))[:_MAX_PATH_SEGMENTS]
+
+
+def _with_segment(url: str, index: int, value: str) -> str:
+    parts = urlsplit(url)
+    segments = parts.path.split("/")
+    segments[index] = quote(value, safe="")
+    return urlunsplit((parts.scheme, parts.netloc, "/".join(segments), parts.query,
+                       parts.fragment))
+
+
+def boolean_families(value: str) -> list[tuple[str, tuple[str, str, str, str]]]:
+    """(label, (true, false, neutral-or, neutral-and)) JavaScript suffix families
+    for a path value, each member the same length so an echo cannot tell them
+    apart: the true member widens a filter, the false one empties it, and the two
+    neutral ones leave the captured value's own match."""
+    def family(q: str) -> tuple[str, str, str, str]:
+        one = f"{q}1{q}"
+        return (f"{value}{q} || {one}=={q}1", f"{value}{q} && {one}=={q}2",
+                f"{value}{q} || {one}=={q}2", f"{value}{q} && {one}=={q}1")
+    quoted = [("single-quoted", family("'")), ("double-quoted", family('"'))]
+    if value.isdigit():
+        bare = (f"{value} || 1==1", f"{value} && 1==2", f"{value} || 1==2",
+                f"{value} && 1==1")
+        return [("unquoted", bare)] + quoted
+    return quoted
 
 
 class NosqlValidator(Validator):
@@ -180,11 +279,16 @@ class NosqlValidator(Validator):
 
     async def _operator_differential(self, finding: Finding, exchange: HttpExchange,
                                      note: str = "") -> ValidationResult:
-        """$ne vs $eq vs plain-string differential on the finding's own request."""
+        """$ne vs $eq vs plain-string differential on the finding's own request,
+        then (GET/HEAD) the boolean-suffix differential on its id-like path segments."""
         targets, coverage = select_targets(finding, operator_targets(exchange), _MAX_PARAMS)
-        if not targets:
+        # A per-parameter dispatch is bound to the one input it names.
+        segments = ([] if getattr(finding, "parameter_only", False)
+                    else path_id_segments(exchange))
+        if not targets and not segments:
             return self._result("skipped", "the captured request has no query or body "
-                                           "parameter to carry a NoSQL operator" + note)
+                                           "parameter, nor an id-like path segment of a "
+                                           "GET, to carry a NoSQL operator" + note)
         ctx = self.run_context
         from harness.run_context import TypedRequest
         from .transport import bind_session
@@ -212,7 +316,9 @@ class NosqlValidator(Validator):
             built = operator_request(exchange, loc, param, op, value)
             if built is None:
                 return None
-            url, body = built
+            return await send_raw(*built)
+
+        async def send_raw(url, body):
             await global_throttle.acquire()
             out = await ctx.target_transport().execute(
                 TypedRequest(method, url, headers=headers, body=body or None),
@@ -224,55 +330,183 @@ class NosqlValidator(Validator):
             counts["answered"] += 1
             return out
 
+        baseline_count = match_count(exchange.response_body)
         decided = []  # targets whose probes all answered: a real negative for them
         for loc, param in targets:
             ne = await send(loc, param, "$ne", token)
-            eq = await send(loc, param, "$eq", token)
             literal = await send(loc, param, None, token)
+            eq = await send(loc, param, "$eq", token)
             if ne is None or eq is None or literal is None:
                 continue  # unanswered or refused: no verdict for this input
-            if _shape(ne) == _shape(eq) or _shape(eq) != _shape(literal):
-                decided.append((loc, param))
-                continue
-            ne2 = await send(loc, param, "$ne", token)
-            eq2 = await send(loc, param, "$eq", token)
-            if ne2 is None or eq2 is None:
-                continue
-            if _shape(ne2) != _shape(ne) or _shape(eq2) != _shape(eq):
-                decided.append((loc, param))  # unstable: not an operator effect
-                continue
+            control_op, control_value = "$eq", token
+            if _shape(eq) != _shape(literal):
+                # The backend may reject $eq itself; a one-element $in is the same
+                # non-matching equality written with another operator.
+                alt = await send(loc, param, "$in", [token])
+                if alt is not None and _shape(alt) == _shape(literal):
+                    eq, control_op, control_value = alt, "$in", [token]
             where = "query" if loc == QUERY else "body"
-            result = self._result(
-                "confirmed",
-                f"the {where} parameter {param!r} of {method} {exchange.url} evaluates NoSQL "
-                f"operators: {{'$ne': t}} answered HTTP {ne.status} ({len(ne.body or '')} "
-                f"bytes) twice, while {{'$eq': t}} and the plain string t both answered HTTP "
-                f"{eq.status} ({len(eq.body or '')} bytes).",
-                confirmed=True, confidence=0.9,
-                evidence="Operator differential on the captured request: a non-matching $eq "
-                         "and the literal value agree, $ne differs, and both repeat.")
-            result.baseline_artifact_id = literal.artifact_id
-            result.attack_artifact_id = ne.artifact_id
-            result.control_artifact_ids = tuple(a for a in (eq.artifact_id, eq2.artifact_id) if a)
-            result.tested_parameters = tested_inputs(finding, [(loc, param)])
-            return result
-        if not decided:
+            if _shape(eq) == _shape(literal) and _shape(ne) != _shape(eq):
+                ne2 = await send(loc, param, "$ne", token)
+                eq2 = await send(loc, param, control_op, control_value)
+                if ne2 is None or eq2 is None:
+                    continue
+                if _shape(ne2) != _shape(ne) or _shape(eq2) != _shape(eq):
+                    decided.append((loc, param))  # unstable: not an operator effect
+                    continue
+                shown = "{'$eq': t}" if control_op == "$eq" else "{'$in': [t]}"
+                widened = self._widening_note(match_count(ne.body), match_count(literal.body),
+                                              baseline_count)
+                result = self._result(
+                    "confirmed",
+                    f"the {where} parameter {param!r} of {method} {exchange.url} evaluates "
+                    f"NoSQL operators: {{'$ne': t}} answered HTTP {ne.status} "
+                    f"({len(ne.body or '')} bytes) twice, while {shown} and the plain string "
+                    f"t both answered HTTP {eq.status} ({len(eq.body or '')} bytes)."
+                    + widened,
+                    confirmed=True, confidence=0.9,
+                    evidence=f"Operator differential on the captured request: a non-matching "
+                             f"{control_op} and the literal value agree, $ne differs, and both "
+                             f"repeat." + widened)
+                result.baseline_artifact_id = literal.artifact_id
+                result.attack_artifact_id = ne.artifact_id
+                result.control_artifact_ids = tuple(
+                    a for a in (eq.artifact_id, eq2.artifact_id) if a)
+                result.tested_parameters = tested_inputs(finding, [(loc, param)])
+                return result
+            # No equality control behaves like the plain value: the operator still
+            # confirms when it matched more objects than the captured value did,
+            # while the plain miss matched fewer, and it repeats.
+            ne_count, miss_count = match_count(ne.body), match_count(literal.body)
+            if (_shape(ne) != _shape(literal) and ne.status is not None
+                    and 200 <= ne.status < 300 and None not in (ne_count, miss_count,
+                                                               baseline_count)
+                    and ne_count > baseline_count > miss_count and ne_count >= 2):
+                ne2 = await send(loc, param, "$ne", token)
+                if ne2 is None:
+                    continue
+                if _shape(ne2) != _shape(ne):
+                    decided.append((loc, param))
+                    continue
+                result = self._result(
+                    "confirmed",
+                    f"the {where} parameter {param!r} of {method} {exchange.url} evaluates "
+                    f"NoSQL operators: {{'$ne': t}} matched {ne_count} objects, twice, where "
+                    f"the captured value matched {baseline_count} and the plain string t "
+                    f"{miss_count} (the backend rejected the equality operators, HTTP "
+                    f"{eq.status}).",
+                    confirmed=True, confidence=0.85,
+                    evidence="Widened match set on the captured request: an operator value "
+                             "matched more objects than the captured value, a plain miss "
+                             "matched fewer, and the operator answer repeats.")
+                result.baseline_artifact_id = literal.artifact_id
+                result.attack_artifact_id = ne.artifact_id
+                result.control_artifact_ids = tuple(
+                    a for a in (eq.artifact_id, ne2.artifact_id) if a)
+                result.tested_parameters = tested_inputs(finding, [(loc, param)])
+                return result
+            decided.append((loc, param))
+        decided_segments, tried_segments = [], 0
+        for index in segments:
+            tried_segments += 1
+            verdict = await self._path_differential(exchange, index, send_raw)
+            if isinstance(verdict, ValidationResult):
+                verdict.tested_parameters = tested_inputs(finding, [])
+                return verdict
+            if verdict:
+                decided_segments.append(index)
+        if not decided and not decided_segments:
             # Nothing reached a verdict (refused by the gate, or unanswered): this is
             # not a negative for the finding.
             return self._result(
                 "error" if counts["sent"] else "skipped",
-                f"no parameter of {method} {exchange.url} got a complete operator "
+                f"no input of {method} {exchange.url} got a complete operator "
                 f"differential ({counts['sent']} sent, {counts['answered']} answered)" + note)
-        if len(decided) < len(targets) and not coverage:
+        if (len(decided) < len(targets) or len(decided_segments) < tried_segments) \
+                and not coverage:
             coverage = PARTIAL_COVERAGE
+        parts = []
+        if decided:
+            parts.append(f"operator values in {', '.join(p for _, p in decided)} of {method} "
+                         f"{exchange.url} behaved like plain strings")
+        if decided_segments:
+            names = ", ".join(repr(unquote(urlsplit(exchange.url).path.split("/")[i]))
+                              for i in decided_segments)
+            parts.append(f"JavaScript boolean suffixes on the path segment(s) {names} "
+                         f"did not split true from false")
         result = self._result(
-            "not_confirmed",
-            f"operator values in {', '.join(p for _, p in decided)} of {method} "
-            f"{exchange.url} behaved like plain strings" + note
-            + coverage_note(coverage, finding))
+            "not_confirmed", "; ".join(parts) + note + coverage_note(coverage, finding))
         result.control_outcome = coverage
         result.tested_parameters = tested_inputs(finding, decided)
         return result
+
+    @staticmethod
+    def _widening_note(ne_count, miss_count, baseline_count) -> str:
+        if ne_count is None or miss_count is None:
+            return ""
+        base = "" if baseline_count is None else f", the captured value {baseline_count}"
+        return (f" The operator matched {ne_count} objects{base}, the plain miss "
+                f"{miss_count}.")
+
+    async def _path_differential(self, exchange: HttpExchange, index: int, send_raw):
+        """Boolean-suffix differential on one id-like path segment. Returns a
+        confirmed result, True when every probe answered without a split (a
+        negative for this segment), or False when no verdict was reached."""
+        url = exchange.url
+        value = unquote(urlsplit(url).path.split("/")[index])
+        miss_value = (str(uuid.uuid4().int)[:max(len(value), 9)] if value.isdigit()
+                      else f"harness{uuid.uuid4().hex[:12]}")
+        base = await send_raw(url, "")
+        miss = await send_raw(_with_segment(url, index, miss_value), "")
+        if base is None or miss is None:
+            return False
+        answered = True
+        for label, (true_v, false_v, neutral_or, neutral_and) in boolean_families(value):
+            async def probe(v):
+                return await send_raw(_with_segment(url, index, v), "")
+            t, f = await probe(true_v), await probe(false_v)
+            if t is None or f is None:
+                answered = False
+                continue
+            if _shape(t) == _shape(f) or _shape(f) != _shape(miss):
+                continue
+            t_count, f_count = match_count(t.body), match_count(f.body)
+            wider = (t_count > f_count if None not in (t_count, f_count)
+                     else len(t.body or "") > len(f.body or ""))
+            if not (t.status is not None and 200 <= t.status < 300 and wider):
+                continue  # an error on the true member is a syntax split, not a filter
+            n_or, n_and = await probe(neutral_or), await probe(neutral_and)
+            t2, f2 = await probe(true_v), await probe(false_v)
+            if None in (n_or, n_and, t2, f2):
+                answered = False
+                continue
+            if (_shape(n_or) != _shape(base) or _shape(n_and) != _shape(base)
+                    or _shape(t2) != _shape(t) or _shape(f2) != _shape(f)):
+                continue
+            distinct = _shape(base) != _shape(miss)
+            detail = (f"the path segment {value!r} of GET {url} is evaluated as JavaScript "
+                      f"({label} suffixes): '{true_v}' answered HTTP {t.status} "
+                      f"({len(t.body or '')} bytes"
+                      + (f", {t_count} objects" if t_count is not None else "")
+                      + f") twice, '{false_v}' answered like a missing id (HTTP {f.status}, "
+                      f"{len(f.body or '')} bytes) twice, and the neutral suffixes "
+                      f"'{neutral_or}' / '{neutral_and}' answered like the captured id "
+                      f"(HTTP {base.status}, {len(base.body or '')} bytes).")
+            result = self._result(
+                "confirmed", detail, confirmed=True, confidence=0.9 if distinct else 0.8,
+                evidence="Boolean differential on an id-like path segment: equal-length "
+                         "true/false JavaScript suffixes split into a wider and an empty "
+                         "answer, both repeat, and the neutral suffixes keep the captured "
+                         "id's answer" + ("" if distinct else
+                                          " (the captured id answers like a missing one)")
+                         + ".")
+            result.baseline_artifact_id = base.artifact_id
+            result.attack_artifact_id = t.artifact_id
+            result.control_artifact_ids = tuple(
+                a for a in (f.artifact_id, miss.artifact_id, n_or.artifact_id,
+                            n_and.artifact_id, t2.artifact_id, f2.artifact_id) if a)
+            return result
+        return answered
 
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         if not self.applies(finding, exchange):
