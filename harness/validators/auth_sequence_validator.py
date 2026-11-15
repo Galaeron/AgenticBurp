@@ -177,6 +177,298 @@ def _is_logout_class(low: str) -> bool:
             or ("not invalidated" in low and bool(_LOGOUT_WORD.search(low))))
 
 
+# --- bearer-token sessions ------------------------------------------------------
+# A login that sets no session cookie may hand the client a token in its body
+# (an SPA keeps it in storage and sends it as a bearer header or a cookie the
+# script sets). These helpers find it, learn how the run's own identities carry
+# such a token, and find a read that only that token authorizes. Token values
+# never reach a summary, evidence or raw_output.
+_TOKEN_FIELD = re.compile(
+    r"^(?:access[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|token|jwt|bearer|"
+    r"accesstoken|idtoken|authtoken|sessiontoken)$", re.I)
+_TOKEN_RESPONSE_HEADERS = ("x-auth-token", "x-access-token", "x-session-token")
+# Same-directory and parent-directory reads of the caller's own account.
+_SELF_READ_NAMES = ("whoami", "me", "profile", "userinfo", "account", "current", "current-user",
+                    "session")
+_GENERIC_SELF_READS = ("/api/me", "/me", "/userinfo", "/whoami", "/api/user", "/api/profile",
+                       "/api/account")
+_SELF_ROUTE = re.compile(r"(?:^|/)(?:whoami|me|profile|userinfo|account|current[-_]?user|session)"
+                         r"(?:/|$)", re.I)
+# A server-side logout or token revocation, as a route the run observed.
+_REVOKE_PATH = re.compile(r"log[-_]?out|sign[-_]?out|log[-_]?off|revoc|revok", re.I)
+_MAX_TOKEN_READS = 20
+_IDENTIFIER_CLAIMS = ("email", "username", "preferred_username", "upn", "login", "user_name",
+                      "mail")
+
+
+def _json_doc(text):
+    try:
+        return json.loads(text or "")
+    except (ValueError, TypeError):
+        return None
+
+
+def _walk_json(doc, depth: int = 3):
+    """(key, value) pairs of a JSON document's nested objects, `depth` levels deep."""
+    stack = [(doc, 0)]
+    while stack:
+        node, level = stack.pop()
+        if level > depth:
+            continue
+        if isinstance(node, dict):
+            for k, v in node.items():
+                yield str(k), v
+                if isinstance(v, (dict, list)):
+                    stack.append((v, level + 1))
+        elif isinstance(node, list):
+            for v in node[:50]:
+                if isinstance(v, (dict, list)):
+                    stack.append((v, level + 1))
+
+
+def _login_token(resp) -> tuple[str, str] | None:
+    """(where, token): a bearer token the login response hands the client -- a JWT
+    or a token-named string in its JSON body, or a token response header. A cookie
+    is not one (that is the cookie path). `where` names the field, never the value."""
+    from .jwt_forge_validator import _JWT_RE
+    doc = _json_doc(getattr(resp, "text", "") or "")
+    if isinstance(doc, (dict, list)):
+        named = None
+        for key, value in _walk_json(doc):
+            if not isinstance(value, str):
+                continue
+            if _JWT_RE.fullmatch(value.strip()):
+                return f"the JSON field {key!r} (a JWT)", value.strip()
+            if named is None and _TOKEN_FIELD.match(key) and len(value) >= 16 and " " not in value:
+                named = (f"the JSON field {key!r}", value)
+        if named:
+            return named
+    headers = getattr(resp, "headers", {}) or {}
+    for name in _TOKEN_RESPONSE_HEADERS:
+        value = (headers.get(name) or "").strip()
+        if len(value) >= 16:
+            return f"the {name} response header", value
+    auth = (headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer ") and len(auth) > 23:
+        return "the Authorization response header", auth[7:].strip()
+    return None
+
+
+def _token_lifetime(token: str) -> tuple[str, bool]:
+    """(description, never_expires) of a token, read from a JWT's exp/iat claims."""
+    from .jwt_forge_validator import _decode
+    decoded = _decode(token)
+    if decoded is None:
+        return "an opaque token (lifetime not visible)", False
+    payload = decoded[1]
+    exp, iat = payload.get("exp"), payload.get("iat")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool):
+        return "a JWT with no exp claim, so it never expires", True
+    if isinstance(iat, (int, float)) and not isinstance(iat, bool) and exp > iat:
+        minutes = int((exp - iat) // 60)
+        span = f"{minutes // 1440} day(s)" if minutes >= 2880 else (
+            f"{minutes // 60} hour(s)" if minutes >= 120 else f"{minutes} minute(s)")
+        return f"a JWT valid for {span}", False
+    return "a JWT with an exp claim", False
+
+
+def _claim_identifiers(payload, depth: int = 2) -> set[str]:
+    """Lower-cased account identifiers (email, username) in a JWT payload,
+    including one nested user object ({"data": {...}}, {"user": {...}})."""
+    out = set()
+    for key, value in _walk_json(payload, depth):
+        if not isinstance(value, str) or not value.strip():
+            continue
+        low = key.lower()
+        if low in _IDENTIFIER_CLAIMS or (low == "sub" and "@" in value):
+            out.add(value.strip().lower())
+    return out
+
+
+def _token_identifiers(token: str) -> set[str]:
+    from .jwt_forge_validator import _decode
+    decoded = _decode(token or "")
+    return _claim_identifiers(decoded[1]) if decoded else set()
+
+
+def _identity_identifiers(ctx) -> set[str]:
+    """Lower-cased account identifiers the run's own identities carry in their
+    JWT claims: accounts the operator registered, so they exist."""
+    from harness.security import is_identity_credential_header
+    from .jwt_forge_validator import _JWT_RE
+    out: set[str] = set()
+    sessions = getattr(ctx, "sessions", None)
+    if sessions is None:
+        return out
+    for session in sessions.identities():
+        for name, value in (session.headers or {}).items():
+            if is_identity_credential_header(name):
+                for match in _JWT_RE.finditer(value or ""):
+                    out |= _token_identifiers(match.group(1))
+    return out
+
+
+def _token_carriers(ctx, exchange) -> list[tuple[str, str]]:
+    """How this app's tokens are sent, as (header, template) with "{}" for the
+    token: learned from the run identities' and the captured request's credential
+    headers ("Authorization: Bearer {}", "Cookie: token={}"), plus the standard
+    bearer header. Never another invented carrier."""
+    from harness.security import is_identity_credential_header
+    from .jwt_forge_validator import _JWT_RE
+    sources = []
+    sessions = getattr(ctx, "sessions", None)
+    if sessions is not None:
+        sources += [s.headers or {} for s in sessions.identities()]
+    sources.append(exchange.request_headers or {})
+    out: list[tuple[str, str]] = []
+    for headers in sources:
+        for name, value in headers.items():
+            if not is_identity_credential_header(name):
+                continue
+            match = _JWT_RE.search(value or "")
+            if not match:
+                continue
+            template = value
+            if name.lower() == "cookie":
+                template = next((part.strip() for part in value.split(";")
+                                 if match.group(1) in part), value)
+            template = template.replace(match.group(1), "{}")
+            canonical = ("Authorization" if name.lower() == "authorization"
+                         else "Cookie" if name.lower() == "cookie" else name)
+            if (canonical, template) not in out:
+                out.append((canonical, template))
+    if not any(n == "Authorization" and t.lower().startswith("bearer ") for n, t in out):
+        out.insert(0, ("Authorization", "Bearer {}"))
+    out.sort(key=lambda c: c[0] != "Authorization")
+    return out[:4]
+
+
+def _carry(headers: dict, carrier: tuple[str, str], token: str) -> dict:
+    name, template = carrier
+    return dict(headers, **{name: template.replace("{}", token)})
+
+
+def _carrier_label(carrier: tuple[str, str]) -> str:
+    name, template = carrier
+    return f"{name}: {template.replace('{}', '<token>')}"
+
+
+def _shows_account(resp, identifiers: set[str]) -> bool:
+    """A 2xx whose body names the account (its email or username)."""
+    if resp is None or not 200 <= resp.status_code < 300:
+        return False
+    low = (resp.text or "").lower()
+    return any(i and i in low for i in identifiers)
+
+
+def _token_denial(resp, identifiers: set[str]) -> str:
+    """The anonymous (or revoked-token) answer as a denial of the account read, or
+    "": 401/403, a login wall, or a 2xx that no longer names the account. A 5xx,
+    a 404 or a rate limit says nothing."""
+    denial = _anonymous_denial(resp.status_code, resp.text or "", resp.headers.get("location") or "")
+    if denial:
+        return denial
+    if 200 <= resp.status_code < 300 and not _shows_account(resp, identifiers):
+        return f"HTTP {resp.status_code} without the account's identifier"
+    return ""
+
+
+def _self_read_urls(exchange, ctx) -> list[str]:
+    """Candidate reads of the caller's own account, most specific first: the run
+    identities' GET health probes, self routes the run's crawl saw the app call,
+    then same-directory and parent-directory account reads beside the login."""
+    p = urlsplit(exchange.url)
+    origin = f"{p.scheme}://{p.netloc}"
+    urls: list[str] = []
+    sessions = getattr(ctx, "sessions", None)
+    for session in (sessions.identities() if sessions is not None else []):
+        probe = getattr(session, "_probe", None)
+        if probe is not None and (probe.method or "GET").upper() == "GET":
+            q = urlsplit(probe.url or "")
+            if (q.scheme, q.netloc) == (p.scheme, p.netloc):
+                urls.append(probe.url)
+    routes = getattr(ctx, "client_routes", None)
+    for table in (getattr(routes, "api_links", None) or {}, getattr(routes, "api_views", None) or {}):
+        for key in list(table)[:200]:
+            method, _, path = str(key).partition(" ")
+            if (method.upper() == "GET" and path.startswith("/") and _SELF_ROUTE.search(path)
+                    and "{" not in path and ":" not in path):
+                urls.append(origin + path)
+    segs = [s for s in p.path.split("/") if s]
+    parents = ["/" + "/".join(segs[:-1]) if len(segs) > 1 else "",
+               "/" + "/".join(segs[:-2]) if len(segs) > 2 else ""]
+    first = [(parent, name) for parent in parents for name in _SELF_READ_NAMES[:3]]
+    rest = [(parent, name) for parent in parents for name in _SELF_READ_NAMES[3:]]
+    urls += [f"{origin}{parent}/{name}" for parent, name in first]
+    urls += [origin + path for path in _GENERIC_SELF_READS]
+    urls += [f"{origin}{parent}/{name}" for parent, name in rest]
+    urls += [origin + path for path in _PROTECTED_CANDIDATES]
+    seen, out = set(), []
+    for url in urls:
+        if url not in seen and url != exchange.url:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def _revocation_routes(bodies, exchange, ctx) -> list[tuple[str, str, str | None, str]]:
+    """Same-origin server-side logout / token-revocation requests the run itself
+    observed, as (method, url, body, where): a logout form or link in a fetched
+    page, a logout/revocation path named in a JSON response, or a non-read API
+    call the crawl saw the app make. Never a guessed path."""
+    p = urlsplit(exchange.url)
+    origin = f"{p.scheme}://{p.netloc}"
+    out: list[tuple[str, str, str | None, str]] = []
+    for text, url in bodies:
+        for method, target, body in _logout_requests(text or "", url):
+            out.append((method, target, body, f"a logout control on {urlsplit(url).path}"))
+        doc = _json_doc(text)
+        if isinstance(doc, (dict, list)):
+            for key, value in _walk_json(doc, 4):
+                if not isinstance(value, str) or len(value) > 300:
+                    continue
+                q = urlsplit(value)
+                path = q.path if (q.scheme, q.netloc) in (("", ""), (p.scheme, p.netloc)) else ""
+                if path.startswith("/") and _REVOKE_PATH.search(path):
+                    out.append(("POST", origin + path, None,
+                                f"named by the JSON field {key!r} of {urlsplit(url).path}"))
+    routes = getattr(ctx, "client_routes", None)
+    for table in (getattr(routes, "api_links", None) or {}, getattr(routes, "api_views", None) or {}):
+        for key in list(table)[:500]:
+            method, _, path = str(key).partition(" ")
+            method = method.upper()
+            if not path.startswith("/") or "{" in path or not _REVOKE_PATH.search(path):
+                continue
+            if method == "GET" and not _LOGOUT_PATH.search(path):
+                continue  # a GET that reads a revocation list does not revoke
+            out.append((method or "POST", origin + path, None, "an API call the crawled app made"))
+    seen, unique = set(), []
+    for row in out:
+        if (row[0], row[1]) not in seen:
+            seen.add((row[0], row[1]))
+            unique.append(row)
+    return unique
+
+
+def _query_identifier(exchange) -> tuple[str, str] | None:
+    """(name, value) of a username/email query parameter, e.g. a lookup such as
+    GET /account/question?email=..."""
+    pairs = parse_qsl(urlsplit(exchange.url or "").query, keep_blank_values=True)
+    names = {k.lower(): (k, v) for k, v in pairs}
+    for key in _USER_KEYS:
+        if key in names:
+            return names[key]
+    return None
+
+
+def _with_query_value(url: str, name: str, value: str) -> str:
+    from urllib.parse import urlencode, urlunsplit
+    parts = urlsplit(url)
+    pairs = [(k, value if k == name else v)
+             for k, v in parse_qsl(parts.query, keep_blank_values=True)]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(pairs), parts.fragment))
+
+
 class AuthSequenceValidator(Validator):
     name = "auth_sequence"
     finding_classes = {
@@ -210,7 +502,10 @@ class AuthSequenceValidator(Validator):
             # captured login, or reports why it cannot without sending anything.
             return True
         if (exchange.method or "").upper() not in ("POST", "PUT"):
-            return False
+            # A lookup that takes the account identifier in its query (GET
+            # ...?email=) can be an enumeration oracle; no other check reads a GET.
+            return (self._which_checks(finding.vulnerability_class, exchange) == ["enum"]
+                    and _query_identifier(exchange) is not None)
         fields, _ = _parse_body(exchange)
         return _find_key(fields, _PASS_KEYS) is not None or _find_key(fields, _USER_KEYS) is not None
 
@@ -256,6 +551,9 @@ class AuthSequenceValidator(Validator):
             return ["mfa"]
         if "authentication" not in low:
             return []
+        if (exchange.method or "").upper() not in ("POST", "PUT"):
+            # A read is no login: only an identifier-in-query lookup is checked.
+            return ["enum"] if _query_identifier(exchange) is not None else []
         path = urlsplit(exchange.url).path.lower()
         fields, _ = _parse_body(exchange)
         checks = []
@@ -335,7 +633,32 @@ class AuthSequenceValidator(Validator):
                                     exchange.request_body)
             post_cookies = _session_cookies(resp.headers.get_list("set-cookie"))
         if not pre_cookies and not post_cookies:
-            return self._not("no session cookie issued (token-based auth?) -- fixation N/A", fc)
+            minted = _login_token(resp) if resp.status_code < 400 else None
+            if minted is None:
+                return self._not("no session cookie issued (token-based auth?) -- fixation N/A", fc)
+            where, token = minted
+            # A token the client already held before logging in -- in the
+            # captured login's own credential headers or handed out by the
+            # pre-login page -- that the login returns unchanged is the token
+            # analogue of an unrotated session id.
+            from harness.security import is_identity_credential_header
+            held = " ".join(v for k, v in (exchange.request_headers or {}).items()
+                            if is_identity_credential_header(k))
+            if pre is not None:
+                held += " " + (pre.text or "")[:200000] + " " + " ".join(
+                    v for k, v in pre.headers.items() if k.lower() in _TOKEN_RESPONSE_HEADERS)
+            if token in held:
+                return self._candidate(
+                    f"the login returned, in {where}, the same token the client presented or was "
+                    f"given before authenticating",
+                    f"Login answered HTTP {resp.status_code} with no session cookie; its token equals "
+                    f"one the client held before the login (value redacted), so a planted pre-login "
+                    f"token may become the logged-in one. Not confirmed: whether that token alone "
+                    f"reaches an authenticated read was not shown.")
+            return self._not(
+                f"no session cookie: the login mints a bearer token in {where} (HTTP "
+                f"{resp.status_code}); a token created by the login itself cannot be planted "
+                f"beforehand -- session fixation N/A", fc)
         # Pre-auth cookies that survive login: re-issued unchanged, or not replaced.
         fixed = {n: v for n, v in pre_cookies.items() if post_cookies.get(n, v) == v}
         if not fixed:
@@ -489,6 +812,11 @@ class AuthSequenceValidator(Validator):
             login = await self._send(client, method, exchange.url, self._headers(exchange), body)
         fresh = _session_cookies(login.headers.get_list("set-cookie"))
         steps.append({"step": "fresh_login", "status": login.status_code, "cookies": sorted(fresh)})
+        if login.status_code < 400 and not fresh:
+            minted = _login_token(login)
+            if minted is not None:
+                steps[-1]["token"] = minted[0]
+                return await self._token_logout(exchange, login, minted, steps, done)
         if login.status_code >= 400 or not fresh:
             return done("inconclusive",
                         "Logout invalidation not tested: the fresh login issued no session cookie "
@@ -571,6 +899,136 @@ class AuthSequenceValidator(Validator):
                     f"Logout invalidation unproven: after {lo_method} {urlsplit(lo_url).path} the replay "
                     f"of {urlsplit(page).path} answered HTTP {after.status_code}, which neither shows the "
                     f"authenticated page nor denies the session.")
+
+    async def _token_read(self, exchange, token, carriers, identifiers, headers):
+        """The first read of the caller's own account that the fresh token alone
+        authorizes while an anonymous request is denied:
+        ((url, carrier, token read, anonymous read, denial), "") or (None, why the
+        first anonymous control did not count, or ""). GET-only, at most
+        _MAX_TOKEN_READS token sends."""
+        sends, failed = 0, ""
+        for url in _self_read_urls(exchange, self.run_context):
+            for carrier in carriers:
+                if sends >= _MAX_TOKEN_READS:
+                    return None, failed
+                sends += 1
+                async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                            follow_redirects=False, verify=False) as client:
+                    try:
+                        got = await self._send(client, "GET", url, _carry(headers, carrier, token), None)
+                    except httpx.HTTPError:
+                        got = None
+                if got is None or got.status_code in (404, 405, 410) or got.status_code >= 500:
+                    break  # no such read here; another carrier would not change that
+                if not _shows_account(got, identifiers):
+                    continue
+                async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                            follow_redirects=False, verify=False) as anon:
+                    try:
+                        anon_got = await self._send(anon, "GET", url, dict(headers), None)
+                    except httpx.HTTPError as e:
+                        failed = failed or f"the anonymous control GET {url} failed ({type(e).__name__})"
+                        break
+                denial = _token_denial(anon_got, identifiers)
+                if denial:
+                    return (url, carrier, got, anon_got, denial), ""
+                failed = failed or (
+                    f"the anonymous control GET {urlsplit(url).path} answered HTTP "
+                    f"{anon_got.status_code}, which is not a denial of the account read")
+                break
+        return None, failed
+
+    async def _token_logout(self, exchange, login, minted, steps, done) -> ValidationResult:
+        """WSTG-SESS-06 for a bearer-token session (the login set no cookie but
+        returned a token). On the FRESH token only: (a) it alone reads the
+        caller's own account while an anonymous request is denied; (b) a
+        server-side logout/revocation route the run observed is called with it;
+        (c) the same token replays the read. Confirmed when (c) still shows the
+        account, the negative when (c) is denied. When the run observed no such
+        route the token is reported as a lead with its lifetime: a logout that
+        only discards the token in the client cannot revoke it, but that absence
+        was not proven, so it is never confirmed."""
+        where, token = minted
+        lifetime, never_expires = _token_lifetime(token)
+        fields, _ = _parse_body(exchange)
+        ukey = _find_key(fields, _USER_KEYS)
+        identifiers = ({str(fields.get(ukey) or "").strip().lower()} if ukey else set())
+        identifiers = {i for i in identifiers | _token_identifiers(token) if len(i) >= 3}
+        ctx = self.run_context
+        carriers = _token_carriers(ctx, exchange)
+        headers = self._page_headers(exchange)
+        found, failed = await self._token_read(exchange, token, carriers, identifiers, headers)
+        if found is None:
+            steps.append({"step": "authenticated_before_logout", "status": "unproven"})
+            return done("inconclusive",
+                        f"Logout invalidation not tested: the fresh login's bearer token ({where}) "
+                        f"authorized no read of the account that an anonymous request is denied"
+                        + (f" ({failed})" if failed else "") + ". Nothing was sent to a logout.")
+        page, carrier, read, anon, denial = found
+        path = urlsplit(page).path
+        steps.append({"step": "authenticated_before_logout", "url": page, "status": read.status_code,
+                      "carrier": _carrier_label(carrier), "anonymous": denial})
+        routes = _revocation_routes([(login.text or "", exchange.url), (read.text or "", page),
+                                     (exchange.response_body or "", exchange.url)], exchange, ctx)
+        if not routes:
+            steps.append({"step": "logout_request", "status": "not_found"})
+            return done(
+                "inconclusive",
+                f"Logout invalidation lead, not confirmed: the login issues a bearer token "
+                f"({lifetime}) that alone authorizes {path}, and the run observed no server-side "
+                f"logout or token-revocation route, so a logout can only discard the token in the "
+                f"client while the server keeps accepting it.",
+                f"A fresh login (HTTP {login.status_code}) returned a token in {where} and set no "
+                f"session cookie. Sent as {_carrier_label(carrier)} it reads {page} (HTTP "
+                f"{read.status_code}, naming the account) while the same request without it got "
+                f"{denial}. No logout form or link, no logout/revocation path in a response and no "
+                f"logout/revocation API call by the crawled app was observed; no logout path is "
+                f"guessed, so nothing was sent to one. Token lifetime: {lifetime}. To confirm, "
+                f"capture the app's logout request (or name its revocation endpoint) and re-run: "
+                f"this leg logs a fresh token out through it and replays {path}. Token value "
+                f"redacted.",
+                confidence=0.5 if never_expires else 0.4)
+        lo_method, lo_url, lo_body, lo_where = routes[0]
+        lo_path = urlsplit(lo_url).path
+        lo_headers = _carry(headers, carrier, token)
+        if lo_body is not None:
+            lo_headers["Content-Type"] = "application/x-www-form-urlencoded"
+        async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                    follow_redirects=False, verify=False) as lo_client:
+            logout = await self._send(lo_client, lo_method, lo_url, lo_headers, lo_body)
+        steps.append({"step": "logout", "method": lo_method, "url": lo_url, "source": lo_where,
+                      "status": logout.status_code})
+        if logout.status_code >= 400:
+            return done("inconclusive",
+                        f"Logout invalidation not tested: {lo_method} {lo_path} ({lo_where}) answered "
+                        f"HTTP {logout.status_code}, so the logout itself did not complete.")
+        async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
+                                    follow_redirects=False, verify=False) as replay_client:
+            after = await self._send(replay_client, "GET", page, _carry(headers, carrier, token), None)
+        still = _shows_account(after, identifiers)
+        steps.append({"step": "replay_after_logout", "url": page, "status": after.status_code,
+                      "authenticated": still})
+        if still:
+            return done(
+                "confirmed",
+                f"Logout invalidation missing: the pre-logout bearer token still authorizes {path} "
+                f"after {lo_method} {lo_path}.",
+                f"A fresh login's token ({where}; {lifetime}) sent as {_carrier_label(carrier)} read "
+                f"{page} (HTTP {read.status_code}, naming the account) while the same request without "
+                f"it got {denial}. After {lo_method} {lo_url} ({lo_where}) with that token (HTTP "
+                f"{logout.status_code}), replaying {page} with the same token still returned the "
+                f"account (HTTP {after.status_code}): the logout does not revoke the token "
+                f"server-side. Token value redacted.",
+                confidence=0.9).with_artifacts(baseline=read, attack=after, controls=[anon])
+        revoked = _token_denial(after, identifiers)
+        if revoked:
+            return done("not_confirmed",
+                        f"Token revoked on logout: after {lo_method} {lo_path} the pre-logout bearer "
+                        f"token is denied at {path} ({revoked}).")
+        return done("inconclusive",
+                    f"Logout invalidation unproven: after {lo_method} {lo_path} the replay of {path} "
+                    f"answered HTTP {after.status_code}, which neither shows the account nor denies "
+                    f"the token.")
 
     # --- 2FA / MFA bypass -----------------------------------------------------
     async def _check_mfa_bypass(self, exchange) -> ValidationResult:
@@ -764,31 +1222,57 @@ class AuthSequenceValidator(Validator):
 
     # --- username enumeration -------------------------------------------------
     async def _check_username_enum(self, exchange) -> ValidationResult:
+        """The same request with an existing account's identifier and a nonexistent
+        one, after masking the echoed identifier and per-request tokens. The
+        identifier is the captured login/reset body's username field, or -- for a
+        lookup that takes it in the query (GET ...?email=) -- that parameter, set
+        to a run identity's own identifier (an account known to exist)."""
         fc = "username_enumeration"
         fields, kind = _parse_body(exchange)
         ukey = _find_key(fields, _USER_KEYS)
-        if not ukey:
+        query = None if ukey else _query_identifier(exchange)
+        if not ukey and query is None:
             return self._skip("no username/email field to test enumeration", fc)
-        pkey = _find_key(fields, _PASS_KEYS)
-        valid_user = str(fields.get(ukey) or "")
+        pkey = _find_key(fields, _PASS_KEYS) if ukey else None
+        known_as, qname = "", ""
+        if query is not None:
+            qname, valid_user = query[0], str(query[1] or "")
+            known = _identity_identifiers(self.run_context)
+            if valid_user.strip().lower() in known:
+                known_as = "a run identity's own identifier"
+            else:
+                wants_email = "@" in valid_user or not valid_user
+                shaped = sorted(i for i in known if ("@" in i) == wants_email)
+                if shaped:
+                    valid_user, known_as = shaped[0], (
+                        "a run identity's own identifier, in place of the captured value")
+        else:
+            valid_user = str(fields.get(ukey) or "")
         if not valid_user:
             return self._skip("captured username is empty", fc)
         invalid_user = (f"nouser_{secrets.token_hex(4)}@example.com" if "@" in valid_user
                         else f"nouser_{secrets.token_hex(4)}")
         wrong_pw = "wrongpw_" + secrets.token_hex(4)
+        method = (exchange.method or "POST").upper()
+        headers = self._headers(exchange)
+        if query is not None and not exchange.request_body:
+            headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
 
-        def _probe_body(u):
+        async def _probe(client, u):
+            """Send the probe for identifier `u`."""
+            if query is not None:
+                return await self._send(client, method, _with_query_value(exchange.url, qname, u),
+                                        headers, exchange.request_body or None)
             f = dict(fields); f[ukey] = u
             if pkey:
                 f[pkey] = wrong_pw
-            return _encode(f, kind)
+            return await self._send(client, method, exchange.url, headers, _encode(f, kind))
 
-        method = (exchange.method or "POST").upper()
         async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
                                     follow_redirects=False, verify=False) as client:
-            r_valid = await self._send(client, method, exchange.url, self._headers(exchange), _probe_body(valid_user))
+            r_valid = await _probe(client, valid_user)
             vstatus, vbody = r_valid.status_code, (r_valid.text or "")
-            r_invalid = await self._send(client, method, exchange.url, self._headers(exchange), _probe_body(invalid_user))
+            r_invalid = await _probe(client, invalid_user)
             istatus, ibody = r_invalid.status_code, (r_invalid.text or "")
 
         def _mask(b, u):
@@ -819,8 +1303,7 @@ class AuthSequenceValidator(Validator):
             try:
                 async with GatedAsyncClient(get_default_gate(), self.name, timeout=self.timeout,
                                             follow_redirects=False, verify=False) as client:
-                    control = await self._send(client, method, exchange.url, self._headers(exchange),
-                                               _probe_body(other_user))
+                    control = await _probe(client, other_user)
             except (SafetyGateBlocked, httpx.HTTPError):
                 control = None
             if control is not None and (
@@ -829,19 +1312,39 @@ class AuthSequenceValidator(Validator):
                 control = None
             return {"baseline": r_invalid, "attack": r_valid, "controls": [control]}
 
+        where = f"{method} {urlsplit(exchange.url).path}?{qname}=" if query is not None else ""
+        if query is not None:
+            how = (f"Same {where} lookup: an existing account ({known_as})" if known_as
+                   else f"Same {where} lookup: the captured identifier")
+        else:
+            how = "Same wrong password: existing user"
         if vstatus != istatus:
             return ValidationResult(
                 self.name, "confirmed", fc, confidence=0.8, confirmed=True,
-                summary="Username enumeration confirmed: valid vs invalid account give different HTTP status.",
-                evidence=f"Same wrong password: existing user -> HTTP {vstatus}, non-existent user -> HTTP "
+                summary="Username enumeration confirmed: valid vs invalid account give different HTTP status"
+                        + (f" at {where}" if where else "") + ".",
+                evidence=f"{how} -> HTTP {vstatus}, non-existent user -> HTTP "
                          f"{istatus}. The status discriminates account existence."
             ).with_artifacts(**await proof())
         if vmask.strip() != imask.strip():
             return ValidationResult(
                 self.name, "confirmed", fc, confidence=0.75, confirmed=True,
-                summary="Username enumeration confirmed: valid vs invalid account give different responses.",
-                evidence=f"Same wrong password and identical status ({vstatus}); after masking the echoed "
-                         f"username and stripping dynamic tokens, the bodies still differ, leaking "
+                summary="Username enumeration confirmed: valid vs invalid account give different responses"
+                        + (f" at {where}" if where else "") + ".",
+                evidence=f"{how} and a non-existent one, identical status ({vstatus}); after masking the "
+                         f"echoed username and stripping dynamic tokens, the bodies still differ, leaking "
                          f"which usernames exist."
             ).with_artifacts(**await proof())
+        if query is not None and not known_as:
+            return ValidationResult(
+                self.name, "inconclusive", fc, confidence=0.0, confirmed=False,
+                summary=f"Username enumeration not tested at {where}: the captured identifier is not "
+                        f"known to exist (no run identity carries it), so its answer matching a "
+                        f"non-existent one's proves nothing.",
+                evidence="Register an identity whose token names its account and re-run.")
+        if query is not None:
+            return self._not(
+                f"an existing account ({known_as}) and a non-existent one produced indistinguishable "
+                f"responses at {where} (no enumeration for that account; an account lacking the "
+                f"looked-up data answers like a missing one)", fc)
         return self._not("valid and invalid usernames produced indistinguishable responses (no enumeration)", fc)
