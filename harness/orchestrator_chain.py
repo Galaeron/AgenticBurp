@@ -2654,12 +2654,17 @@ class ChainMixin:
                     "open_redirect": _redir, "sequence": _seq, "deserialization_oob": _deser,
                     "auth_sequence": _auth, "rate_limit": _rate, "reset_token": _reset,
                     "dom_xss": _domxss, "toctou": _toctou, "write_integrity": _wi,
+                    # Its override POSTs can create; they are undone through the
+                    # same restore routes as write_integrity's creates.
                     "verb_tamper": VerbTamperValidator(allowed_hosts=self.allowed_hosts,
-                                                         run_context=run_context),
+                                                         run_context=run_context,
+                                                         restore_routes=_wi_cfg.get("restore_routes") or (),
+                                                         route_inventory=lambda: list(state.endpoints)),
                     "csrf": CsrfValidator(allowed_hosts=self.allowed_hosts,
                                            run_context=run_context),
                     "nosql": _nosql,
-                    "file_upload": FileUploadValidator(allowed_hosts=self.allowed_hosts),
+                    "file_upload": FileUploadValidator(allowed_hosts=self.allowed_hosts,
+                                                         run_context=run_context),
                 }
                 _sqlmap_inst = self.validator_registry.validators.get("sqlmap")
                 if _sqlmap_inst is not None:

@@ -43,6 +43,14 @@ write. It is active and inert by default: it runs only when
 - Discount-code reuse and expiry are not attempted (they need a declared spent code).
 - `sequence` hands a mass-assignment finding on a collection create
   (`POST` to a listing) to this leg, because it could never delete what it made.
+- `verb_tamper`'s override POSTs use the same restore routes. An override the
+  server ignores runs as a POST; a 201, a Location header or a body naming a new
+  id is a negative for the bypass, never an observation. A 201/Location create is
+  deleted and verified gone when its DELETE route is known, else named
+  `LEFT IN PLACE` (result and change log) and the other override POSTs are
+  withheld. An id named only by the body is never deleted on that alone. A path
+  where the run already saw a POST create, with no DELETE route, gets no override
+  POST (inconclusive, with the reason).
 
 ## Live trial (in `config.local.yaml`, never `config.yaml`)
 
