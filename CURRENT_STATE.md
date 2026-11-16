@@ -19,6 +19,9 @@
 - This branch, `fix/oracle-leg-gaps-20261114` off main `1f632169` (not merged): leg fixes from
   the oracle run (nosql, file_upload, xxe, race, auth_sequence, listing logs, idor, api_security,
   sequence, client_trust, write_integrity; docs/WRITE_CHECKS.md), tests `test_oracle_gaps_*.py`.
+- `fix/crawl-check-20261115` on top of it (not merged), from a real crawl of a fresh :3002: SPA
+  script bodies bounded in bytes, the spec behind a docs page (under its server path),
+  stored_xss per-field plant, route probes as a new document, script-driven upload forms.
 - Not on main: `fcb96d62` (owner decision below); `WorkingSunday`,
   `main-checkout-snapshot-20261101` and the `origin/vibe/*` branches (old or superseded).
 
@@ -29,6 +32,8 @@
   exist nowhere else. Split it per docs/I01_CANDIDATE_MANIFEST_2026-10-17.md.
 
 ## Verification
+- `fix/crawl-check-20261115` at `4b3a7062`, 2026-11-16, system Python 3.14.7: smoke (182) and
+  precondition (74) exit 0; full exit 0 (harness 6633, evaluation 452 / 17 skips, integrity 59).
 - This branch, 2026-11-15, system Python 3.14.7: smoke and precondition exit 0; the 97
   modules touching the changed legs, 2036 OK; full exit 0 (harness 6608, native 38, eval 452).
 - Main tip `27ae9e3e`, 2026-11-14, system Python 3.14.7: smoke and precondition exit 0. Full
@@ -54,12 +59,17 @@
   `validator-trial-20261114/`) 13 confirmed, race a lead, restores verified. Oracle run (each
   leg aimed at its endpoint by hand): 6db01d2d 22 of 60 confirmed, 20 of 98 solved (r10: 13);
   this branch (pass 3) 31 confirmed, 23 solved, none worse. `oracle-juice-shop-20261114/README.md`.
+- 2026-11-16 crawl check (build_engagement + feature crawl, anonymous and one user, fresh :3002,
+  `.test-work/crawl-check-20261115/crawl4`): reaches POST /file-upload (held capture),
+  /b2b/v2/orders, `#/track-result?id` (probe), POST /dataerasure and the /profile forms; not
+  /support/logs or /encryptionkeys (linked nowhere; wordlist only, ffuf was off).
 
 ## Open work (priority order)
 0. Owner: may real runs set `validators.write_integrity.allow_unrestorable_self_service_creates`
-   (sign-up accounts left, each named)? Not leg gaps: stored XSS on client-rendered pages is
-   untested (the leg loads client views only from a crawl's route map; the oracle driver had
-   none), and default-credential guessing (ATHN-02) was declined in the backlog.
+   (sign-up accounts left, each named)? Not leg gaps: client-rendered stored XSS with a crawl's
+   route map (crawl check): feedback is sanitized server-side; product reviews render only in a
+   dialog a click opens, and no crawl records it (needs click-driven exploration). Default-
+   credential guessing (ATHN-02) was declined in the backlog.
 1. WG-2 item 5: `_LEG_CONFIRMATIONS` gaps in harness/coverage_tracker.py (client_trust's
    wider fields only reach a run once it is listed there). Still open from
    the WSTG review: INJT-14 has no row, ATHN-04 has no bypass leg, WG-4 needs an owner
