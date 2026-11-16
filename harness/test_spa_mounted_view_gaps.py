@@ -15,14 +15,16 @@ re-renders only when the route path changes. Its home view links to:
     /api/orders/<ref>;
   - #/complain: a form (no method) with a required textarea, a file input
     (accept .pdf) and a submit button disabled until the textarea has text; on
-    submit the script posts the form's FormData to /api/complaint-file;
+    submit the script posts the form's FormData to /api/complaint-file. A
+    notice (a toast or banner) lies over the view and takes pointer clicks;
   - #/attach: a form with a file input and no submit control.
 
 Covered here (skipped without Chromium):
   - the probe finds `ref` on #/order (the view fetched the marker);
   - control: the same probe by a hash change finds nothing;
   - the complaint form's upload is captured (held: no upload reaches the
-    server), with the filled text field and the benign .pdf;
+    server), with the filled text field and the benign .pdf, the notice over
+    its submit control notwithstanding;
   - control: a form with no submit control is a recorded skip, with the reason;
   - the crawl keeps each script URL once (the probes load the bundle again).
 """
@@ -56,7 +58,9 @@ _APP_JS = """(function () {
     "order": '<h1>Order</h1><p id="o"></p>',
     "complain": '<form id="c"><textarea name="msg" required></textarea>' +
                 '<input type="file" name="doc" accept=".pdf">' +
-                '<button type="submit" id="go" disabled>Send</button></form>',
+                '<button type="submit" id="go" disabled>Send</button></form>' +
+                '<div style="position:fixed;left:0;top:0;width:100%;height:100%;z-index:9">' +
+                'Notice</div>',
     "attach": '<form><input type="file" name="extra" accept=".pdf"></form>'
   };
   var mounted = null;

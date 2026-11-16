@@ -971,7 +971,11 @@ async def _submit_script_form(handle) -> str:
         try:
             await button.click(timeout=2000)
         except Exception:
-            return "invalid" if not await button.is_enabled() else "failed"
+            if not await button.is_enabled():
+                return "invalid"
+            # Enabled, but the pointer click lands elsewhere: a toast or banner
+            # over the control takes it. Activate the control itself instead.
+            await button.evaluate("b => b.click()")
         return "clicked"
     except Exception:
         return "failed"
