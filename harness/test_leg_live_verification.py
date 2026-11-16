@@ -368,7 +368,12 @@ class LiveLegVerificationTest(EvidenceCase):
     @unittest.skipIf(shutil.which("curl") is None, "curl not available to exercise the shell payload")
     @evidence_for(**cm.caller_evidence("cmdi_confirm"))
     def test_command_injection_confirms_via_shell(self):
-        v = CommandInjectionValidator(allowed_hosts=["127.0.0.1"], timeout=1.0)
+        # The fixture runs the payload's curl inside the request, so a send waits for
+        # a shell and curl to start. On a loaded Windows runner that passed 1 s (PR #30
+        # CI): the leg drops a probe whose send timed out, and the run read
+        # inconclusive. 5 s matches the fixture's own subprocess timeout. A hit ends the
+        # callback wait early, so a passing run is no slower.
+        v = CommandInjectionValidator(allowed_hosts=["127.0.0.1"], timeout=5.0)
         res = self._run(v, "/cmdi/ping?host=seed")
         self._observe(res)
         self.assertEqual(res.status, "confirmed",
