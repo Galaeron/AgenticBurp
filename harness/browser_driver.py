@@ -479,10 +479,15 @@ _VIEW_TEXT_JS = """() => {
 }"""
 
 
-# _IdentityRouter.script_bodies (crawl_spa with declared_views): at most this many
-# same-origin scripts per crawl, each cut here (client_routes reads no more).
-_MAX_SCRIPT_BODIES = 6
+# _IdentityRouter.script_bodies (crawl_spa with declared_views): the same-origin
+# scripts of one crawl, each cut at _SCRIPT_BODY_BYTES (client_routes reads no
+# more), kept while their total stays within _SCRIPT_BYTES_TOTAL. The bound is in
+# bytes, not a count of six: a bundler's runtime, polyfills and small chunks load
+# (and finish) before the large script that holds the router config, and a count
+# spent on them dropped that config, so no declared view was ever visited.
+_MAX_SCRIPT_BODIES = 64
 _SCRIPT_BODY_BYTES = 5_000_000
+_SCRIPT_BYTES_TOTAL = 30_000_000
 # Request headers the router does not copy from the browser's request when it
 # sends that request itself (connection-level, or rebuilt by the router).
 _UNFORWARDED_REQUEST_HEADERS = frozenset({
@@ -573,6 +578,10 @@ class _IdentityRouter:
         # router config they declare. None (the default) keeps none.
         self.script_bodies: list[str] | None = None
         self._scripts_kept = 0
+        self._script_bytes_kept = 0
+        # Each script URL is kept once: a probe loads the app as a new document,
+        # and its bundles again (route probes, crawl_views).
+        self._script_urls: set = set()
         # crawl_spa(file_uploads=True) while one file input's upload is tried: every
         # write the page issues is HELD and aborted, never sent (see _hold_write).
         self.hold: dict | None = None
@@ -702,10 +711,14 @@ class _IdentityRouter:
                 if (self.script_bodies is not None and (resource_type or "").lower() == "script"
                         and 200 <= response.status_code < 300
                         and self._scripts_kept < _MAX_SCRIPT_BODIES
+                        and url not in self._script_urls
                         and ScopePolicy.origin_of(url) == self.run_origin):
-                    self._scripts_kept += 1
-                    self.script_bodies.append(
-                        bytes(response.content[:_SCRIPT_BODY_BYTES]).decode("utf-8", "replace"))
+                    kept = bytes(response.content[:_SCRIPT_BODY_BYTES])
+                    if self._script_bytes_kept + len(kept) <= _SCRIPT_BYTES_TOTAL:
+                        self._script_urls.add(url)
+                        self._scripts_kept += 1
+                        self._script_bytes_kept += len(kept)
+                        self.script_bodies.append(kept.decode("utf-8", "replace"))
                 await route.fulfill(status=response.status_code, headers=fulfilled,
                                     body=response.content)
                 return
@@ -924,6 +937,52 @@ _SUBMIT_FILE_FORM_JS = """el => {
 }"""
 
 
+# A script-driven form (no POST method: the page uploads from its own submit
+# handler, by XHR or fetch): its empty visible text fields get a benign value,
+# then its submit control is clicked, as a user would. Never a password field.
+_FILLABLE_JS = """el => {
+  if (el.disabled || el.readOnly || (el.value || '') !== '' || !el.getClientRects().length) return '';
+  const t = el.tagName === 'TEXTAREA' ? 'textarea' : (el.type || 'text').toLowerCase();
+  return ['text', 'textarea', 'search', 'email', 'url', 'tel', 'number'].includes(t) ? t : '';
+}"""
+_BENIGN_FIELD_VALUES = {"email": "upload-check@example.com", "url": "https://example.com/",
+                        "tel": "5550100", "number": "1"}
+_BENIGN_TEXT = "harness upload check"
+_MAX_FILLED_FIELDS = 12
+_SUBMIT_CONTROL = "button[type=submit], input[type=submit], button:not([type])"
+
+
+async def _submit_script_form(handle) -> str:
+    """Fill the file input's form and click its submit control (see _FILLABLE_JS).
+    Every write the page issues meanwhile stays held. Returns "clicked",
+    "noform", "nosubmit", "invalid" (the control stayed disabled) or "failed"."""
+    form = await handle.evaluate_handle("el => el.form")
+    try:
+        if not await form.evaluate("f => !!f"):
+            return "noform"
+        button = await form.query_selector(_SUBMIT_CONTROL)
+        if button is None:
+            return "nosubmit"
+        for control in (await form.query_selector_all("input, textarea"))[:_MAX_FILLED_FIELDS]:
+            kind = await control.evaluate(_FILLABLE_JS)
+            if kind:
+                await _quietly(control.fill(_BENIGN_FIELD_VALUES.get(kind, _BENIGN_TEXT),
+                                            timeout=1000))
+        try:
+            await button.click(timeout=2000)
+        except Exception:
+            if not await button.is_enabled():
+                return "invalid"
+            # Enabled, but the pointer click lands elsewhere: a toast or banner
+            # over the control takes it. Activate the control itself instead.
+            await button.evaluate("b => b.click()")
+        return "clicked"
+    except Exception:
+        return "failed"
+    finally:
+        await _quietly(form.dispose())
+
+
 async def _await_hold(hold: dict, wait_ms: int) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0.3, min(wait_ms, 10000) / 1000)
@@ -950,9 +1009,11 @@ def _upload_refusal(gate, case_ref: str) -> str:
 async def _upload_file_input(page, router, desc: dict, *, gate, headers: dict | None,
                              wait_ms: int):
     """Try one file input: attach a small benign file its `accept` allows, wait for
-    the page's own upload request, and (an input in a POST form, nothing seen yet)
-    submit the form as the page would. The router HOLDS every write meanwhile:
-    the upload is captured as a request template and aborted, never sent (an
+    the page's own upload request, and (nothing seen yet) submit its form as the
+    page would: a POST form natively, a script-driven form (no POST method) by
+    filling its empty text fields with benign values and clicking its submit
+    control, as a page that uploads on submit expects. The router HOLDS every
+    write meanwhile: the upload is captured as a request template and aborted, never sent (an
     uploaded file cannot be removed generically; the file_upload validator makes
     its own gated upload from the capture). Only with writes on and the input's
     ceiling case open, checked before anything is attached. Returns (exchange
@@ -992,6 +1053,10 @@ async def _upload_file_input(page, router, desc: dict, *, gate, headers: dict | 
             submitted = str(await handles[index].evaluate(_SUBMIT_FILE_FORM_JS))
             if submitted == "submitted":
                 await _await_hold(hold, wait_ms)
+        elif hold["exchange"] is None and not hold["reason"] and form:
+            submitted = await _submit_script_form(handles[index])
+            if submitted == "clicked":
+                await _await_hold(hold, wait_ms)
     finally:
         router.hold = None
     others =(f"; {len(hold['aborted'])} other write(s) held and aborted"
@@ -1003,10 +1068,13 @@ async def _upload_file_input(page, router, desc: dict, *, gate, headers: dict | 
         return None, hold["reason"] + others
     if submitted == "invalid":
         return None, "its form needs other fields filled before it submits; not submitted" + others
-    if form and (form.get("method") or "get") != "post":
-        return None, "no upload request observed; its form does not submit by POST" + others
-    return None, (f"no upload request observed after attaching a benign .{ext} file"
-                  + (" and submitting its form" if submitted == "submitted" else "") + others)
+    if submitted == "nosubmit":
+        return None, "no upload request observed; its form has no submit control" + others
+    if submitted == "failed":
+        return None, "no upload request observed; its submit control could not be clicked" + others
+    how = {"submitted": " and submitting its form",
+           "clicked": " and clicking its form's submit control"}.get(submitted, "")
+    return None, f"no upload request observed after attaching a benign .{ext} file{how}{others}"
 
 
 def playwright_available() -> bool:
@@ -1383,6 +1451,15 @@ class PlaywrightDriver:
                                         raise ViewRefused(router.refused_redirects[-1]) from exc
                                     raise
                             await page.wait_for_timeout(wait_ms)
+
+                        async def open_fresh(self, target: str) -> None:
+                            # A route probe: `target` as a new document, never a hash
+                            # change. A hash change to the view already shown keeps
+                            # it mounted, and a view that reads its route query once,
+                            # when it mounts, never saw the probe's markers.
+                            await _quietly(page.goto("about:blank", timeout=timeout_ms))
+                            self.stale = True
+                            await self.open(target)
 
                         async def links(self) -> list:
                             found = await page.evaluate(LINK_TARGETS_JS)

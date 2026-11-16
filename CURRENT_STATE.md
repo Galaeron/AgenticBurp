@@ -19,6 +19,9 @@
 - This branch, `fix/oracle-leg-gaps-20261114` off main `1f632169` (not merged): leg fixes from
   the oracle run (nosql, file_upload, xxe, race, auth_sequence, listing logs, idor, api_security,
   sequence, client_trust, write_integrity; docs/WRITE_CHECKS.md), tests `test_oracle_gaps_*.py`.
+- `fix/crawl-check-20261115` on top of it (not merged), from a real crawl of a fresh :3002: SPA
+  script bodies bounded in bytes, the spec behind a docs page (under its server path),
+  stored_xss per-field plant, route probes as a new document, script-driven upload forms.
 - Not on main: `fcb96d62` (owner decision below); `WorkingSunday`,
   `main-checkout-snapshot-20261101` and the `origin/vibe/*` branches (old or superseded).
 
@@ -29,6 +32,8 @@
   exist nowhere else. Split it per docs/I01_CANDIDATE_MANIFEST_2026-10-17.md.
 
 ## Verification
+- `fix/crawl-check-20261115` at `4b3a7062`, 2026-11-16, system Python 3.14.7: smoke (182) and
+  precondition (74) exit 0; full exit 0 (harness 6633, evaluation 452 / 17 skips, integrity 59).
 - This branch, 2026-11-15, system Python 3.14.7: smoke and precondition exit 0; the 97
   modules touching the changed legs, 2036 OK; full exit 0 (harness 6608, native 38, eval 452).
 - Main tip `27ae9e3e`, 2026-11-14, system Python 3.14.7: smoke and precondition exit 0. Full
@@ -54,12 +59,17 @@
   `validator-trial-20261114/`) 13 confirmed, race a lead, restores verified. Oracle run (each
   leg aimed at its endpoint by hand): 6db01d2d 22 of 60 confirmed, 20 of 98 solved (r10: 13);
   this branch (pass 3) 31 confirmed, 23 solved, none worse. `oracle-juice-shop-20261114/README.md`.
+- 2026-11-16 crawl check (build_engagement + feature crawl, anonymous and one user, fresh :3002,
+  `.test-work/crawl-check-20261115/crawl4`): reaches POST /file-upload (held capture),
+  /b2b/v2/orders, `#/track-result?id` (probe), POST /dataerasure and the /profile forms; not
+  /support/logs or /encryptionkeys (linked nowhere; wordlist only, ffuf was off).
 
 ## Open work (priority order)
 0. Owner: may real runs set `validators.write_integrity.allow_unrestorable_self_service_creates`
-   (sign-up accounts left, each named)? Not leg gaps: stored XSS on client-rendered pages is
-   untested (the leg loads client views only from a crawl's route map; the oracle driver had
-   none), and default-credential guessing (ATHN-02) was declined in the backlog.
+   (sign-up accounts left, each named)? Not leg gaps: client-rendered stored XSS with a crawl's
+   route map (crawl check): feedback is sanitized server-side; product reviews render only in a
+   dialog a click opens, and no crawl records it (needs click-driven exploration). Default-
+   credential guessing (ATHN-02) was declined in the backlog.
 1. Still open from the WSTG review: INJT-14 has no row, ATHN-04 has no bypass leg, WG-4
    needs an owner decision, WG-5 needs a mail sink (IMPROVEMENT_BACKLOG.md WG-*). WG-2 item 5
    is done: client_trust, websocket and oauth are drive legs; crypto, recon, cache poisoning
@@ -77,7 +87,12 @@
    PoC; replays need allow_mutating_replay). Keep it, or set the row back to manual.
 6. Proof/issue dedup (owner, 2026-10-28): one vulnerability, one proof, keyed on host,
    mechanism, principal and check family; other routes become affected locations.
-7. Coverage drive throughput (v8: 110 of 1380 queued sent, 1270 incomplete attempts).
+7. Coverage drive throughput (v8: 110 of 1380 queued sent, 1270 incomplete attempts; r10: 912
+   cells budget_exhausted). Fixed offline (`dcedade9`): time-fair order under a deadline,
+   unbuilt captures never hide one that ran, all-declined inputs read leg_precondition_unmet.
+   Open: request-level legs never credit per-parameter siblings (nosql needs a path remainder
+   first); registry-covered copies with 0 sends never conclude; cases come from the endpoint
+   template, not each identity's captures. A live run measures the gain.
 8. `redact_headers` has no X-CSRF-Token entry; harness/active_verification.py falls back
    to llama3.1:8b (Burp validation only); 3acd392 has had no live run. Code review 02
    RV-K, I16 wiring, RV-O to RV-S residuals: docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md.
