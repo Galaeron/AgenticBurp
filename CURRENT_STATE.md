@@ -1,4 +1,4 @@
-# Current state — 2026-11-15 (earlier runs and merges: git history of this file)
+# Current state — 2026-11-16 (earlier runs and merges: git history of this file)
 
 ## Branch and base
 - `main` = `port/wstg-ids-2026-11-14` on `integrate/main-2026-11-14` (base `979803d5`).
@@ -16,13 +16,19 @@
   `write_integrity` needs `validators.active_enabled` and `allow_mutating_replay` (both false;
   docs/WRITE_CHECKS.md); route probes, file uploads and discovery recursion are off.
 - SKL-1 race: a generic burst is a lead; only the email race read-back confirms.
-- This branch, `fix/oracle-leg-gaps-20261114` off main `1f632169` (not merged): leg fixes from
-  the oracle run (nosql, file_upload, xxe, race, auth_sequence, listing logs, idor, api_security,
-  sequence, client_trust, write_integrity; docs/WRITE_CHECKS.md), tests `test_oracle_gaps_*.py`.
-- `fix/crawl-check-20261115` on top of it (not merged), from a real crawl of a fresh :3002: SPA
-  script bodies bounded in bytes, the spec behind a docs page (under its server path),
-  stored_xss per-field plant, route probes as a new document, script-driven upload forms.
-- Not on main: `fcb96d62` (owner decision below); `WorkingSunday`,
+- PR #30 (`fix/oracle-leg-gaps-20261114` off main `1f632169`), merged only after its CI full
+  suite passed. It holds the leg fixes from the oracle run (nosql, file_upload, xxe, race,
+  auth_sequence, listing logs, idor, api_security, sequence, client_trust, write_integrity;
+  docs/WRITE_CHECKS.md) and tests `test_oracle_gaps_*.py`. Four branches were merged into it:
+  - write safety (`de2207f8`, `c0e70ac2`): file_upload sends through the run's gate; a
+    verb_tamper create is deleted and verified, or named;
+  - WG-2 item 5 (`e4bdf94c`);
+  - coverage-drive throughput (`dcedade9`);
+  - `fix/crawl-check-20261115`: SPA script bodies bounded in bytes, the spec behind a docs
+    page, a stored_xss plant per field, route probes as a new document, script-driven
+    upload forms.
+- Not on main: `feat/scoreboard-scorer-20261116` (worktree `scorer-20261116`); `fcb96d62`
+  (owner decision below); `WorkingSunday`,
   `main-checkout-snapshot-20261101` and the `origin/vibe/*` branches (old or superseded).
 
 ## Checkout
@@ -32,6 +38,9 @@
   exist nowhere else. Split it per docs/I01_CANDIDATE_MANIFEST_2026-10-17.md.
 
 ## Verification
+- PR #30 code at `71a4df23`, 2026-11-16, system Python 3.14.7: smoke and precondition (74)
+  exit 0; the 33 test modules for the changed files, 588 OK. The full suite ran in PR #30's
+  CI (3.14), not again locally. Each merged branch passed full on 3.14 before its merge.
 - `fix/crawl-check-20261115` at `4b3a7062`, 2026-11-16, system Python 3.14.7: smoke (182) and
   precondition (74) exit 0; full exit 0 (harness 6633, evaluation 452 / 17 skips, integrity 59).
 - This branch, 2026-11-15, system Python 3.14.7: smoke and precondition exit 0; the 97
