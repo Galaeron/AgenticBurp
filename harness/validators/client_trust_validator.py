@@ -261,6 +261,12 @@ def trust_fields(fields: dict, kind: str = "json") -> list[_Field]:
     return found
 
 
+def body_trust_fields(body: str) -> list[_Field]:
+    """trust_fields of a raw urlencoded or JSON request body (the coverage row's
+    applicability test reads a captured template body with it)."""
+    return trust_fields(*_parse(body or ""))
+
+
 def has_trust_shape(exchange: HttpExchange) -> bool:
     """The leg's targeting predicate: a POST/PUT/PATCH whose body carries an integer
     price/amount/total or another server-owned field (payment source, plan/tier,

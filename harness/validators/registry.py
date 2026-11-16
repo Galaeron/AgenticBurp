@@ -676,6 +676,37 @@ class ValidatorRegistry:
             if run_context is None or not run_context.gate.config.allow_mutating_replay:
                 return decision("policy_denied", "mutating_policy_denied", "write checks require explicit mutating replay permission")
             mechanism = "write_integrity." + kind
+        if family == "client_trust":
+            # WG-2 item 5: the tamper is a write and a granted plan/membership may
+            # have no undo, so the drive needs explicit mutating permission too.
+            from .client_trust_validator import has_trust_shape
+            if method not in {"POST", "PUT", "PATCH"}:
+                return decision("unsupported", "unsupported_method",
+                                "client-trust tampers a captured POST/PUT/PATCH write")
+            if not has_trust_shape(exchange):
+                return decision("unsupported", "no_trust_field",
+                                "the captured body has no server-owned field to tamper")
+            if run_context is None or not run_context.gate.config.allow_mutating_replay:
+                return decision("policy_denied", "mutating_policy_denied",
+                                "client-trust tampers require explicit mutating replay permission")
+            mechanism = "client_trust.tamper"
+        if family == "websocket":
+            # Cross-site hijacking rides the cookie a browser attaches on its own;
+            # a long-poll capture is not a WebSocket handshake.
+            from .websocket_validator import ambient_cookie
+            if is_polling_transport(exchange.url or ""):
+                return decision("unsupported", "polling_transport",
+                                "the capture is a long-polling request, not a WebSocket handshake")
+            if not ambient_cookie(exchange):
+                return decision("unsupported", "no_ambient_credential",
+                                "cross-site WebSocket hijacking needs a cookie-bearing handshake")
+            mechanism = "websocket.cross_origin_handshake"
+        if family == "oauth":
+            from .oauth_validator import has_oauth_shape
+            if not has_oauth_shape(exchange):
+                return decision("unsupported", "not_an_oauth_request",
+                                "no OAuth authorization or token parameters in the captured URL")
+            mechanism = "oauth.flow_checks"
         if check.id == "WSTG-ATHZ-04":
             from .idor_read_validator import _locate_id
             if not _locate_id(exchange):

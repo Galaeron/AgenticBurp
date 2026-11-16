@@ -5023,6 +5023,25 @@ non-negotiables at the top of this file apply.
   caller confirm/control/gate-off against a loopback upload app, scheme reads for cells, cases,
   evidence and events, attribution controls, import guard). `harness.suite full` on 3.14: unittest
   4012 OK, testing 440 OK, evaluation_integrity 59 OK, pytest 38 passed. Still open: (2), (5).
+- **Result, open item (5) (2026-11-15, on top of `fix/oracle-leg-gaps-20261114`):** VERIFIED (offline).
+  `client_trust` (BUSL-02), `websocket` (CLNT-10) and `oauth` (ATHZ-05) join `_LEG_CONFIRMATIONS` and the
+  registry-bound drive map in `orchestrator_chain.py`. `capability_for_check` holds each gate and shape:
+  client_trust needs a POST/PUT/PATCH with a trust field (`has_trust_shape`) and `allow_mutating_replay`
+  (else policy_denied: the cell is policy_blocked and nothing is sent); websocket declines a long-poll
+  capture and a cookie-less handshake (`ambient_cookie`, shared with the validator); oauth declines a URL
+  with no OAuth parameter (`has_oauth_shape`, the validator's own skip conditions). BUSL-02 also applies
+  where the leg's recogniser finds a payment, plan, currency, coupon or role field (`body_trust_fields`).
+  Left undriven, reasons in `coverage_tracker.UNDRIVEN_ROW_CONFIRMATIONS`: crypto (one aggregate
+  TLS/HSTS/cookie verdict; plain HTTP always reports a weakness), recon (no per-check verdict),
+  web_cache_poisoning (never confirms; one verdict over INJT-17 and CONF-13), subdomain_takeover (fetches
+  out-of-scope hosts, no DNS lookup). Pure guard `leg_table_problems`: every row kind is a leg, undriven
+  with a reason, or a non-validator kind. Tests: `test_catalog_validator_rows` (DriveLegTableTests with
+  negative controls, driver offers), `test_coverage_capabilities` (AddedDriveLegCallerTests through
+  `investigate_engagement`, AddedLegReadinessTests). On 3.14: smoke 182 OK; test_orchestrator_precondition
+  74 OK; `harness.suite full` unittest 6620 OK, testing 452 OK, evaluation_integrity 59 OK, pytest 38
+  passed. Follow-ups: the label chain's own client_trust instance (`_ct`, reached from
+  `shape_precondition_legs`) ignores `validators.client_trust.enabled`; the agent-routed websocket path
+  still confirms a cookie-less 101. Still open: (2).
 
 ### [~] WG-3 — Python leg for logout invalidation (WSTG-SESS-06); end its Java-only status
 - **Domain:** Validator coverage / Safety · **Effort:** M · **Depends on:** none ·

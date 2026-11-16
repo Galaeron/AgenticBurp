@@ -261,6 +261,251 @@ class EngagementCapabilityTests(unittest.TestCase):
         self.assertFalse([r for r in jwt if r['attempted']])
         self.assertIn('validator_unavailable', {r['terminal_reason'] for r in jwt})
 
+class AddedDriveLegCallerTests(unittest.TestCase):
+    """WG-2 item 5: client_trust (BUSL-02), websocket (CLNT-10) and oauth (ATHZ-05)
+    are in _LEG_CONFIRMATIONS, so investigate_engagement drives each applicable
+    cell with no agent label, and a clean answer leaves it attempted -> not_detected.
+    Negatives: a write with no server-owned field, an OAuth path with no OAuth
+    parameters, a long-poll capture and a Bearer-only handshake are never
+    dispatched; client_trust stays inert without allow_mutating_replay.
+
+    Only the coverage drive's dispatches count here: it always passes a case_ref,
+    while the label chain (shape_precondition_legs routes a trust-shaped write to
+    its own client_trust instance, which skips itself without mutating permission)
+    calls the cache with none."""
+    setUp = EngagementCapabilityTests.setUp
+    restore = staticmethod(EngagementCapabilityTests.restore)
+
+    ADDED = ('client_trust', 'websocket', 'oauth')
+    OAUTH_QUERY = 'response_type=code&client_id=fixture&redirect_uri=http://localhost/cb&state=abcdefgh1234'
+
+    def drive(self, *, mutating, case_drive=False):
+        from harness import test_smoke_investigate as smoke
+        from harness.coverage_tracker import _LEG_CONFIRMATIONS
+        from harness.engagement import EngagementState
+        from harness.models import HttpExchange
+        from harness.orchestrator import Orchestrator
+        from harness.orchestrator_chain import _ConfirmationCache
+        from harness.role_crawl import RoleCrawlResult, RoleSession
+        from harness.run_context import RunContext
+        from harness.validators.base import ValidationResult
+        base = smoke.BASE_URL
+        roles = [RoleSession('user', {'Cookie': 'sid=fixture-cookie'}, name='cookie-user'),
+                 RoleSession('user', {'Authorization': 'Bearer fixture'}, name='bearer-user')]
+        cfg = smoke._test_config()
+        for name in _LEG_CONFIRMATIONS:
+            cfg['validators'].setdefault(name, {})['enabled'] = name in self.ADDED
+        seen = []
+        async def dispatch(self_, validator, finding, exchange, case_ref=None):
+            if case_ref is not None:
+                seen.append((validator.name, exchange.method, exchange.url,
+                             dict(exchange.request_headers or {})))
+            return ValidationResult(validator.name, 'not_confirmed', finding.vulnerability_class,
+                                    summary='fixture: nothing found')
+        captures = [
+            ('POST', '/api/basket/items', '{"productId": 3, "quantity": 2}', 'application/json'),
+            ('POST', '/api/notes', '{"title": "t", "text": "x"}', 'application/json'),
+            ('GET', '/ws', '', ''),
+            ('GET', '/socket.io/?EIO=4&transport=polling', '', ''),
+            ('GET', '/oauth/authorize?' + self.OAUTH_QUERY, '', ''),
+            ('GET', '/oauth/callback', '', ''),
+        ]
+        def build(*args, **kwargs):
+            state = EngagementState('localhost')
+            for role in roles:
+                for method, path, body, ctype in captures:
+                    headers = dict(role.headers, **({'Content-Type': ctype} if ctype else {}))
+                    state.record_template(base + path, method, HttpExchange(
+                        url=base + path, method=method, request_headers=headers, request_body=body,
+                        response_status=200, response_headers={'Content-Type': 'application/json'},
+                        response_body='{}'))
+            for ep in state.endpoints.values():
+                ep.reachable_roles = ['user']
+            return state, RoleCrawlResult(base_url=base)
+        orch = Orchestrator(cfg)
+        _controlled_model(orch)
+        orch.business_context_enabled = False
+        orch.engagement_coverage_drive = True
+        orch.engagement_coverage_case_drive = case_drive
+        orch.run_active_probe = AsyncMock(return_value={'iterative_result': {'findings': []}, 'integration': {}})
+        async def run():
+            async with RunContext.create(allowed_hosts=['localhost'], max_requests=50, config=cfg,
+                    gate_config={'active_enabled': True, 'allow_mutating_replay': mutating}) as ctx:
+                return await orch.investigate_engagement(base, roles, max_nodes=0, step_budget=1,
+                    max_chain_rounds=0, active_discovery=False, run_context=ctx)
+        with patch('harness.engagement_builder.build_engagement', side_effect=build), \
+                patch('httpx.AsyncClient.get', new_callable=AsyncMock, side_effect=smoke._responder(False)), \
+                patch.object(_ConfirmationCache, 'validate', dispatch):
+            result = asyncio.run(run())
+        return seen, result['coverage']['phase_ledger']['cells']
+
+    @staticmethod
+    def cells(rows, check, endpoint):
+        return [r for r in rows if r['check'] == check and r['endpoint'] == endpoint]
+
+    def assert_driven_not_detected(self, rows, check, endpoint, identities=None):
+        cells = self.cells(rows, check, endpoint)
+        if identities is not None:
+            cells = [r for r in cells if r['identity'] in identities]
+        self.assertTrue(cells, (check, endpoint))
+        for row in cells:
+            self.assertTrue(row['shape_applicable'] and row['attempted'] and row['conclusive'], row)
+            self.assertEqual(row['observation_status'], 'not_detected', row)
+
+    def assert_never_dispatched(self, rows, check, endpoint, code=None):
+        cells = self.cells(rows, check, endpoint)
+        self.assertTrue(cells, (check, endpoint))
+        for row in cells:
+            self.assertFalse(row['attempted'] or row['sent'], row)
+            if code is not None:
+                self.assertEqual(row['readiness'].get('reason_code'), code, row)
+
+    def test_added_legs_are_driven_and_a_clean_answer_is_not_detected(self):
+        for case_drive in (False, True):
+            with self.subTest(case_drive=case_drive):
+                seen, rows = self.drive(mutating=True, case_drive=case_drive)
+                names = {(name, method, url.split('?', 1)[0]) for name, method, url, _ in seen}
+                self.assertIn(('client_trust', 'POST', 'http://localhost/api/basket/items'), names)
+                self.assertIn(('websocket_validator', 'GET', 'http://localhost/ws'), names)
+                self.assertIn(('oauth_validator', 'GET', 'http://localhost/oauth/authorize'), names)
+                # Both identities may tamper the basket write and read the OAuth URL.
+                self.assert_driven_not_detected(rows, 'WSTG-BUSL-02', 'POST /api/basket/items')
+                self.assert_driven_not_detected(rows, 'WSTG-ATHZ-05', 'GET /oauth/authorize')
+                ws_ids = {r['identity'] for r in self.cells(rows, 'WSTG-CLNT-10', 'GET /ws')
+                          if r['attempted']}
+                self.assertEqual(len(ws_ids), 1, ws_ids)
+                self.assert_driven_not_detected(rows, 'WSTG-CLNT-10', 'GET /ws', ws_ids)
+                # Every handshake the drive sent carried the identity's cookie.
+                self.assertTrue(all('Cookie' in headers for name, _, _, headers in seen
+                                    if name == 'websocket_validator'), seen)
+
+    def test_shapes_that_do_not_fit_are_never_dispatched(self):
+        seen, rows = self.drive(mutating=True)
+        urls = {(name, url.split('?', 1)[0]) for name, _, url, _ in seen}
+        # A write with no server-owned field: the row does not apply at all.
+        self.assertTrue([r for r in rows if r['endpoint'] == 'POST /api/notes'])
+        notes = self.cells(rows, 'WSTG-BUSL-02', 'POST /api/notes')
+        self.assertFalse(any(r['shape_applicable'] or r['attempted'] for r in notes), notes)
+        self.assertNotIn(('client_trust', 'http://localhost/api/notes'), urls)
+        # The OAuth row applies to the path, but the capture carries no OAuth parameter.
+        self.assert_never_dispatched(rows, 'WSTG-ATHZ-05', 'GET /oauth/callback', 'not_an_oauth_request')
+        self.assertNotIn(('oauth_validator', 'http://localhost/oauth/callback'), urls)
+        # A long-poll capture is not a WebSocket handshake.
+        self.assert_never_dispatched(rows, 'WSTG-CLNT-10', 'GET /socket.io', 'polling_transport')
+        # A Bearer-only identity has no cookie for a cross-site page to ride.
+        bearer = [r for r in self.cells(rows, 'WSTG-CLNT-10', 'GET /ws') if not r['attempted']]
+        self.assertEqual(len(bearer), 1, bearer)
+        self.assertEqual(bearer[0]['readiness'].get('reason_code'), 'no_ambient_credential')
+
+    def test_client_trust_stays_inert_without_mutating_permission(self):
+        seen, rows = self.drive(mutating=False)
+        self.assertNotIn('client_trust', {name for name, *_ in seen})
+        cells = self.cells(rows, 'WSTG-BUSL-02', 'POST /api/basket/items')
+        self.assertTrue(cells)
+        for row in cells:
+            self.assertFalse(row['attempted'] or row['sent'], row)
+            self.assertEqual(row['terminal_reason'], 'policy_blocked', row)
+        # The read-only legs are unaffected by the write permission.
+        self.assertIn('oauth_validator', {name for name, *_ in seen})
+        self.assertIn('websocket_validator', {name for name, *_ in seen})
+
+    def test_disabled_added_legs_are_unavailable_not_driven(self):
+        from harness import test_smoke_investigate as smoke
+        from harness.coverage_tracker import _LEG_CONFIRMATIONS
+        self.assertTrue(set(self.ADDED) <= _LEG_CONFIRMATIONS)
+        saved = self.ADDED
+        self.ADDED = ()
+        try:
+            seen, rows = self.drive(mutating=True)
+        finally:
+            self.ADDED = saved
+        self.assertFalse({name for name, *_ in seen} & {'client_trust', 'websocket_validator',
+                                                       'oauth_validator'}, seen)
+        for check, endpoint in (('WSTG-BUSL-02', 'POST /api/basket/items'),
+                                ('WSTG-ATHZ-05', 'GET /oauth/authorize'), ('WSTG-CLNT-10', 'GET /ws')):
+            for row in self.cells(rows, check, endpoint):
+                self.assertFalse(row['attempted'], row)
+                self.assertEqual(row['terminal_reason'], 'validator_unavailable', row)
+
+
+class AddedLegReadinessTests(unittest.TestCase):
+    """capability_for_check for the WG-2 item 5 legs: each declines a wrong-shape
+    capture before dispatch, and client_trust needs mutating permission."""
+
+    def decide(self, check, url, *, method='GET', body='', headers=None, mutating=True,
+               run_context=True):
+        from harness.models import HttpExchange
+        from harness.validators.registry import ValidatorRegistry
+        registry = ValidatorRegistry.__new__(ValidatorRegistry)
+        registry.enabled = True; registry.active_enabled = True; registry._disabled_capabilities = set()
+        registry.validators = {name: SimpleNamespace(active=True)
+                               for name in ('client_trust', 'websocket', 'oauth')}
+        ctx = SimpleNamespace(scope=SimpleNamespace(in_scope=lambda _url: True),
+                              gate=SimpleNamespace(config=SimpleNamespace(allow_mutating_replay=mutating)))
+        exchange = HttpExchange(url=url, method=method, request_body=body,
+                                request_headers=headers or {})
+        return registry.capability_for_check(CHECKS_BY_ID[check], exchange,
+                                             run_context=ctx if run_context else None)
+
+    def test_client_trust(self):
+        url = 'http://fixture.invalid/api/membership'
+        ready = self.decide('WSTG-BUSL-02', url, method='POST', body='{"paymentMode": "wallet"}')
+        self.assertEqual((ready['status'], ready['mechanism_id']), ('ready', 'client_trust.tamper'))
+        self.assertEqual(ready['finding_class'], 'business_logic')
+        for body in ('{"quantity": 2}', '{"plan": "basic"}', 'price=1000&item=3', '{"role": "user"}'):
+            self.assertEqual(self.decide('WSTG-BUSL-02', url, method='POST', body=body)['status'],
+                             'ready', body)
+        self.assertEqual(self.decide('WSTG-BUSL-02', url, method='POST', body='{"title": "t"}')['reason_code'],
+                         'no_trust_field')
+        # A quantity that is not a positive integer has nothing to tamper with.
+        self.assertEqual(self.decide('WSTG-BUSL-02', url, method='POST', body='{"quantity": "many"}')['reason_code'],
+                         'no_trust_field')
+        self.assertEqual(self.decide('WSTG-BUSL-02', url, body='')['reason_code'], 'unsupported_method')
+        for kwargs in ({'mutating': False}, {'run_context': False}):
+            denied = self.decide('WSTG-BUSL-02', url, method='POST', body='{"quantity": 2}', **kwargs)
+            self.assertEqual((denied['status'], denied['reason_code']),
+                             ('policy_denied', 'mutating_policy_denied'), kwargs)
+
+    def test_websocket(self):
+        cookie = {'Cookie': 'sid=x'}
+        ready = self.decide('WSTG-CLNT-10', 'http://fixture.invalid/ws', headers=cookie)
+        self.assertEqual((ready['status'], ready['mechanism_id']),
+                         ('ready', 'websocket.cross_origin_handshake'))
+        self.assertEqual(self.decide('WSTG-CLNT-10', 'http://fixture.invalid/ws',
+                                     headers={'Authorization': 'Bearer t'})['reason_code'],
+                         'no_ambient_credential')
+        self.assertEqual(self.decide('WSTG-CLNT-10', 'http://fixture.invalid/socket.io/?EIO=4&transport=polling&t=x',
+                                     headers=cookie)['reason_code'], 'polling_transport')
+        self.assertEqual(self.decide('WSTG-CLNT-10', 'http://fixture.invalid/socket.io/?EIO=4&transport=websocket',
+                                     headers=cookie)['status'], 'ready')
+
+    def test_oauth(self):
+        base = 'http://fixture.invalid/oauth/authorize'
+        for query in ('response_type=code&client_id=c', 'client_id=c&redirect_uri=https://x/cb',
+                      'response_type=code', 'code=abc', 'access_token=t'):
+            self.assertEqual(self.decide('WSTG-ATHZ-05', base + '?' + query)['status'], 'ready', query)
+        self.assertEqual(self.decide('WSTG-ATHZ-05', 'http://fixture.invalid/cb#access_token=t')['status'],
+                         'ready')
+        for url in (base, base + '?client_id=c', base + '?response_type=token'):
+            self.assertEqual(self.decide('WSTG-ATHZ-05', url)['reason_code'], 'not_an_oauth_request', url)
+
+    def test_readiness_agrees_with_each_validators_own_skip(self):
+        """The readiness predicates are the validators' own: a capture they decline is
+        one the validator itself would skip (a check, not a send)."""
+        from harness.models import Finding, HttpExchange
+        from harness.validators.oauth_validator import OAuthValidator
+        from harness.validators.websocket_validator import ambient_cookie
+        finding = Finding(vulnerability_class='oauth', confidence=0.5, summary='x',
+                          evidence='capture', suggested_test='probe', basis='derived')
+        skipped = asyncio.run(OAuthValidator().validate(
+            finding, HttpExchange(url='http://fixture.invalid/oauth/authorize?client_id=c', method='GET')))
+        self.assertEqual(skipped.status, 'skipped')
+        self.assertIsNone(ambient_cookie(HttpExchange(url='http://x/ws', method='GET',
+                                                      request_headers={'Authorization': 'Bearer t'})))
+        self.assertEqual(ambient_cookie(HttpExchange(url='http://x/ws', method='GET',
+                                                     request_headers={'cookie': 'a=b'})), 'a=b')
+
+
 class ExactProcedureCallerTests(unittest.TestCase):
     setUp = EngagementCapabilityTests.setUp
     restore = staticmethod(EngagementCapabilityTests.restore)

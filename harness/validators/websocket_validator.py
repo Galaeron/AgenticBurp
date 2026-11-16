@@ -38,6 +38,13 @@ log = logging.getLogger("harness.validators.websocket")
 _SPOOFED_ORIGIN = "https://attacker-controlled-cswsh-probe.example"
 
 
+def ambient_cookie(exchange) -> str | None:
+    """The captured Cookie header the handshake probe replays, or None. The coverage
+    drive's readiness check uses it too, so both agree on what a probe carries."""
+    headers = getattr(exchange, "request_headers", None) or {}
+    return headers.get("Cookie") or headers.get("cookie")
+
+
 @dataclass
 class WebsocketTestResult:
     test_name: str
@@ -130,8 +137,7 @@ class WebsocketValidator(Validator):
                     evidence="", raw_output="[]",
                 )
 
-            cookie_header = (exchange.request_headers or {}).get("Cookie") or \
-                             (exchange.request_headers or {}).get("cookie")
+            cookie_header = ambient_cookie(exchange)
 
             result = self._attempt_handshake(ws_url, cookie_header)
             tests = [result]

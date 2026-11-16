@@ -254,7 +254,52 @@ _LEG_CONFIRMATIONS = {
     "csp", "cors", "nosql", "header_injection", "http_request_smuggling",
     "security_headers", "error_handling", "content_exposure", "write_integrity",
     "listing_exposure", "filter_bypass", "metrics_exposure", "sensitive_file", "well_known",
+    # WG-2 item 5. Each keeps its own gate: client_trust tampers are writes (readiness
+    # needs active_enabled and allow_mutating_replay); websocket and oauth are active.
+    "client_trust", "websocket", "oauth",
 }
+# Catalog confirmation kinds that name a registered validator but are NOT drive legs,
+# each with the reason. Driving one would write a cell verdict its probe does not
+# establish. harness.test_catalog_validator_rows requires every row kind to be in
+# _LEG_CONFIRMATIONS, here, or a non-validator kind ("manual", "agent").
+UNDRIVEN_ROW_CONFIRMATIONS: dict[str, str] = {
+    "crypto": "one aggregate verdict over TLS, HSTS and cookie attributes: on plain HTTP its "
+              "TLS test always reports a weakness, so it would confirm SESS-02 and CONF-07 "
+              "cells whatever their cookies or headers say",
+    "recon": "fingerprinting, comment and method enumeration have no per-check verdict "
+             "(capability_for_check reports check_adapter_missing for INFO-02, INFO-05, CONF-06)",
+    "web_cache_poisoning": "never confirms (retired verdict) and reports a found reflection as "
+                           "not_confirmed; one aggregate verdict runs both the INJT-17 and CONF-13 "
+                           "probes, and the deception probe drops the identity's credentials",
+    "subdomain_takeover": "fetches third-party hosts named in a response body (outside the "
+                          "engagement scope) and does no DNS lookup, so its negative does not "
+                          "answer CONF-10; the row applies to every endpoint, one skip each",
+}
+
+
+def leg_table_problems(rows, legs=None, undriven=None, non_validator=None) -> list[str]:
+    """Every problem between catalog confirmation kinds and the drive-leg table;
+    empty means consistent. Each row kind is a drive leg, an undriven kind with a
+    reason, or a non-validator kind; the two tables are disjoint; neither names a
+    kind no row uses (a stale entry)."""
+    from harness.coverage_model import NON_VALIDATOR_CONFIRMATIONS
+    legs = _LEG_CONFIRMATIONS if legs is None else set(legs)
+    undriven = UNDRIVEN_ROW_CONFIRMATIONS if undriven is None else undriven
+    non_validator = NON_VALIDATOR_CONFIRMATIONS if non_validator is None else non_validator
+    kinds = {r.confirmation for r in rows}
+    problems: list[str] = []
+    for kind in sorted(kinds - legs - set(undriven) - set(non_validator)):
+        problems.append(f"{kind}: row kind is neither a drive leg nor undriven with a reason")
+    for kind in sorted(set(undriven)):
+        if kind in legs:
+            problems.append(f"{kind}: both a drive leg and undriven")
+        elif not (undriven[kind] or "").strip():
+            problems.append(f"{kind}: undriven with no reason")
+    for kind in sorted((legs | set(undriven)) - kinds):
+        problems.append(f"{kind}: in the leg table but no row names it (stale entry)")
+    return problems
+
+
 # Legs that judge the captured response and send nothing. They run first and spend
 # no dispatch budget, so they never crowd out a leg that sends.
 _PASSIVE_LEG_CONFIRMATIONS = frozenset({"security_headers", "error_handling", "content_exposure"})

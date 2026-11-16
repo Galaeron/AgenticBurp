@@ -60,10 +60,10 @@
    (sign-up accounts left, each named)? Not leg gaps: stored XSS on client-rendered pages is
    untested (the leg loads client views only from a crawl's route map; the oracle driver had
    none), and default-credential guessing (ATHN-02) was declined in the backlog.
-1. WG-2 item 5: `_LEG_CONFIRMATIONS` gaps in harness/coverage_tracker.py (client_trust's
-   wider fields only reach a run once it is listed there). Still open from
-   the WSTG review: INJT-14 has no row, ATHN-04 has no bypass leg, WG-4 needs an owner
-   decision, WG-5 needs a mail sink (IMPROVEMENT_BACKLOG.md WG-*).
+1. Still open from the WSTG review: INJT-14 has no row, ATHN-04 has no bypass leg, WG-4
+   needs an owner decision, WG-5 needs a mail sink (IMPROVEMENT_BACKLOG.md WG-*). WG-2 item 5
+   is done: client_trust, websocket and oauth are drive legs; crypto, recon, cache poisoning
+   and subdomain_takeover stay undriven (reasons in `UNDRIVEN_ROW_CONFIRMATIONS`).
 2. A full Juice Shop run on the merge (the legs passed alone; JWT captured-key confusion,
    file_upload, SPA crawl, the WG auth rows and SESS-06 were not exercised). r10
    leftovers: compare result.json with r9; find the check that sent ~10k/h to
