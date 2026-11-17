@@ -184,6 +184,90 @@ def _denial(status, body: str, location: str) -> str:
     return ""
 
 
+# --- two-principal ownership (authz.self_observed_ownership) -------------------
+# A field an object names its owning account with.
+_OWNER_FIELD = re.compile(
+    r"^(?:user_?id|owner(?:_?id)?|owned_?by|customer_?id|account_?id|created_?by(?:_?id)?|"
+    r"author_?id|member_?id|user_?email|owner_?email|email)$", re.IGNORECASE)
+# JWT claims that name the caller's account, read at the top level or in one
+# user object ({"data": {...}}, {"user": {...}}).
+_ID_CLAIMS = ("id", "sub", "uid", "user_id", "userid", "account_id", "accountid")
+_EMAIL_CLAIMS = ("email", "mail", "upn", "user_email")
+_CLAIM_OBJECTS = ("data", "user", "account", "profile", "principal")
+
+
+def _json_doc(body: str):
+    import json
+    try:
+        return json.loads(body or "")
+    except (ValueError, TypeError):
+        return None
+
+
+def _owner_fields(body: str) -> dict[str, tuple[str, str]]:
+    """{json path: (kind, value)} of owner-naming scalar fields in a JSON object,
+    kind "email" or "id". Values are compared, never reported."""
+    out: dict[str, tuple[str, str]] = {}
+
+    def walk(node, path, depth):
+        if depth > 4 or len(out) >= 20:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                p = f"{path}/{k}"
+                if isinstance(v, (dict, list)):
+                    walk(v, p, depth + 1)
+                elif (_OWNER_FIELD.match(str(k)) and isinstance(v, (str, int))
+                      and not isinstance(v, bool) and str(v).strip()):
+                    value = str(v).strip().lower()
+                    out[p] = ("email" if "@" in value else "id", value)
+        elif isinstance(node, list):
+            for i, v in enumerate(node[:20]):
+                walk(v, f"{path}/{i}", depth + 1)
+
+    walk(_json_doc(body), "", 0)
+    return out
+
+
+def _session_accounts(session, self_owned) -> dict[str, set[str]]:
+    """{"id": {...}, "email": {...}}: the account keys a run identity's own
+    credentials name (its JWT claims) plus the account ids the run observed it
+    bound to (self_ownership, from its own whoami reads)."""
+    from harness.security import is_identity_credential_header
+    from .jwt_forge_validator import _JWT_RE, _decode
+    keys: dict[str, set[str]] = {"id": set(), "email": set()}
+
+    def take(claims: dict):
+        for name in _ID_CLAIMS:
+            v = claims.get(name)
+            if isinstance(v, (str, int)) and not isinstance(v, bool) and str(v).strip():
+                value = str(v).strip().lower()
+                keys["email" if "@" in value else "id"].add(value)
+        for name in _EMAIL_CLAIMS:
+            v = claims.get(name)
+            if isinstance(v, str) and "@" in v:
+                keys["email"].add(v.strip().lower())
+
+    for name, value in (getattr(session, "headers", None) or {}).items():
+        if not is_identity_credential_header(name):
+            continue
+        for match in _JWT_RE.finditer(value or ""):
+            decoded = _decode(match.group(1))
+            if not decoded:
+                continue
+            payload = decoded[1]
+            take(payload)
+            for obj in _CLAIM_OBJECTS:
+                if isinstance(payload.get(obj), dict):
+                    take(payload[obj])
+    if self_owned is not None:
+        try:
+            keys["id"] |= {str(i).lower() for i in self_owned.account_ids(session.principal_id)}
+        except Exception:
+            pass
+    return keys
+
+
 def _distinct(sa, ba: str, sb, bb: str) -> bool:
     if sa != sb:
         return True
@@ -281,6 +365,72 @@ class IdorReadValidator(Validator):
             return unknown
         return decision, source, provenance
 
+    def _two_principal_ready(self) -> str:
+        """"" when a two-principal ownership check can run, else why not. It needs
+        the run's self-observed ownership opt-in (authz.self_observed_ownership,
+        the owner decision of 2026-11-03) and a second run identity."""
+        from harness.run_context import current_run_context
+        ctx = self.run_context or current_run_context()
+        if ctx is None or getattr(ctx, "self_ownership", None) is None:
+            return ("authz.self_observed_ownership is off, so ownership the harness observes for "
+                    "its own identities is not used")
+        principals = {s.principal_id for s in ctx.sessions.identities()}
+        if len(principals) < 2:
+            return "the run has no second identity"
+        return ""
+
+    async def _two_principal(self, exchange, foreign_url, b_own, b_f, markers, anon_headers):
+        """Show the protected foreign object belongs to ANOTHER run identity:
+        (a) an owner-naming field in it (userId, ownerId, customerId, email, ...)
+        holds one of identity B's own account keys (from B's token claims or B's
+        observed account binding); (b) the reader A's own object carries A's key
+        at the same field, so the field is the owner and A and B are different
+        accounts of the same kind; (c) B's own session reads the same object.
+        Returns ({"b": principal, "field": path, "kind": kind, "status": s}, "")
+        or (None, the missing evidence). Values are compared, never reported."""
+        from harness.run_context import current_run_context
+        from harness.security import is_identity_credential_header
+        ctx = self.run_context or current_run_context()
+        so = getattr(ctx, "self_ownership", None)
+        ref, _ = ctx.sessions.bind_headers(exchange.request_headers or {})
+        reader = ctx.sessions.get(ref)
+        if reader is None:
+            return None, "the capture's credentials belong to no run identity"
+        mine = _session_accounts(reader, so)
+        others = [s for s in ctx.sessions.identities() if s.principal_id != reader.principal_id]
+        theirs = [(s, _session_accounts(s, so)) for s in others]
+        foreign_fields, own_fields = _owner_fields(b_f), _owner_fields(b_own)
+        if not foreign_fields:
+            return None, "the foreign object has no owner-naming field (userId, ownerId, email ...)"
+        why = ""
+        for path, (kind, value) in foreign_fields.items():
+            own = own_fields.get(path)
+            if own is None or own[0] != kind or own[1] not in mine[kind]:
+                why = why or (f"this principal's own object does not carry its own account at the "
+                              f"owner field {path}, so that field is not shown to name the owner")
+                continue
+            if value in mine[kind]:
+                why = why or f"the owner field {path} names this principal's own account"
+                continue
+            owner = next((s for s, keys in theirs if value in keys[kind]), None)
+            if owner is None:
+                why = why or (f"the owner field {path} names an account no run identity holds "
+                              f"(value redacted)")
+                continue
+            creds = {k: v for k, v in (owner.headers or {}).items() if is_identity_credential_header(k)}
+            read = await self._get(foreign_url, dict(anon_headers, **creds))
+            if read is None:
+                return None, f"the second identity {owner.principal_id}'s read failed or was blocked"
+            s_b, b_b, _ = read
+            if not (_is_object(s_b, b_b) and _exposes_object(markers, s_b, b_b)
+                    and _owner_fields(b_b).get(path) == (kind, value)):
+                why = why or (f"the owner field {path} names {owner.principal_id}, but that "
+                              f"identity's own session did not read the same object (HTTP {s_b})")
+                continue
+            return {"b": owner.principal_id, "a": reader.principal_id, "field": path, "kind": kind,
+                    "status": s_b}, ""
+        return None, why
+
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         host = urlsplit(exchange.url).hostname or ""
         if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
@@ -324,6 +474,12 @@ class IdorReadValidator(Validator):
         has_session = len(anon_headers) < len(headers)
         candidate = ""  # a distinct foreign object we could not show is protected
         protected = ""  # a protected foreign object this one principal could read
+        protected_at = (None, "")
+        # Why a two-principal ownership check cannot run ("" when it can). When it
+        # can, every foreign id is tried for one a second identity owns; otherwise
+        # the first protected object ends the probe, as before.
+        unready = self._two_principal_ready()
+        two_why = ""
         failures = SendFailures()
         for cand in foreigns:
             foreign_url = _with_id(exchange, kind, key, cand)
@@ -396,19 +552,57 @@ class IdorReadValidator(Validator):
                     f"{source.replace('_', '-')} ownership, so reading it is not a crossing")
                 continue
             # V2: the object is protected and this session reads it, but one
-            # principal cannot show it belongs to someone else.
+            # principal cannot show it belongs to someone else -- unless the run's
+            # self-observed ownership (opt-in) and a second identity can.
+            if not unready:
+                shown, why = await self._two_principal(
+                    exchange, foreign_url, b_own, b_f, _object_markers(b_f, b_own, b_miss),
+                    anon_headers)
+                if shown:
+                    return ValidationResult(
+                        self.name, "confirmed", "idor", confidence=0.9, confirmed=True,
+                        summary=(f"IDOR confirmed: changing the {kind} id {key!r} returned another "
+                                 f"account's protected object to this session (two principals)"),
+                        evidence=(f"As the captured principal ({shown['a']}), {exchange.method} with the "
+                                  f"{kind} id {key!r} set to a foreign value returned a substantive "
+                                  f"object (HTTP {s_f}) that differs from this principal's own object "
+                                  f"and a known-absent id (HTTP {s_miss}); the same read without "
+                                  f"credentials was refused ({denied}). Self-observed ownership, two "
+                                  f"principals: the object's owner field {shown['field']} holds the "
+                                  f"{shown['kind']} of run identity {shown['b']}'s own account (from "
+                                  f"its credentials), whose own session reads the same object (HTTP "
+                                  f"{shown['status']}), while this principal's own object carries this "
+                                  f"principal's different {shown['kind']} at that field. The other "
+                                  f"object's contents and the account values are redacted; the probe "
+                                  f"was read-only."))
+                two_why = two_why or why
+            if not protected:
+                protected_at = (s_f, denied)
+            protected = protected or "protected"
+            if unready:
+                break
+        if protected:
+            s_f, denied = protected_at
+            if unready:
+                detail = (f"{unready}; an operator declaration of the object's owner "
+                          f"(authz.owners) or authz.self_observed_ownership with a second "
+                          f"registered identity whose credentials name the owning account would "
+                          f"let this leg confirm")
+            else:
+                detail = (f"the two-principal check found no other run identity owning a protected "
+                          f"foreign object: {two_why or 'no owner evidence'}; an operator "
+                          f"declaration of the owner (authz.owners) would let this leg confirm")
             protected = (
                 f"As the captured principal, {exchange.method} with the {kind} id {key!r} set to a "
                 f"foreign value returned a substantive object (HTTP {s_f}) that differs from both "
                 f"this principal's own object and a known-absent id (HTTP {s_miss}). The same read "
                 f"without credentials was refused ({denied}), so the object is protected. That "
                 f"does not show it belongs to another user: this principal may own both objects. "
-                f"Missing evidence: a second identity, so the cross-identity check can show the "
-                f"object's owner and that this principal should be denied it (register its "
-                f"session via POST /identities/session-headers), or a manual check that the "
-                f"object belongs to another user. The other object's contents are redacted; the "
-                f"probe was read-only (no write or delete).")
-            break
+                f"Missing evidence: a second identity shown to own the object ({detail}), so the "
+                f"cross-identity check can show the object's owner and that this principal should "
+                f"be denied it (register its session via POST /identities/session-headers), or a "
+                f"manual check that the object belongs to another user. The other object's "
+                f"contents are redacted; the probe was read-only (no write or delete).")
         if protected:
             return ValidationResult(
                 self.name, "inconclusive", "idor", confidence=0.5, confirmed=False,

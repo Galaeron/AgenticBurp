@@ -1,4 +1,4 @@
-# Current state — 2026-11-14 (earlier runs and merges: git history of this file)
+# Current state — 2026-11-16 (earlier runs and merges: git history of this file)
 
 ## Branch and base
 - `main` = `port/wstg-ids-2026-11-14` on `integrate/main-2026-11-14` (base `979803d5`).
@@ -16,7 +16,19 @@
   `write_integrity` needs `validators.active_enabled` and `allow_mutating_replay` (both false;
   docs/WRITE_CHECKS.md); route probes, file uploads and discovery recursion are off.
 - SKL-1 race: a generic burst is a lead; only the email race read-back confirms.
-- Not on main: `fcb96d62` (owner decision below); `WorkingSunday`,
+- PR #30 (`fix/oracle-leg-gaps-20261114` off main `1f632169`), merged only after its CI full
+  suite passed. It holds the leg fixes from the oracle run (nosql, file_upload, xxe, race,
+  auth_sequence, listing logs, idor, api_security, sequence, client_trust, write_integrity;
+  docs/WRITE_CHECKS.md) and tests `test_oracle_gaps_*.py`. Four branches were merged into it:
+  - write safety (`de2207f8`, `c0e70ac2`): file_upload sends through the run's gate; a
+    verb_tamper create is deleted and verified, or named;
+  - WG-2 item 5 (`e4bdf94c`);
+  - coverage-drive throughput (`dcedade9`);
+  - `fix/crawl-check-20261115`: SPA script bodies bounded in bytes, the spec behind a docs
+    page, a stored_xss plant per field, route probes as a new document, script-driven
+    upload forms.
+- Not on main: `feat/scoreboard-scorer-20261116` (worktree `scorer-20261116`); `fcb96d62`
+  (owner decision below); `WorkingSunday`,
   `main-checkout-snapshot-20261101` and the `origin/vibe/*` branches (old or superseded).
 
 ## Checkout
@@ -26,15 +38,18 @@
   exist nowhere else. Split it per docs/I01_CANDIDATE_MANIFEST_2026-10-17.md.
 
 ## Verification
-- Port tip `27ae9e3e`, 2026-11-14, Windows, system Python 3.14.7: smoke (182 tests and
-  coverage gate) and precondition (74 tests) exit 0; `6db01d2d` alone failed smoke's gate
-  (its SESS-06/BUSL-08 evidence tests were not in smoke). Full not rerun on 6db01d2d; the
-  owner chose to reuse the earlier verification (2026-11-14): `9fab7470`, WG-2 Results.
-- `integrate/main-2026-11-14` `9fab7470`, 2026-11-14, Windows, system Python 3.14.7:
-  smoke, precondition and full exit 0 (harness 6419, native 38, evaluation 452 / 17
-  skips, integrity 59). burp-extension is unchanged, so Java was not rerun.
-- `main` `a3681c5`, 2026-11-01, Linux, Python 3.13: Java 379 tests, 0 failures. CI runs
-  Python 3.14; its full job installs Playwright + Chromium.
+- PR #30 code at `71a4df23`, 2026-11-16, system Python 3.14.7: smoke and precondition (74)
+  exit 0; the 33 test modules for the changed files, 588 OK. The full suite ran in PR #30's
+  CI (3.14), not again locally. Each merged branch passed full on 3.14 before its merge.
+- `fix/crawl-check-20261115` at `4b3a7062`, 2026-11-16, system Python 3.14.7: smoke (182) and
+  precondition (74) exit 0; full exit 0 (harness 6633, evaluation 452 / 17 skips, integrity 59).
+- This branch, 2026-11-15, system Python 3.14.7: smoke and precondition exit 0; the 97
+  modules touching the changed legs, 2036 OK; full exit 0 (harness 6608, native 38, eval 452).
+- Main tip `27ae9e3e`, 2026-11-14, system Python 3.14.7: smoke and precondition exit 0. Full
+  not rerun there; the owner reused `9fab7470`'s (2026-11-14).
+- `9fab7470`, 2026-11-14, system Python 3.14.7: smoke, precondition and full exit 0 (harness
+  6419, native 38, evaluation 452 / 17 skips, integrity 59). Java not rerun (unchanged).
+- Java: `a3681c5`, 2026-11-01, Linux, 379 tests, 0 failures. CI: Python 3.14 + Playwright Chromium.
 - Verify in an in-repo worktree, `PYTHONPATH=<worktree>`, system Python (not
   `.venv-rationalisation`). Defender deletes `file_upload_agent.py` under %TEMP%.
 - Java: `gradle clean test shadowJar` on the in-repo JDK 17 (`.audit-external/toolchains/jdk17`),
@@ -46,36 +61,47 @@
 - `ollama.api: "openai"` sends model calls to llama-server (OpenAI-compatible) at `base_url`.
 
 ## Live runs (owned Juice Shop on 127.0.0.1:3002 only; sqlmap only from `harness/sqlmap:1.10.9`)
-- r10 (job 9eb242afd5a0, run/r10 `8727c42d`, llama.cpp gpt-oss-20b, :3004): done in
-  23.1 h, 236,966 requests, 1,181 findings, 138 confirmed; 912 coverage legs unrun at
-  budget. Target solved 13/116 (5 confirmed, 3 proven but unbound, 5 unreported; binding
-  fixed by `d9e1b3c4` + `d52e99f5`). XSS never confirmed. Files (main checkout):
-  `.test-work/juice-shop-24h-20261111-r10/`, `-20h-20261110-r9/`.
+- r10 (job 9eb242afd5a0, `8727c42d`, gpt-oss-20b, :3004): 23.1 h, 236,966 requests, 138 of
+  1,181 findings confirmed, 912 legs unrun at budget; 13/116 solved; no XSS confirmed.
+  Files (main checkout): `.test-work/juice-shop-24h-20261111-r10/`, `-20h-20261110-r9/`.
 - 2026-11-14, fresh :3002, main checkout `.test-work/`: validator trial (each new leg alone,
   `validator-trial-20261114/`) 13 confirmed, race a lead, restores verified. Oracle run (each
-  leg aimed at its endpoint by hand, 6db01d2d): 20 of 98 solved (r10: 13); leg false
-  negatives and orchestrator gaps in `oracle-juice-shop-20261114/README.md`, fix order open.
+  leg aimed at its endpoint by hand): 6db01d2d 22 of 60 confirmed, 20 of 98 solved (r10: 13);
+  this branch (pass 3) 31 confirmed, 23 solved, none worse. `oracle-juice-shop-20261114/README.md`.
+- 2026-11-16 crawl check (build_engagement + feature crawl, anonymous and one user, fresh :3002,
+  `.test-work/crawl-check-20261115/crawl4`): reaches POST /file-upload (held capture),
+  /b2b/v2/orders, `#/track-result?id` (probe), POST /dataerasure and the /profile forms; not
+  /support/logs or /encryptionkeys (linked nowhere; wordlist only, ffuf was off).
 
 ## Open work (priority order)
-1. WG-2 item 5: `_LEG_CONFIRMATIONS` gaps in harness/coverage_tracker.py. Still open from
-   the WSTG review: INJT-14 has no row, ATHN-04 has no bypass leg, WG-4 needs an owner
-   decision, WG-5 needs a mail sink (IMPROVEMENT_BACKLOG.md WG-*).
+0. Owner: may real runs set `validators.write_integrity.allow_unrestorable_self_service_creates`
+   (sign-up accounts left, each named)? Not leg gaps: client-rendered stored XSS with a crawl's
+   route map (crawl check): feedback is sanitized server-side; product reviews render only in a
+   dialog a click opens, and no crawl records it (needs click-driven exploration). Default-
+   credential guessing (ATHN-02) was declined in the backlog.
+1. Still open from the WSTG review: INJT-14 has no row, ATHN-04 has no bypass leg, WG-4
+   needs an owner decision, WG-5 needs a mail sink (IMPROVEMENT_BACKLOG.md WG-*). WG-2 item 5
+   is done: client_trust, websocket and oauth are drive legs; crypto, recon, cache poisoning
+   and subdomain_takeover stay undriven (reasons in `UNDRIVEN_ROW_CONFIRMATIONS`).
 2. A full Juice Shop run on the merge (the legs passed alone; JWT captured-key confusion,
    file_upload, SPA crawl, the WG auth rows and SESS-06 were not exercised). r10
    leftovers: compare result.json with r9; find the check that sent ~10k/h to
    socket.io polling at h4-5; cross_identity still repeats across findings.
 3. Owner review of `8040dbf5` (policy reads a decoded NUL both ways, on main).
-4. r6 follow-ups, if r7-r10 did not close them: time for the coverage drive and end-of-job
-   accounting; passive-leg proofs carry exchange artifact ids. Briefs T1-T6:
-   `.test-work/r5-r6-detection-analysis-20261109/ANALYSIS.md` (main checkout). Review
-   leftovers: tool-reported sqlmap rows keep confirmed=True for worklist stop logic; a
-   resumed journal can skip the query probe (worklist_investigator.py); skipped keys
-   advance the lower-tier rotation (assessment_health.py).
+4. r6 follow-ups (coverage-drive time, end-of-job accounting, passive proofs with artifact
+   ids; briefs T1-T6 in `.test-work/r5-r6-detection-analysis-20261109/ANALYSIS.md`) and review
+   leftovers (sqlmap rows keep confirmed=True for stop logic; a resumed journal can skip the
+   query probe; skipped keys advance the lower-tier rotation).
 5. Owner check: SESS-05 now drives the csrf leg (0.4 observation without a browser
    PoC; replays need allow_mutating_replay). Keep it, or set the row back to manual.
 6. Proof/issue dedup (owner, 2026-10-28): one vulnerability, one proof, keyed on host,
    mechanism, principal and check family; other routes become affected locations.
-7. Coverage drive throughput (v8: 110 of 1380 queued sent, 1270 incomplete attempts).
+7. Coverage drive throughput (v8: 110 of 1380 queued sent, 1270 incomplete attempts; r10: 912
+   cells budget_exhausted). Fixed offline (`dcedade9`): time-fair order under a deadline,
+   unbuilt captures never hide one that ran, all-declined inputs read leg_precondition_unmet.
+   Open: request-level legs never credit per-parameter siblings (nosql needs a path remainder
+   first); registry-covered copies with 0 sends never conclude; cases come from the endpoint
+   template, not each identity's captures. A live run measures the gain.
 8. `redact_headers` has no X-CSRF-Token entry; harness/active_verification.py falls back
    to llama3.1:8b (Burp validation only); 3acd392 has had no live run. Code review 02
    RV-K, I16 wiring, RV-O to RV-S residuals: docs/CODE_REVIEW_02_TRIAGE_2026-10-19.md.

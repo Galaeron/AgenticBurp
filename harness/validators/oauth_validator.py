@@ -34,6 +34,18 @@ if TYPE_CHECKING:
 log = logging.getLogger("harness.validators.oauth")
 
 
+def has_oauth_shape(exchange) -> bool:
+    """Whether at least one of this validator's checks applies to the exchange's URL
+    (the same conditions each _check_* method tests). Without one, validate() skips."""
+    parsed = urlparse(getattr(exchange, "url", "") or "")
+    qs = parse_qs(parsed.query)
+    fragment = parse_qs(parsed.fragment) if parsed.fragment else {}
+    return bool(("response_type" in qs and "client_id" in qs)
+                or qs.get("response_type", [None])[0] == "code"
+                or "access_token" in qs or "access_token" in fragment or "code" in qs
+                or (qs.get("redirect_uri", [None])[0] and "client_id" in qs))
+
+
 @dataclass
 class OAuthTestResult:
     test_name: str

@@ -235,6 +235,12 @@ def _declared_url(current: str, path: str, hash_hint: bool) -> str | None:
     return resolve_view(current, path)
 
 
+async def _open_probe(adapter, target: str) -> None:
+    """A route probe's load: a new document when the adapter can (`open_fresh`)."""
+    open_fresh = getattr(adapter, "open_fresh", None)
+    await (open_fresh(target) if callable(open_fresh) else adapter.open(target))
+
+
 UPLOAD_CAPABILITY = "file_upload_capture"
 
 
@@ -323,7 +329,10 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
 
     `route_probes` > 0 loads up to that many views once more, by GET navigation,
     with a marker value in each parameter name the same-origin scripts read
-    (client_routes.read_names_of) and the view does not carry yet. A name whose
+    (client_routes.read_names_of) and the view does not carry yet. An adapter with
+    `open_fresh()` loads the probe as a new document: a hash change to the view
+    just shown keeps it mounted, and a view that reads its query once, when it
+    mounts, would never see the markers. A name whose
     marker the rendered view shows (`text()`: the visible text and the form
     values) or sends in a call is a route input of that view (`probes`). Its own
     cap, apart from max_views; a probe the app does not stay on records nothing,
@@ -425,7 +434,7 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
             return
         probe_room -= 1
         try:
-            await adapter.open(target)
+            await _open_probe(adapter, target)
         except ViewRefused as exc:
             result.skip("refused_redirect")
             result.refused.append(f"probe {key}: {exc}")

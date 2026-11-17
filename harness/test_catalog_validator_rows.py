@@ -11,7 +11,10 @@ Pins:
   - the stale kinds WG-2 fixed (CSRF, NoSQL, SESS-01) and the MFA binding move;
   - caller level: a CoverageTracker built over an engagement marks each new row
     applicable only on the exchange shape its leg needs, and the coverage driver
-    offers the new leg-backed rows (auth_sequence, verb_tamper) as pending cells.
+    offers the new leg-backed rows (auth_sequence, verb_tamper) as pending cells;
+  - WG-2 item 5: every row kind is a drive leg or undriven with a reason
+    (`coverage_tracker.leg_table_problems`, with negative controls), and the
+    driver offers client_trust, websocket and oauth cells only where they apply.
 """
 from __future__ import annotations
 
@@ -24,7 +27,10 @@ from harness.coverage_model import (
     CHECK_CATALOG, CHECKS_BY_ID, EXCLUDED_CATALOG_ROWS, NON_VALIDATOR_CONFIRMATIONS,
     VALIDATOR_ROW_EXCLUSIONS, CellStatus, catalog_kind_problems,
 )
-from harness.coverage_tracker import CoverageTracker, endpoint_view
+from harness.coverage_tracker import (
+    _LEG_CONFIRMATIONS, UNDRIVEN_ROW_CONFIRMATIONS, CoverageTracker, endpoint_view,
+    leg_table_problems,
+)
 from harness.safety_gate import reset_default_gate
 from harness.validators.registry import ValidatorRegistry
 
@@ -91,6 +97,43 @@ class KindAuditTests(unittest.TestCase):
         self.assertEqual(rows, ["WSTG-INJT-05: on the excluded-row list but has a row"])
 
 
+class DriveLegTableTests(unittest.TestCase):
+    """WG-2 item 5: every row kind is either a coverage-drive leg or listed as
+    undriven with the reason its verdict cannot answer the row."""
+
+    def test_shipped_leg_table_has_no_problems(self):
+        self.assertEqual(leg_table_problems(CHECK_CATALOG), [])
+
+    def test_added_and_rejected_kinds(self):
+        for name in ("client_trust", "websocket", "oauth"):
+            self.assertIn(name, _LEG_CONFIRMATIONS)
+        self.assertEqual(set(UNDRIVEN_ROW_CONFIRMATIONS),
+                         {"crypto", "recon", "web_cache_poisoning", "subdomain_takeover"})
+        for name, why in UNDRIVEN_ROW_CONFIRMATIONS.items():
+            self.assertNotIn(name, _LEG_CONFIRMATIONS)
+            self.assertTrue(why.strip(), name)
+        # Each added leg is the confirmation of exactly the row it now drives.
+        for check_id, name in (("WSTG-BUSL-02", "client_trust"), ("WSTG-CLNT-10", "websocket"),
+                               ("WSTG-ATHZ-05", "oauth")):
+            self.assertEqual(CHECKS_BY_ID[check_id].confirmation, name)
+
+    def test_problems_are_reported(self):
+        # Negative controls: an undocumented kind, a kind on both lists, a blank
+        # reason and a stale entry are each reported.
+        dropped = _LEG_CONFIRMATIONS - {"oauth"}
+        self.assertEqual(leg_table_problems(CHECK_CATALOG, legs=dropped), [
+            "oauth: row kind is neither a drive leg nor undriven with a reason"])
+        both = _LEG_CONFIRMATIONS | {"crypto"}
+        self.assertEqual(leg_table_problems(CHECK_CATALOG, legs=both), [
+            "crypto: both a drive leg and undriven"])
+        blank = {**UNDRIVEN_ROW_CONFIRMATIONS, "recon": " "}
+        self.assertEqual(leg_table_problems(CHECK_CATALOG, undriven=blank), [
+            "recon: undriven with no reason"])
+        stale = _LEG_CONFIRMATIONS | {"gone_leg"}
+        self.assertEqual(leg_table_problems(CHECK_CATALOG, legs=stale), [
+            "gone_leg: in the leg table but no row names it (stale entry)"])
+
+
 class FixedKindTests(unittest.TestCase):
     def test_stale_kinds_now_name_their_validator(self):
         self.assertEqual(CHECKS_BY_ID["WSTG-SESS-05"].confirmation, "csrf")
@@ -116,11 +159,12 @@ _DENIED = "GET /api/admin/report"
 _CART = "POST /api/cart"
 _NOTES = "GET /api/notes"
 _NOTE_W = "POST /api/notes"
+_PLAN = "POST /api/subscription"   # a server-owned plan field, no price/amount key
 
 
 def _engagement():
     st = engagement.EngagementState(host="t.test")
-    for key in (_LOGIN, _WS, _OAUTH, _DENIED, _CART, _NOTES, _NOTE_W):
+    for key in (_LOGIN, _WS, _OAUTH, _DENIED, _CART, _NOTES, _NOTE_W, _PLAN):
         method, _, path = key.partition(" ")
         st._ep(method, path)
     st.endpoints[_LOGIN].template = {"method": "POST", "query": "",
@@ -137,6 +181,8 @@ def _engagement():
                                     "content_type": "application/json", "object_id": None}
     st.endpoints[_NOTE_W].template = {"method": "POST", "query": "", "body": '{"title": "t"}',
                                       "content_type": "application/json", "object_id": None}
+    st.endpoints[_PLAN].template = {"method": "POST", "query": "", "body": '{"plan": "basic"}',
+                                    "content_type": "application/json", "object_id": None}
     return st
 
 
@@ -150,7 +196,7 @@ _EXPECTED_ONLY = {
     "WSTG-CLNT-10": {_WS},
     "WSTG-ATHZ-05": {_OAUTH},
     "WSTG-INJT-03": {_DENIED},
-    "WSTG-BUSL-02": {_CART},
+    "WSTG-BUSL-02": {_CART, _PLAN},   # client_trust's own trust-field recogniser
     "WSTG-CONF-13": {_DENIED},
     "WSTG-INJT-17": {_WS, _OAUTH, _DENIED, _NOTES},
 }
@@ -195,6 +241,18 @@ class CallerLevelCoverageTests(unittest.TestCase):
         self.assertNotIn((_NOTES, "WSTG-INJT-03"), cells)
         # SESS-01 moved to reset_token, so the auth_sequence driver no longer offers it.
         self.assertNotIn((_LOGIN, "WSTG-SESS-01"), cells)
+
+    def test_driver_offers_the_wg2_item5_legs(self):
+        # client_trust, websocket and oauth are drive legs: their applicable cells
+        # are pending for the driver with no agent label.
+        cells = {(ep, c.id) for _, ep, c in
+                 self.tracker.pending_leg_cells({"client_trust", "websocket", "oauth"})}
+        self.assertEqual(cells, {(_CART, "WSTG-BUSL-02"), (_PLAN, "WSTG-BUSL-02"),
+                                 (_WS, "WSTG-CLNT-10"), (_OAUTH, "WSTG-ATHZ-05")})
+        # Negative control: a driver without those legs is offered none of the cells.
+        others = {(ep, c.id) for _, ep, c in
+                  self.tracker.pending_leg_cells(_LEG_CONFIRMATIONS - {"client_trust", "websocket", "oauth"})}
+        self.assertFalse({c for _, c in others} & {"WSTG-BUSL-02", "WSTG-CLNT-10", "WSTG-ATHZ-05"})
 
 
 if __name__ == "__main__":

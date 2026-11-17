@@ -147,17 +147,154 @@ def _secret_value(value) -> bool:
             and not _MASK_RE.search(text) and not re.search(r"\s", text))
 
 
+# Credential material recognised by value shape. A crypt/PHC hash (bcrypt,
+# argon2, pbkdf2, scrypt, sha-crypt) is a password hash under any key; a bare
+# hex or base64 digest is one only under a password-named key (a checksum,
+# etag or content hash is not); a base32 seed is a TOTP secret only under a
+# one-time-password-named key.
+_CRYPT_HASH = re.compile(
+    r"^(?:\$(?:2[abxy]?|argon2(?:id|i|d)|pbkdf2(?:-sha\d+)?|scrypt|sha(?:256|512)|[1356]|apr1|y|7)"
+    r"\$[./A-Za-z0-9$=,+-]{16,}"
+    r"|(?:pbkdf2_sha(?:1|256|512)|bcrypt(?:_sha256)?|argon2|scrypt)\$[./A-Za-z0-9$=,+-]{16,})$")
+_HEX_DIGEST = re.compile(r"^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{56}|[0-9a-fA-F]{64}"
+                         r"|[0-9a-fA-F]{96}|[0-9a-fA-F]{128})$")
+_B64_DIGEST = re.compile(r"^[A-Za-z0-9+/]{22,88}={0,2}$")
+_BASE32_SEED = re.compile(r"^[A-Z2-7]{16,64}=*$")
+_PASSWORD_WORDS = frozenset({"password", "passwd", "pwd", "pass", "passphrase", "passcode"})
+_OTP_WORDS = frozenset({"totp", "otp", "mfa", "2fa", "twofactor", "authenticator"})
+_SEED_WORDS = frozenset({"secret", "seed", "key"})
+# Words that make a key a checksum, an id or an attribute of a credential, never
+# the credential itself.
+_NOT_MATERIAL_WORDS = frozenset({
+    "checksum", "etag", "integrity", "fingerprint", "id", "uuid", "guid", "hint", "policy",
+    "type", "length", "len", "at", "expires", "expiry", "changed", "reset", "updated",
+    "strength", "rule", "rules", "required", "format", "algorithm", "algo", "version",
+    "count", "attempts", "enabled", "set", "url", "link"})
+
+
+def _credential_material(key, value) -> str:
+    """What credential material `value` under `key` is ("password hash",
+    "password digest", "TOTP secret"), or "" when it is none."""
+    if not isinstance(value, str) or isinstance(value, bool):
+        return ""
+    text = value.strip()
+    words = _key_words(key)
+    if not text or _NOT_MATERIAL_WORDS & set(words[-1:]) or not _secret_value(text):
+        return ""
+    if _CRYPT_HASH.match(text):
+        return "password hash"
+    flat = _field_key(key)
+    password_named = bool(_PASSWORD_WORDS & set(words)) or flat in {"password", "passwordhash", "passwd"}
+    if password_named and (_HEX_DIGEST.match(text) or (
+            _B64_DIGEST.match(text) and re.search(r"[0-9+/]", text) and re.search(r"[A-Z]", text)
+            and re.search(r"[a-z]", text))):
+        return "password digest"
+    if (_OTP_WORDS & set(words) or "totp" in flat or "twofactor" in flat) and (
+            words[-1] in _SEED_WORDS) and _BASE32_SEED.match(text):
+        return "TOTP secret"
+    return ""
+
+
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")
+
+
+def _jwt_claims(value) -> dict | None:
+    """The decoded payload of a JWT string (signature not checked: anyone who
+    holds the token can read it), else None."""
+    import base64
+    if not isinstance(value, str):
+        return None
+    m = _JWT_RE.fullmatch(value.strip())
+    if not m:
+        return None
+    payload = value.strip().split(".")[1]
+    try:
+        claims = jsonlib.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except (ValueError, TypeError):
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def _credential_jwts(headers) -> list[tuple[str, dict]]:
+    """(header name, claims) of each JWT the request's identity credentials carry
+    (an Authorization bearer, a token cookie, an API-token header)."""
+    from harness.security import is_identity_credential_header
+    out = []
+    for name, value in (headers or {}).items():
+        if not is_identity_credential_header(name) and str(name).lower() not in ("authorization", "cookie"):
+            continue
+        for token in _JWT_RE.findall(str(value or "")):
+            claims = _jwt_claims(token)
+            if claims is not None:
+                out.append((str(name), claims))
+    return out
+
+
+def _claim_identity_keys(claims) -> set:
+    """Account keys (the self_ownership forms) a token's claims name: its email
+    and its user id, at the top level or one wrapper down ({"data": {...}})."""
+    from harness.self_ownership import _email_key
+    keys: set = set()
+    if not isinstance(claims, dict):
+        return keys
+    # A wrapped account object's own "id" names the account; a top-level "id"
+    # may be the token's own id, so only user-id claims count there.
+    docs = [(claims, ("userid", "uid", "sub", "accountid"))] + [
+        (v, ("id", "userid", "uid", "accountid")) for v in claims.values() if isinstance(v, dict)]
+    for doc, id_keys in docs:
+        for k, v in doc.items():
+            if isinstance(v, bool) or not isinstance(v, (str, int)) or not str(v).strip():
+                continue
+            fk = _field_key(k)
+            if fk in ("email", "mail") and "@" in str(v):
+                keys.add(_email_key(v))
+            elif fk in id_keys:
+                keys.add("id:" + str(v).strip())
+    return keys - {""}
+
+
+def _claim_hits(name: str, claims: dict) -> list[tuple]:
+    """(claim path, kind) of each credential secret in a token's own claims: a
+    _SELF_SECRETS claim holding a value, or credential material by shape."""
+    hits: list[tuple] = []
+
+    def walk(value, path, depth):
+        if depth > _MAX_WALK_DEPTH:
+            return
+        if isinstance(value, list):
+            for i, item in enumerate(value[:_MAX_LIST_ITEMS]):
+                walk(item, f"{path}[{i}]", depth + 1)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                kind = _credential_material(key, item) or (
+                    "credential secret" if _field_key(key) in _SELF_SECRETS and _secret_value(item) else "")
+                if kind:
+                    hits.append((f"{path}.{key}", kind))
+                if isinstance(item, (dict, list)):
+                    walk(item, f"{path}.{key}", depth + 1)
+
+    walk(claims, f"request.{name}<jwt>", 0)
+    return hits
+
+
 def _owner_keys(value) -> set:
     from harness.self_ownership import _email_key
     text = str(value).strip()
     return {text, "id:" + text} | ({_email_key(value)} - {""})
 
 
+_UNREGISTERED = "unregistered-account:"
+
+
 def _exposure_hits(outcome, accounts: dict, caller_id: str) -> list[tuple]:
     """(field path, owner, object path, value digest) for each unmasked secret
     field on an object owned by exactly one identified account in `accounts`,
     that is either another account's or a _SELF_SECRETS field of the caller's.
-    Only a 2xx JSON answer is read."""
+    Credential material by shape (a password hash or digest under a password
+    key, a TOTP seed: _credential_material) counts on any identified account's
+    object, the caller's included, and on an account object whose email is
+    shown to differ from the caller's (an account no session is registered
+    for). A JWT value is read as its claims. Only a 2xx JSON answer is read."""
     import hashlib
     if not 200 <= (outcome.status or 0) < 300:
         return []
@@ -184,13 +321,25 @@ def _exposure_hits(outcome, accounts: dict, caller_id: str) -> list[tuple]:
             owners = {pid for pid, account in accounts.items() if keys & account}
             # Ambiguous or unknown owner: this object and its children name nobody.
             owner = next(iter(owners)) if len(owners) == 1 else ""
+            emails = {k for k in keys if k.startswith("email:")}
+            mine = {k for k in accounts.get(caller_id, ()) if str(k).startswith("email:")}
+            if not owners and emails and mine and not emails & mine:
+                # An account object whose email is not the caller's: another
+                # account, though no session is registered for it.
+                owner = _UNREGISTERED + sorted(emails)[0].split(":", 1)[1]
             object_path = path
         for key, item in value.items():
             field = _field_key(key)
+            claims = _jwt_claims(item)
+            if claims is not None:
+                walk(claims, f"{path}.{key}<jwt>", owner, object_path, depth + 1)
+            material = bool(_credential_material(key, item))
+            unregistered = owner.startswith(_UNREGISTERED)
             exact = (field in _SECRET_FIELDS and _secret_value(item)
-                     and (owner != caller_id or field in _SELF_SECRETS))
-            # A compound name counts only on another account's object.
-            if owner and (exact or (owner != caller_id and _compound_secret(key, item))):
+                     and ((owner != caller_id and not unregistered) or field in _SELF_SECRETS))
+            # A compound name counts only on a registered other account's object.
+            if owner and (material or exact or (owner != caller_id and not unregistered
+                                                and _compound_secret(key, item))):
                 digest = hashlib.sha256(str(item).encode()).hexdigest()[:16]
                 hits.append((f"{path}.{key}", owner, object_path, digest))
             if isinstance(item, (dict, list)):
@@ -235,8 +384,11 @@ def exposure_fields(text) -> list[str]:
         elif isinstance(value, dict):
             for key, item in value.items():
                 if ((_field_key(key) in _SECRET_FIELDS and _secret_value(item))
-                        or _compound_secret(key, item)):
+                        or _compound_secret(key, item) or _credential_material(key, item)):
                     found.append(f"{path}.{key}")
+                claims = _jwt_claims(item)
+                if claims is not None:
+                    walk(claims, f"{path}.{key}<jwt>", depth + 1)
                 if isinstance(item, (dict, list)):
                     walk(item, f"{path}.{key}", depth + 1)
 
@@ -427,7 +579,7 @@ class ApiSecurityValidator(Validator):
 
         try:
             if exchange.method.upper() in ("POST", "PUT", "PATCH") and exchange.request_body:
-                result = await self._probe_mass_assignment(exchange)
+                result = await self._probe_mass_assignment(exchange, finding)
                 if result is not None:
                     tests.append(result)
 
@@ -459,13 +611,18 @@ class ApiSecurityValidator(Validator):
                 for t in candidate_tests:
                     summary_parts.append(f"  - {t.test_name}: {t.detail}")
             elif incomplete_tests:
-                # L4: a probe that was refused or got no response did not pass.
+                # L4: a probe that was refused, got no response or could not be
+                # made safely did not pass.
                 summary_parts.append(f"API security check incomplete: {len(incomplete_tests)} of "
-                                     f"{len(tests)} probe(s) got no response; not a negative result:")
+                                     f"{len(tests)} probe(s) did not complete; not a negative result:")
                 for t in incomplete_tests:
                     summary_parts.append(f"  - {t.test_name}: {t.detail}")
             else:
                 summary_parts.append("No mass assignment or unbounded resource consumption confirmed")
+                # A create handed to write_integrity says what its read-back showed.
+                for t in tests:
+                    if t.detail.startswith("Create replayed by write_integrity"):
+                        summary_parts.append(f"  - {t.test_name}: {t.detail}")
 
             if vulnerable:
                 status, confidence = "confirmed", 0.75
@@ -548,15 +705,25 @@ class ApiSecurityValidator(Validator):
             return unsent(baseline, "baseline")
         accounts = self._exposure_accounts(identities, run, _principal_for)
         hits = _exposure_hits(baseline, accounts, caller.id)
-        if not hits:
+        # Credential material inside the caller's own session token (a JWT whose
+        # payload carries its password hash or second-factor seed), counted only
+        # when the server accepted that token on this replay: it issued it.
+        token_hits = ([(path, caller.id, f"session token ({name})", kind)
+                       for name, claims in _credential_jwts(headers)
+                       for path, kind in _claim_hits(name, claims)]
+                      if 200 <= (baseline.status or 0) < 300 else [])
+        if not hits and not token_hits:
             return result("not_confirmed", "No unmasked credential secret on an object of an "
-                                           "identified account").with_artifacts(baseline=baseline)
+                                           "identified account, and none in the claims of the "
+                                           "caller's session token").with_artifacts(baseline=baseline)
         attack = await send(True)
         if not attack.ok:
             return unsent(attack, "repeat")
         repeat = {h[:2]: h for h in _exposure_hits(attack, accounts, caller.id)}
         stable = [h for h in hits if repeat.get(h[:2]) == h]
-        if not stable:
+        if not 200 <= (attack.status or 0) < 300:
+            token_hits = []
+        if not stable and not token_hits:
             return result("not_confirmed", "The credential-like value changed between two reads "
                                            "as the same principal (a per-response value, not a "
                                            "stored secret)").with_artifacts(baseline=baseline, attack=attack)
@@ -577,13 +744,20 @@ class ApiSecurityValidator(Validator):
             return unsent(control, "anonymous control")
         anon_leaks = {h[:2] for h in _exposure_hits(control, accounts, caller.id)}
         evidence = " | ".join(
-            f"field={path}; object={obj}; owner={owner}; reader={caller.id}; "
-            f"{'own credential secret' if owner == caller.id else 'another account'}; "
-            f"anonymous read {'also shows it' if (path, owner) in anon_leaks else 'does not'}; "
-            f"value=[withheld]"
-            for path, owner, obj, _digest in stable)
+            [f"field={path}; object={obj}; owner={owner}; reader={caller.id}; "
+             f"{'own credential secret' if owner == caller.id else 'another account'}; "
+             f"anonymous read {'also shows it' if (path, owner) in anon_leaks else 'does not'}; "
+             f"value=[withheld]"
+             for path, owner, obj, _digest in stable]
+            + [f"claim={path}; {kind} in the caller's {where}, which the server accepted on "
+               f"this GET (HTTP {baseline.status}, twice); a JWT payload is readable by anyone "
+               f"holding the token; anonymous read carries no token; value=[withheld]"
+               for path, _owner, where, kind in token_hits])
+        parts = ([f"returns {len(stable)} unmasked credential field(s)"] if stable else []) + (
+            [f"accepts a session token whose payload carries {len(token_hits)} credential "
+             f"secret(s) ({', '.join(sorted({k for *_x, k in token_hits}))})"] if token_hits else [])
         return result("confirmed", f"Credential-secret exposure confirmed: GET {exchange.url} as "
-                                   f"{caller.id} returns {len(stable)} unmasked credential field(s)",
+                                   f"{caller.id} " + " and ".join(parts),
                       evidence).with_artifacts(baseline=baseline, attack=attack, controls=[control])
 
     @staticmethod
@@ -620,16 +794,70 @@ class ApiSecurityValidator(Validator):
             keys = {str(principal.id)}
             if ownership is not None:
                 keys.update(ownership._account(principal))
-            accounts[principal.id] = keys
+            # The account a session's own token names (its email and user id claims).
+            for _name, claims in _credential_jwts(ident.get("headers") or {}):
+                keys.update(_claim_identity_keys(claims))
+            accounts.setdefault(principal.id, set()).update(keys)
         return accounts
 
-    async def _probe_mass_assignment(self, exchange: HttpExchange) -> ApiSecurityTestResult | None:
+    @staticmethod
+    def _captured_create(exchange: HttpExchange) -> bool:
+        """A POST to a collection that the capture shows created an object (201
+        Created, or a Location header): replaying it creates another one."""
+        from .write_integrity_validator import _is_create
+        if not _is_create(exchange):
+            return False
+        headers = {str(k).lower() for k in (exchange.response_headers or {})}
+        return exchange.response_status == 201 or "location" in headers
+
+    async def _probe_create_mass_assignment(self, exchange: HttpExchange, finding) -> ApiSecurityTestResult:
+        """Mass assignment at create, run by write_integrity's create engine on the
+        same run: a uniquified plain create as the positive control, the same
+        create with the canonical privileged fields (role/isAdmin/...), each read
+        back and deleted again under its restore rule. A create this harness
+        cannot undo is not sent here."""
+        from harness.run_context import current_run_context
+        from .write_integrity_validator import MASS_ASSIGNMENT_CREATE, WriteIntegrityValidator
+        name = "Mass Assignment Probe"
+        run = self.run_context or current_run_context()
+        if run is None:
+            return _incomplete(name, "blocked", "A replayed create needs a run (sessions, change "
+                                                "log, restore); nothing was written")
+        wi_cfg = ((getattr(run, "config", None) or {}).get("validators") or {}).get("write_integrity") or {}
+        leg = WriteIntegrityValidator(
+            allowed_hosts=[urlparse(exchange.url).hostname or ""], run_context=run,
+            restore_routes=wi_cfg.get("restore_routes") or (),
+            allow_writes=bool(run.gate.config.allow_mutating_replay))
+        probe = (finding.model_copy(update={"vulnerability_class": MASS_ASSIGNMENT_CREATE})
+                 if finding is not None and hasattr(finding, "model_copy") else None)
+        if probe is None:
+            from harness.models import Finding
+            probe = Finding(vulnerability_class=MASS_ASSIGNMENT_CREATE, severity="medium",
+                            confidence=0.5, summary="mass assignment at create",
+                            evidence="", suggested_test="", basis="derived")
+        got = await leg.validate(probe, exchange)
+        detail = f"Create replayed by write_integrity mass_assignment_create: {got.summary}"
+        evidence = got.evidence or ""
+        if got.status == "confirmed":
+            return ApiSecurityTestResult(name, False, "high", detail, evidence, vulnerable=True)
+        if got.status == "supported":
+            return ApiSecurityTestResult(name, True, "medium", detail, evidence, candidate=True)
+        if got.status == "not_confirmed":
+            return ApiSecurityTestResult(name, True, "low", detail, evidence)
+        kind = "blocked" if got.status in ("skipped", "blocked") else "error"
+        return ApiSecurityTestResult(name, False, "low", detail, evidence, checked=False, incomplete=kind)
+
+    async def _probe_mass_assignment(self, exchange: HttpExchange, finding=None) -> ApiSecurityTestResult | None:
         try:
             body = jsonlib.loads(exchange.request_body)
         except (jsonlib.JSONDecodeError, TypeError):
             return None
         if not isinstance(body, dict):
             return None
+        if self._captured_create(exchange):
+            # Replaying a create verbatim collides with the captured object (a
+            # unique email/username) and leaves an object nobody deletes.
+            return await self._probe_create_mass_assignment(exchange, finding)
 
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in ("content-length", "host")}

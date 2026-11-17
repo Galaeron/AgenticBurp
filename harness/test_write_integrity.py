@@ -475,8 +475,11 @@ class CapabilityTests(_Fixture):
             self.assertEqual((got["status"], got["mechanism_id"]), ("ready", "write_integrity." + kind),
                              check_id)
             on_update = reg.capability_for_check(check, update, run_context=run)
+            # Business-rule tampering and forged authorship have an update path
+            # (snapshot, write, read back, write the snapshot back).
             self.assertEqual(on_update["status"],
-                             "ready" if kind == "business_rule_tamper" else "unsupported", check_id)
+                             "ready" if kind in ("business_rule_tamper", "forged_authorship")
+                             else "unsupported", check_id)
         _, denied_run = self.build(run_writes=False)
         denied = reg.capability_for_check(CHECKS_BY_ID["AV-MASSASSIGN-02"], create,
                                           run_context=denied_run)

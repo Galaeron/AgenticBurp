@@ -572,6 +572,14 @@ def _has_client_value_field(endpoint: dict) -> tuple[bool, str]:
         return False, "no body-bearing write to tamper"
     if any(_CLIENT_VALUE_FIELD.search(k) for k in _query_and_body_keys(endpoint)):
         return True, "write carries a client-supplied value field (price/amount/total)"
+    body = (endpoint.get("template") or {}).get("body") or ""
+    if body:
+        # The leg's own recogniser (payment source, plan/tier, currency, coupon,
+        # role/status flag), so the row applies wherever the leg has a field to tamper.
+        from harness.validators.client_trust_validator import body_trust_fields
+        found = body_trust_fields(body)
+        if found:
+            return True, f"write carries a server-owned {found[0].family} field ({found[0].key})"
     path = (endpoint.get("path", "") or "").lower()
     if any(k in path for k in _CLIENT_VALUE_PATH):
         return True, "write on a cart/checkout/order/payment path"

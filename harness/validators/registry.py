@@ -276,9 +276,12 @@ class ValidatorRegistry:
         # headers. Active; does NOT send blind mutating methods (PUT/DELETE).
         vt_cfg = cfg.get("verb_tamper", {})
         if vt_cfg.get("enabled", True):
+            # An override POST the server ignores can create an object; the
+            # operator's declared restore routes say where it can be deleted.
             self.validators["verb_tamper"] = VerbTamperValidator(
                 allowed_hosts=_allowed, timeout=float(vt_cfg.get("timeout", 10.0)),
-                try_mutating_methods=bool(vt_cfg.get("try_mutating_methods", False)))
+                try_mutating_methods=bool(vt_cfg.get("try_mutating_methods", False)),
+                restore_routes=(cfg.get("write_integrity", {}) or {}).get("restore_routes") or ())
         # CSRF leg -- deterministic property check: replays a state-changing
         # request without the CSRF token and checks SameSite. Active; mutating
         # replay gated by allow_mutating_replay.
@@ -604,10 +607,10 @@ class ValidatorRegistry:
             if check.id != "WSTG-IDNT-04" and (not password or not user):
                 return decision("needs_prerequisite", "missing_credentials", "captured username/password fields are required")
         if family == "nosql":
-            from .nosql_validator import _login_boundary, operator_targets
+            from .nosql_validator import _login_boundary, operator_targets, path_id_segments
             if _login_boundary(exchange):
                 mechanism = "nosql.login_operator"
-            elif operator_targets(exchange):
+            elif operator_targets(exchange) or path_id_segments(exchange):
                 # r7: the finding's own request, one parameter at a time.
                 mechanism = "nosql.operator_differential"
             else:
@@ -664,17 +667,49 @@ class ValidatorRegistry:
             if method == "DELETE" and str(self._xid_cfg.get("delete_restore_method", "")).upper() != "PUT":
                 return decision("needs_prerequisite", "missing_restore_contract", "DELETE requires an explicit PUT recreation contract")
         if family == "write_integrity":
-            from .write_integrity_validator import BUSINESS_RULE_TAMPER, kind_for, _is_create, _json_object
+            from .write_integrity_validator import (BUSINESS_RULE_TAMPER, FORGED_AUTHORSHIP, kind_for,
+                                                    _is_create, _json_object)
             kind = kind_for(finding_class, exchange)
             if method not in {"POST", "PUT", "PATCH"} or kind is None:
                 return decision("unsupported", "unsupported_method", "write checks need a captured JSON create or update")
             if _json_object(exchange.request_body) is None:
                 return decision("needs_prerequisite", "missing_json_body", "a captured JSON object body is required")
-            if not _is_create(exchange) and kind != BUSINESS_RULE_TAMPER:
+            if not _is_create(exchange) and kind not in (BUSINESS_RULE_TAMPER, FORGED_AUTHORSHIP):
                 return decision("unsupported", "unsupported_method", "this write check needs a POST create to a collection")
             if run_context is None or not run_context.gate.config.allow_mutating_replay:
                 return decision("policy_denied", "mutating_policy_denied", "write checks require explicit mutating replay permission")
             mechanism = "write_integrity." + kind
+        if family == "client_trust":
+            # WG-2 item 5: the tamper is a write and a granted plan/membership may
+            # have no undo, so the drive needs explicit mutating permission too.
+            from .client_trust_validator import has_trust_shape
+            if method not in {"POST", "PUT", "PATCH"}:
+                return decision("unsupported", "unsupported_method",
+                                "client-trust tampers a captured POST/PUT/PATCH write")
+            if not has_trust_shape(exchange):
+                return decision("unsupported", "no_trust_field",
+                                "the captured body has no server-owned field to tamper")
+            if run_context is None or not run_context.gate.config.allow_mutating_replay:
+                return decision("policy_denied", "mutating_policy_denied",
+                                "client-trust tampers require explicit mutating replay permission")
+            mechanism = "client_trust.tamper"
+        if family == "websocket":
+            # Cross-site hijacking rides the cookie a browser attaches on its own;
+            # a long-poll capture is not a WebSocket handshake.
+            from .websocket_validator import ambient_cookie
+            if is_polling_transport(exchange.url or ""):
+                return decision("unsupported", "polling_transport",
+                                "the capture is a long-polling request, not a WebSocket handshake")
+            if not ambient_cookie(exchange):
+                return decision("unsupported", "no_ambient_credential",
+                                "cross-site WebSocket hijacking needs a cookie-bearing handshake")
+            mechanism = "websocket.cross_origin_handshake"
+        if family == "oauth":
+            from .oauth_validator import has_oauth_shape
+            if not has_oauth_shape(exchange):
+                return decision("unsupported", "not_an_oauth_request",
+                                "no OAuth authorization or token parameters in the captured URL")
+            mechanism = "oauth.flow_checks"
         if check.id == "WSTG-ATHZ-04":
             from .idor_read_validator import _locate_id
             if not _locate_id(exchange):

@@ -26,6 +26,7 @@ from harness.circuit_breaker import get_ollama_circuit_breaker
 from harness.run_context import transport_for, ExecutionOutcome, case_scope, count_sends
 from harness.execution_registry import ExecutionRegistry
 from harness.validators.injection_targets import REQUEST_LEVEL_INPUTS, case_target
+from harness.coverage_model import derive_input_cases_from_template
 from harness import run_journal
 from harness import review_overlap
 # FR-6: need the module too (the driver scope reads its ambient run) -- aliased for the
@@ -39,6 +40,18 @@ from harness.objective_profiles import ObjectiveTask
 # FR-6 (F10) sentinel appended to a header value to make it a genuinely invalid
 # credential control -- see `_invalidated_headers` below.
 _FR6_INVALID_SENTINEL = "_fr6_invalid"
+
+
+# Case locations a capture's own template names its inputs at
+# (coverage_model.derive_input_cases_from_template).
+_CAPTURE_INPUT_LOCATIONS = frozenset({"query", "body_form", "body_json"})
+
+
+def _unbuilt(result):
+    """Mark a coverage-drive result for a capture no request was built from: the
+    capture lacked what the leg needs, so nothing was sent. Returns `result`."""
+    result.replay_unbuilt = True
+    return result
 
 
 _FOLDED_SUMMARY_KEYS = frozenset({"eligible", "investigated", "extra_probes", "skipped",
@@ -2654,12 +2667,17 @@ class ChainMixin:
                     "open_redirect": _redir, "sequence": _seq, "deserialization_oob": _deser,
                     "auth_sequence": _auth, "rate_limit": _rate, "reset_token": _reset,
                     "dom_xss": _domxss, "toctou": _toctou, "write_integrity": _wi,
+                    # Its override POSTs can create; they are undone through the
+                    # same restore routes as write_integrity's creates.
                     "verb_tamper": VerbTamperValidator(allowed_hosts=self.allowed_hosts,
-                                                         run_context=run_context),
+                                                         run_context=run_context,
+                                                         restore_routes=_wi_cfg.get("restore_routes") or (),
+                                                         route_inventory=lambda: list(state.endpoints)),
                     "csrf": CsrfValidator(allowed_hosts=self.allowed_hosts,
                                            run_context=run_context),
                     "nosql": _nosql,
-                    "file_upload": FileUploadValidator(allowed_hosts=self.allowed_hosts),
+                    "file_upload": FileUploadValidator(allowed_hosts=self.allowed_hosts,
+                                                         run_context=run_context),
                 }
                 _sqlmap_inst = self.validator_registry.validators.get("sqlmap")
                 if _sqlmap_inst is not None:
@@ -2670,10 +2688,13 @@ class ChainMixin:
                 # security_headers, error_handling and content_exposure are passive:
                 # they judge the captured response. listing_exposure, filter_bypass,
                 # metrics_exposure, sensitive_file and well_known send GETs (exposure_leads).
+                # client_trust (BUSL-02), websocket (CLNT-10) and oauth (ATHZ-05) each
+                # answer one row; capability_for_check holds their gates and shapes.
                 for name in ("csp", "cors", "header_injection", "http_request_smuggling",
                              "race_condition", "security_headers", "error_handling",
                              "content_exposure", "listing_exposure", "filter_bypass",
-                             "metrics_exposure", "sensitive_file", "well_known"):
+                             "metrics_exposure", "sensitive_file", "well_known",
+                             "client_trust", "websocket", "oauth"):
                     registered = self.validator_registry.validators.get(name)
                     if registered is not None:
                         _val_by_conf[name] = self.validator_registry.bind_run_context(
@@ -2761,8 +2782,10 @@ class ChainMixin:
                         from harness.validators.base import ValidationResult
                         status = ("blocked" if capability["status"] == "policy_denied" else
                                   "inconclusive" if capability["status"] == "needs_prerequisite" else "skipped")
-                        return ValidationResult(check.confirmation, status, check.vulnerability_class,
+                        refused = ValidationResult(check.confirmation, status, check.vulnerability_class,
                             summary=f"{capability['reason_code']}: {capability['reason']}")
+                        # Nothing was sent; a missing prerequisite is this capture's.
+                        return _unbuilt(refused) if capability["status"] == "needs_prerequisite" else refused
                     try:
                         leg_case = self._coverage_case(identity=identity, check=check, exchange=ex,
                                                        case_key=case_key, run_context=run_context)
@@ -2938,13 +2961,27 @@ class ChainMixin:
                     outcomes, held_back = [], []
                     share_key = (ep_key, check.id) + (
                         (identity,) if check.confirmation in _PER_IDENTITY_SHARE else ())
+                    # A per-parameter dispatch of a query or body input replays only
+                    # the captures that carry that input; any other capture cannot
+                    # test it, and the leg would only decline it.
+                    named = ((case_key.parameter_location, case_key.parameter_name)
+                             if case_target(check.confirmation, case_key) is not None
+                             and case_key.parameter_location in _CAPTURE_INPUT_LOCATIONS else None)
                     for node in worklist_investigator.captured_nodes(
                             dict(ep.to_dict(), capture_variants=variants), base_url, selected_roles,
                             include_probes=True):
                         problem = worklist_investigator.capture_problem(node)
                         if problem:
-                            outcomes.append(_VR(check.confirmation, "inconclusive", check.vulnerability_class,
-                                                summary=problem + ": supply a complete authorized capture"))
+                            outcomes.append(_unbuilt(_VR(
+                                check.confirmation, "inconclusive", check.vulnerability_class,
+                                summary=problem + ": supply a complete authorized capture")))
+                        elif named is not None and named not in {
+                                (c.parameter_location, c.parameter_name)
+                                for c in derive_input_cases_from_template(node.get("template"))}:
+                            outcomes.append(_unbuilt(_VR(
+                                check.confirmation, "skipped", check.vulnerability_class,
+                                summary=f"no capture of this identity carries {case_key.label()}, "
+                                        "so this leg cannot test it on its own; nothing was sent")))
                         elif (_endpoint_check_cap is not None
                               and _endpoint_check_spent.get(share_key, 0.0) >= _endpoint_check_cap):
                             # A started replay always finishes; only the next one waits.
@@ -2978,6 +3015,16 @@ class ChainMixin:
                     # the cell, so it never hides another capture's verdict.
                     if check.confirmation in coverage_tracker._PASSIVE_LEG_CONFIRMATIONS:
                         outcomes = [r for r in outcomes if r is None or r.status != "skipped"] or outcomes
+                    # A capture no request could be built from for this leg (a route
+                    # placeholder with no observed id, no parameter to carry the
+                    # probe, not the input this case names) sent nothing and says
+                    # nothing about the cell. It never hides the verdict and sends of
+                    # a capture that ran (r10: about 180 cells reported such a refusal,
+                    # with no sends, although readiness had found another capture of
+                    # the cell ready). When no capture could be built, the first
+                    # refusal stands.
+                    outcomes = [r for r in outcomes
+                                if r is None or not getattr(r, "replay_unbuilt", False)] or outcomes
                     # Every proof instance was recorded above. A positive instance
                     # does not turn another unanswered variant into a clean cell.
                     incomplete = [r for r in outcomes if r is None or r.status not in

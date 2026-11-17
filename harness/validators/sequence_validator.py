@@ -99,6 +99,17 @@ def _lists_a_collection(doc) -> bool:
                and (not v or isinstance(v[0], dict)) for k, v in doc.items())
 
 
+# An identifier as the last path segment: a number, a long hex string or a uuid.
+_ITEM_SEGMENT = re.compile(r"^(\d+|[0-9a-fA-F]{8,}|[0-9a-fA-F]{8}-[0-9a-fA-F-]{4,})$")
+
+
+def _names_an_item(url: str) -> bool:
+    """True when the URL's last path segment is an object id (an update target),
+    False for a collection (where a POST creates)."""
+    segments = [s for s in urlsplit(url or "").path.split("/") if s]
+    return bool(segments) and bool(_ITEM_SEGMENT.match(segments[-1]))
+
+
 _LISTING_KEYS = frozenset({"data", "items", "results", "records", "rows", "entries", "list",
                            "content", "elements", "hits", "objects"})
 
@@ -215,7 +226,18 @@ class SequenceValidator(Validator):
                                         follow_redirects=False, verify=False) as client:
                 # 1. baseline read
                 b_status, baseline = await self._get_json(client, exchange.url, headers)
+                if not 200 <= (b_status or 0) < 300:
+                    baseline = None   # an error document ({"error": ...}) is not the resource
                 if not isinstance(baseline, dict):
+                    if method == "POST" and not _names_an_item(exchange.url):
+                        # The GET already carried the capture's own session: a create
+                        # (often an anonymous signup) whose collection that session may
+                        # not list. There is no object to diff before the write exists.
+                        return self._skip(
+                            f"POST to a collection is a create the capture's own session cannot "
+                            f"read back (GET {urlsplit(exchange.url).path} -> {b_status}): handed to "
+                            f"write_integrity (mass_assignment_create, restored by DELETE) and "
+                            f"api_security's create check; nothing was written")
                     return self._skip(f"resource not readable as a JSON object for a "
                                       f"differential (GET -> {b_status})")
                 if method == "POST" and _lists_a_collection(baseline):
