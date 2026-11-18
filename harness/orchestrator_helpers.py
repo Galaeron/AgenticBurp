@@ -310,6 +310,33 @@ def _nosql_login_candidate(exchange: HttpExchange) -> bool:
     return all(_credential_names(exchange.request_body or ""))
 
 
+def _nosql_json_write_candidate(exchange: HttpExchange, gate=None) -> bool:
+    """A captured JSON update (PUT/PATCH) with scalar fields of its own, where the
+    run's write gates already admit the operator differential's replays.
+
+    r11: the nosql leg reached JSON write bodies only when an agent labelled them,
+    so an injectable `id` in a review PATCH was never tried. Shape now opens the
+    leg, but only where the run would send it anyway: validators.active_enabled,
+    validators.allow_mutating_replay, and a per-finding write ceiling for nosql
+    (validators.mutating_ceiling_by_check.nosql) that pays for one verdict. The
+    default ceiling of 1 opens no leg, so no default widens. POST creates are left
+    out (`json_write_fields`): nothing here can delete what they would make."""
+    from harness.validators.nosql_validator import _SENDS_PER_VERDICT, json_write_fields
+    if not json_write_fields(exchange):
+        return False
+    if gate is None:
+        from harness.safety_gate import get_default_gate
+        gate = get_default_gate()
+    cfg = getattr(gate, "config", None)
+    if not (getattr(cfg, "active_enabled", False) and getattr(cfg, "allow_mutating_replay", False)):
+        return False
+    try:
+        _, _, ceiling = gate.mutating_headroom(None, "nosql")
+    except Exception:
+        return False
+    return ceiling >= _SENDS_PER_VERDICT
+
+
 def _email_change_race_candidate(exchange: HttpExchange) -> bool:
     """A mutating form request with a settable email address.
 
@@ -500,7 +527,7 @@ def _has_2fa_step_shape(exchange: HttpExchange) -> bool:
 
 
 def shape_precondition_legs(node: dict, exchange: HttpExchange, roles, base_url: str,
-                            id_fill: str = "1") -> list[tuple[str, HttpExchange]]:
+                            id_fill: str = "1", *, gate=None) -> list[tuple[str, HttpExchange]]:
     """The proactive confirmation legs an endpoint's shape warrants, as
     (vulnerability_class, seed_exchange) pairs to run REGARDLESS of agent labels:
 
@@ -511,6 +538,9 @@ def shape_precondition_legs(node: dict, exchange: HttpExchange, roles, base_url:
       - query/body parameter present -> SQL injection plus other injection legs
       - settable JSON/form body on a mutating method -> mass-assignment
         (write-then-re-read differential, sequence validator)
+      - form/JSON login, or a JSON PUT/PATCH with scalar fields whose writes
+        the gate admits -> nosql operator differential (`gate` defaults to the
+        run's ambient gate)
 
     The xxe/ssrf/mass-assignment legs need a real body/param, which route-
     discovery seeds don't carry, so they fire only on a captured exchange that
@@ -566,7 +596,9 @@ def shape_precondition_legs(node: dict, exchange: HttpExchange, roles, base_url:
         legs.append(("deserialization", exchange))
     if _has_settable_body(exchange):
         legs.append(("mass_assignment", exchange))
-    if _nosql_login_candidate(exchange):
+    # One nosql leg per request template: a login's credential fields, or a JSON
+    # update's own fields when the write gates admit its replays.
+    if _nosql_login_candidate(exchange) or _nosql_json_write_candidate(exchange, gate):
         legs.append(("nosql", exchange))
     if _email_change_race_candidate(exchange):
         legs.append(("race_condition", exchange))
