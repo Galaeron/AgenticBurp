@@ -511,6 +511,11 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
             # The module holds no client and sends nothing; its candidates are page
             # URLs the browser loads by GET navigation.
             "route_candidates.py",
+            # challenge_echo (R11-8 c): exchange.method appears only in a GET-only
+            # shape guard and as the route key that pairs captures. Its opt-in live
+            # sends (challenge GETs hardcoded; the captured submission's own method)
+            # go through the gate-routed RunContext executor, never a raw client.
+            "challenge_echo_validator.py",
         }
 
         violations = []

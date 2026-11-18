@@ -934,6 +934,22 @@ validators:
     enabled: true
     timeout: 10.0
     min_attempts: 12
+    # R11-8 (c): wrong-answer guessing at a run-owned account's reset/recovery-answer
+    # write records a LEAD; true lets it confirm (owner sign-off).
+    confirm_reset_answer: false
+  # R11-8 (c): a recovery lookup (GET naming an account) that answers a run
+  # identity's account unlike an unknown one records a LEAD via the new lookup
+  # paths; true lets it confirm. The older agent-finding path confirms as before.
+  auth_sequence:
+    confirm_lookup: false
+  # R11-8 (c): a challenge whose response carries its own answer. Reads captured
+  # challenge/submission pairs and sends nothing unless active_submit is on.
+  challenge_echo:
+    enabled: true
+    timeout: 10.0
+    confirm: false          # true lets a 2+-pair (or active) echo confirm; else a LEAD
+    active_submit: false    # true submits a wrong-value control, then echoed candidates
+    max_submissions: 4      # cap on active submissions per challenge
   # Reset-token entropy leg (V3): samples reset tokens observable in responses and
   # confirms only unambiguous predictability (constant/sequential/timestamp/below
   # 64-bit floor/derived). Trigger is a mutating POST (needs allow_mutating_replay).
