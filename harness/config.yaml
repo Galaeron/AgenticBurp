@@ -884,6 +884,13 @@ validators:
     # scan, enforced by the run's tool proxy (outside a run they are not scanned).
     # Every request may create an object; the reason and cap go in the proof.
     create_endpoint_max_requests: 200
+    # Wall-time share per endpoint family (method, origin, and path with object-id
+    # segments folded), all of the run's sqlmap legs together (R11-3). A started scan
+    # always finishes; past the share the next target on that family is held,
+    # reported as inconclusive with the reason, never a negative. Seconds; 0 = no bound.
+    # Long-polling transport endpoints (Engine.IO / SockJS response framing) are
+    # never scanned: their parameters are transport state (harness/sqlmap_targeting.py).
+    endpoint_family_seconds: 900
   # Cross-identity (Autorize-style) access-control validator. The single-exchange
   # idor/auth agents can only GUESS at broken access control; this replays the
   # request as ANOTHER identity (+ anonymous) and compares, the only way to tell
