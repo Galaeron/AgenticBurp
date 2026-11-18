@@ -168,7 +168,7 @@ class _Base(_CallerBase, unittest.TestCase):   # base named for the static check
         from harness.run_context import RunContext
         orch = self._orch(hosts=("127.0.0.1",))
         orch.validator_registry.validators = {
-            "auth_sequence": AuthSequenceValidator(allowed_hosts=["127.0.0.1"], confirm_lookup=True)}
+            "auth_sequence": AuthSequenceValidator(allowed_hosts=["127.0.0.1"])}
         origin = "{0.scheme}://{0.netloc}".format(urlsplit(exchange.url))
 
         async def go():

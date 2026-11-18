@@ -693,7 +693,7 @@ def _r11_detection_shapes(exchange: HttpExchange) -> list[Finding]:
     lookup naming an account in its query (username enumeration), and a
     reset/recovery-answer write (wrong-answer rate limit). Each leg records a
     lead until its confirm key is on."""
-    from harness.validators.auth_sequence_validator import _query_identifier
+    from harness.validators.auth_sequence_validator import RECOVERY_LOOKUP_SHAPE, _query_identifier
     from harness.validators.challenge_echo_validator import is_challenge_shape
     from harness.validators.rate_limit_validator import reset_answer_shape
     method = (exchange.method or "GET").upper()
@@ -701,7 +701,7 @@ def _r11_detection_shapes(exchange: HttpExchange) -> list[Finding]:
     if is_challenge_shape(exchange):
         shapes.append(("challenge_echo", "medium", "challenge-shaped JSON response"))
     if method == "GET" and _query_identifier(exchange) is not None:
-        shapes.append(("username_enumeration", "medium", "account identifier in the query"))
+        shapes.append(("username_enumeration", "medium", RECOVERY_LOOKUP_SHAPE))
     if reset_answer_shape(exchange) is not None:
         shapes.append(("rate_limit", "medium", "reset/recovery-answer write"))
     return [Finding(vulnerability_class=cls, confidence=0.3, severity=sev,

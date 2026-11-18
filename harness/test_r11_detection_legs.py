@@ -77,7 +77,7 @@ def _ex(url, method="GET", body="", status=200, response=None):
                         response_body=json.dumps(response if response is not None else {}))
 
 
-class _Base(_CallerBase):
+class _Base(_CallerBase, unittest.TestCase):   # base named for the static checks
     def app(self, handle):
         app = _App(handle)
         self.addCleanup(app.close)
@@ -308,6 +308,50 @@ class LookupEnumerationTests(_Base):
                                self._lookup(app), "username_enumeration", identities=[_ANN])
         self.assertEqual(report.status, "not_confirmed", report.summary)
         self.assertIn("indistinguishable", report.summary)
+
+    def test_older_agent_finding_path_still_confirms_with_defaults(self):
+        """ed91ca34's lookup check, reached from an agent's finding, keeps its
+        confirm default; only the new recovery-lookup paths lead."""
+        from harness.models import Finding
+        from harness.run_context import RunContext
+        app = _lookup_app(self, True)
+        orch = self.orch("auth_sequence")          # confirm_lookup left at its default
+        self.assertFalse(orch.validator_registry.validators["auth_sequence"].confirm_lookup)
+        exchange = self._lookup(app)
+        finding = Finding(vulnerability_class="username_enumeration", confidence=0.6,
+                          severity="medium", summary="The lookup may reveal which accounts exist",
+                          evidence="lookup by email", suggested_test="", basis="derived")
+
+        async def go():
+            run = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=100,
+                                    gate_config={"active_enabled": True,
+                                                 "allow_mutating_replay": True})
+            run.sessions.register("s0", "p0", {"Authorization": "Bearer " + _jwt(90, _ANN)},
+                                  allowed_origins=[app.origin])
+            async with run:
+                reports, _ = await orch._validate_findings(
+                    exchange, [AgentReport(agent="auth", model="fake", findings=[finding])],
+                    run_context=run)
+            await run.aclose()
+            return reports
+
+        report = asyncio.run(go())[0]
+        self.assertEqual(report.status, "confirmed", report.summary)
+
+    def test_new_lookup_paths_are_recognised(self):
+        from harness.models import Finding
+        from harness.validators.auth_sequence_validator import is_recovery_lookup_leg
+        shape = [f for f in shape_precondition_findings(
+            _ex("http://127.0.0.1/rest/account/question?email=a@b.test"))
+            if f.vulnerability_class == "username_enumeration"]
+        self.assertTrue(shape and is_recovery_lookup_leg(shape[0]))
+        coverage = Finding(vulnerability_class="username_enumeration", confidence=0.5,
+                           summary="username_enumeration", evidence="", suggested_test="",
+                           basis="derived")
+        self.assertTrue(is_recovery_lookup_leg(coverage))
+        agent = coverage.model_copy(update={"summary": "Lookup reveals accounts",
+                                            "evidence": "seen"})
+        self.assertFalse(is_recovery_lookup_leg(agent))
 
     def test_coverage_drive_opens_the_lookup_cell(self):
         """The coverage row and its capability gate let a GET lookup through; r11's
