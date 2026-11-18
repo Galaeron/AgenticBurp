@@ -484,9 +484,14 @@ class AuthSequenceValidator(Validator):
     }
     active = True
 
-    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0):
+    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
+                 confirm_lookup: bool = False):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
+        # R11-8 (c): a GET lookup that discriminates a run identity's account from
+        # an unknown one is a labelled LEAD until the owner signs off
+        # (validators.auth_sequence.confirm_lookup).
+        self.confirm_lookup = bool(confirm_lookup)
 
     def _skip(self, why: str, fc="broken_authentication") -> ValidationResult:
         return ValidationResult(self.name, "skipped", fc, summary=why)
@@ -1318,6 +1323,23 @@ class AuthSequenceValidator(Validator):
                    else f"Same {where} lookup: the captured identifier")
         else:
             how = "Same wrong password: existing user"
+        if query is not None and not self.confirm_lookup and (
+                vstatus != istatus or vmask.strip() != imask.strip()):
+            differ = (f"HTTP {vstatus} vs HTTP {istatus}" if vstatus != istatus
+                      else f"identical status ({vstatus}), different bodies after masking")
+            return ValidationResult(
+                self.name, "not_confirmed", fc, confidence=0.5, confirmed=False,
+                summary=(f"Lead, not confirmed (validators.auth_sequence.confirm_lookup is off, "
+                         f"owner sign-off pending): account enumeration through the lookup "
+                         f"{where}: an existing account and a non-existent one answer "
+                         f"differently ({differ})."),
+                evidence=(f"{how} and a random non-existent one: {differ}. The identifiers "
+                          f"are redacted here."),
+                limitation="a lookup discrimination confirms only with "
+                           "validators.auth_sequence.confirm_lookup: true",
+                manual_verification=("Look up a known account and an unknown one at the "
+                                     "same route; compare the answers."),
+            ).with_artifacts(**await proof())
         if vstatus != istatus:
             return ValidationResult(
                 self.name, "confirmed", fc, confidence=0.8, confirmed=True,

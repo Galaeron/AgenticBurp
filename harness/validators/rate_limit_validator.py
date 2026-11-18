@@ -20,6 +20,18 @@ wrong credentials (that would risk locking a legitimate account -- the destructi
 lockout-trigger variant needs explicit authorization). Mutating; the burst is
 authorised once through the gate (needs allow_mutating_replay) then fired via a
 plain client, exactly like the race-condition leg.
+
+Reset-answer mode (R11-8 c). A reset or recovery-answer write (an account
+identifier plus an answer field) is NOT replayed unchanged: replaying a
+successful reset resets again. Instead the burst sends WRONG answers, each one
+different, and every other field exactly as captured. It sends only when:
+  - the identifier is a run-owned identity's own account (never a real user's);
+  - the captured reset was accepted, so the new-password fields it carries are
+    already the account's password: even an answer the server wrongly accepts
+    changes nothing;
+  - each wrong answer is rejected. An accepted one stops the burst at once.
+All wrong answers rejected, every attempt answered, none throttled: a LEAD by
+default; a confirmation only with validators.rate_limit.confirm_reset_answer.
 """
 from __future__ import annotations
 from harness import scope_lock
@@ -44,6 +56,37 @@ _THROTTLE_MARKERS = re.compile(
 )
 
 
+_ANSWER_KEY = re.compile(r"answer", re.I)
+_RESET_PATH = re.compile(r"reset|recover|forgot", re.I)
+_NEW_SECRET_KEY = re.compile(r"pass|new|repeat|confirm", re.I)
+_REJECTED = re.compile(r"\b(wrong|invalid|incorrect|failed|denied|mismatch|not match)", re.I)
+
+
+def reset_answer_shape(exchange: HttpExchange) -> tuple[str, str] | None:
+    """(identifier field, answer field) of a reset / recovery-answer write, else
+    None. Needs both fields, plus a new-secret field or a reset-like path."""
+    from .auth_sequence_validator import _parse_body, _find_key, _PASS_KEYS, _USER_KEYS
+    if (exchange.method or "GET").upper() not in ("POST", "PUT", "PATCH"):
+        return None
+    fields, _kind = _parse_body(exchange)
+    ukey = _find_key(fields, _USER_KEYS)
+    akey = next((k for k in fields if _ANSWER_KEY.search(k) and k.lower() not in _PASS_KEYS
+                 and isinstance(fields[k], (str, int)) and not isinstance(fields[k], bool)),
+                None)
+    if not ukey or not akey:
+        return None
+    others = [k for k in fields if k not in (ukey, akey)]
+    if not (_RESET_PATH.search(urlsplit(exchange.url).path)
+            or any(_NEW_SECRET_KEY.search(k) for k in others)):
+        return None
+    return ukey, akey
+
+
+def _rejected(resp) -> bool:
+    status = resp.status_code or 0
+    return not 200 <= status < 300 or bool(_REJECTED.search(resp.text or ""))
+
+
 class RateLimitValidator(Validator):
     name = "rate_limit"
     finding_classes = {"rate_limit", "rate limit", "no rate limiting", "missing rate limit",
@@ -52,11 +95,12 @@ class RateLimitValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 min_attempts: int = 5, run_context=None):
+                 min_attempts: int = 5, run_context=None, confirm_reset_answer: bool = False):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self.min_attempts = max(2, int(min_attempts))
         self.run_context = run_context
+        self.confirm_reset_answer = bool(confirm_reset_answer)
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         if not super().applies(finding, exchange):
@@ -81,6 +125,9 @@ class RateLimitValidator(Validator):
         if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
         method = (exchange.method or "POST").upper()
+        shape = reset_answer_shape(exchange)
+        if shape is not None:
+            return await self._reset_answer_burst(exchange, method, *shape)
 
         gate = self.run_context.gate if self.run_context is not None else get_default_gate()
         decision = gate.authorize_burst(
@@ -182,3 +229,99 @@ class RateLimitValidator(Validator):
                     f"attempts. Needs an invalid-credential control + explicit policy window.",
             evidence=f"Replayed the captured request {completed} times (min_attempts "
                      f"{self.min_attempts}). Status distribution: {statuses}.")
+
+    async def _reset_answer_burst(self, exchange, method, ukey, akey) -> ValidationResult:
+        """Wrong-answer burst against a run-owned account's reset (module doc)."""
+        import secrets
+        from types import SimpleNamespace
+        from harness.run_context import TypedRequest
+        from .auth_sequence_validator import _encode, _identity_identifiers, _parse_body
+        from .transport import bind_session
+        fc = "rate_limit"
+        run = self.run_context
+        if run is None:
+            return self._skip("reset-answer guessing needs a run context (run-owned identities)")
+        fields, kind = _parse_body(exchange)
+        account = str(fields.get(ukey) or "").strip().lower()
+        if not account or account not in _identity_identifiers(run):
+            return self._skip("reset-answer guessing is sent only for a run-owned identity's own "
+                              "account; this reset names another account (redacted)")
+        captured_status = exchange.response_status or 0
+        if not 200 <= captured_status < 300 or _REJECTED.search(exchange.response_body or ""):
+            return self._skip("the captured reset was not accepted, so its new-password fields may "
+                              "not be the account's current password: a wrongly accepted answer "
+                              "could change it, so nothing is sent")
+        decision = run.gate.authorize_burst(
+            validator_name=self.name, method=method, url=exchange.url,
+            requested_burst_size=self.min_attempts, body=exchange.request_body)
+        if not decision.allowed:
+            return self._skip(f"burst not authorized by safety gate: {decision.reason}")
+        allowed = decision.allowed_burst_size
+        if allowed < 2:
+            return self._skip(f"burst ceiling {allowed} is below 2 (raise validators.max_burst_size)")
+        headers = {k: v for k, v in (exchange.request_headers or {}).items()
+                   if k.lower() not in ("content-length", "host")}
+        where = f"{method} {urlsplit(exchange.url).path}"
+        statuses: dict[int, int] = {}
+        completed, refused, errors = 0, "", []
+        for attempt in range(1, allowed + 1):
+            attempt_fields = dict(fields)
+            attempt_fields[akey] = "wrong-" + secrets.token_hex(4)
+            session_ref, bound = bind_session(run, headers)
+            result = await run.executor().execute(
+                TypedRequest(method, exchange.url, headers=bound,
+                             body=_encode(attempt_fields, kind)),
+                capability=self.name, session_ref=session_ref)
+            if not result.executed:
+                refused = result.outcome
+                break
+            if not result.ok:
+                errors.append(f"attempt {attempt}: "
+                              f"{getattr(result.artifact, 'transport_outcome', '') or result.error}")
+                continue
+            resp = SimpleNamespace(status_code=result.status, text=result.body,
+                                   headers=result.headers)
+            completed += 1
+            statuses[resp.status_code] = statuses.get(resp.status_code, 0) + 1
+            if self._throttled(resp):
+                return ValidationResult(
+                    self.name, "not_confirmed", fc, confidence=0.2, confirmed=False,
+                    summary=f"Reset-answer guessing is limited at {where}: a throttle signal "
+                            f"after {completed} wrong answer(s).",
+                    evidence=f"Status distribution: {statuses}.")
+            if not _rejected(resp):
+                # Stop at once: the server took a wrong answer (or says nothing).
+                return ValidationResult(
+                    self.name, "not_confirmed", fc, confidence=0.4, confirmed=False,
+                    summary=f"Lead, not confirmed: {where} accepted wrong answer {completed} "
+                            f"(HTTP {resp.status_code}, no rejection). The burst stopped there; "
+                            f"the answer may not be checked at all.",
+                    evidence="Every other field was the accepted capture's own, so the account's "
+                             "password was set to the value it already had.",
+                    manual_verification="Check by hand whether the reset verifies the answer.")
+        if completed < 2 or refused or errors:
+            why = "; ".join(([f"refused by the run ({refused})"] if refused else []) + errors[:3])
+            return ValidationResult(
+                self.name, "inconclusive", fc, confidence=0.0, confirmed=False,
+                summary=f"Reset-answer guessing check incomplete at {where}: {completed} of "
+                        f"{allowed} wrong answer(s) answered" + (f" ({why})" if why else ""),
+                evidence=f"Status distribution: {statuses}.")
+        evidence = (f"{completed} different wrong answers for a run-owned account (redacted), "
+                    f"every other field as captured; each rejected, none throttled "
+                    f"(status distribution: {statuses}, burst ceiling {allowed}).")
+        if self.confirm_reset_answer and completed >= self.min_attempts:
+            return ValidationResult(
+                self.name, "confirmed", fc, confidence=0.75, confirmed=True,
+                summary=f"No limit on reset-answer guessing at {where}: {completed} wrong answers "
+                        f"in a row were each rejected with no throttle or lockout.",
+                evidence=evidence)
+        why = ("validators.rate_limit.confirm_reset_answer is off (owner sign-off pending)"
+               if not self.confirm_reset_answer else
+               f"only {completed} of min_attempts {self.min_attempts} attempts were allowed")
+        return ValidationResult(
+            self.name, "not_confirmed", fc, confidence=0.5, confirmed=False,
+            summary=f"Lead, not confirmed ({why}): {completed} wrong reset answers at {where} were "
+                    f"each rejected with no throttle or lockout.",
+            evidence=evidence, limitation=why,
+            manual_verification="Confirm the reset answer can be guessed without limit for a "
+                                "test account.")
