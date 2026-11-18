@@ -5394,7 +5394,7 @@ Non-negotiables apply:
   - Owner question: may a missing `exp` on a session JWT confirm as a finding of its own?
   - A token that survives a password change has no leg. It would need a password change and
     a restore, so it is a write.
-- **(c) No leg exists (Strix #27, #15).**
+- **(c) No leg exists (Strix #27, #15).** (DONE 8723e21b, leads until owner sign-off)
   - A challenge endpoint that returns its own answer: 4,581 captcha requests in r11, never
     flagged. Generic oracle: a value from one response that a later request must echo to
     pass the challenge.
