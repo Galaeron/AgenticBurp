@@ -5331,7 +5331,7 @@ Non-negotiables apply:
 - **Domain:** Detection · **Effort:** M per sub-item · **Mode:** LOOP (offline); (b) and (c)
   change confirmation policy, so they need OWNER sign-off.
 - **(a) The leg mutated the wrong inputs (Strix #3, NoSQL operator injection on a review
-  PATCH).**
+  PATCH).** (DONE 884e32ca)
   - Evidence (SUPPORTED, r11 proofs): the nosql leg ran on `PATCH /rest/products/reviews`
     and the review POST/PUT 9 times. Every time it put operators in inputs named `name` and
     `value`, which "behaved like plain strings". It never mutated the request's own `id`
