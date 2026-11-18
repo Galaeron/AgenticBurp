@@ -5317,7 +5317,7 @@ Non-negotiables apply:
   - `phase_timings` is filled.
   - Negative control: no extra pass starts after the soft-cancel deadline.
 
-### [ ] R11-5 — Find why thousands of successful writes produced no write verdict
+### [x] R11-5 — Find why thousands of successful writes produced no write verdict
 - **Domain:** Authorization / write checks · **Effort:** M · **Depends on:** HU-1 for intent
   on non-owned objects · **Mode:** LOOP (offline investigation from the r11 store, then a fix).
 - **Evidence (SUPPORTED, r11, `strix_compare.py`):**
