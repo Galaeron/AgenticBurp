@@ -116,7 +116,7 @@ class RunManifest:
             "started_at": time.time(), "finished_at": None, "request_count": None,
             "confirmed_issues": None, "operational_errors": [],
             "completion_status": "running", "degraded": False, "model_metrics": None,
-            "phase_timings": None,
+            "phase_timings": None, "sqlmap_targeting": None,
             "measurement": {"fixture_kind": "unscored", "precision": None, "recall": None,
                             "scoring_limitation": "No independent expected-case mapping supplied"},
         }
@@ -156,6 +156,9 @@ class RunManifest:
                           # run's own instrumentation block (None when it has none).
                           "model_metrics": _counters(instrumentation.get("model_metrics")),
                           "phase_timings": _counters(instrumentation.get("phase_timings")),
+                          # R11-4: sqlmap's held targets per endpoint family and the
+                          # transport endpoints it skipped (None: sqlmap never asked).
+                          "sqlmap_targeting": redact(instrumentation.get("sqlmap_targeting")),
                           # Whether each local model's context window held the
                           # largest prompt at run start (OllamaClient.context_preflight).
                           "context_preflight": _counters(instrumentation.get("context_preflight"))})

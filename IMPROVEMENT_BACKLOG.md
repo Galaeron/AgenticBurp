@@ -5254,7 +5254,7 @@ Non-negotiables apply:
   - Past its share, sqlmap's next target is reported as held, not silently dropped.
   - Negative control: a parameter named `t` on a non-transport route still gets sqlmap.
 
-### [ ] R11-4 — Hand unused phase time to skipped work before the job ends
+### [x] R11-4 — Hand unused phase time to skipped work before the job ends
 - **Domain:** Scheduling · **Effort:** M · **Mode:** LOOP (offline).
 - **Evidence (SUPPORTED, r11):**
   - The job ended 51 min before its soft-cancel deadline.
