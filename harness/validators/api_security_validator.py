@@ -688,15 +688,34 @@ class ApiSecurityValidator(Validator):
             return result("skipped", "Sensitive-field exposure needs a run with registered sessions")
         cross = CrossIdentityValidator(run_context=run)
         identities = cross._run_identities(urlparse(exchange.url).hostname or "")
-        source = _source_identity(identities, _auth_signature(exchange.request_headers))
+        signature = _auth_signature(exchange.request_headers)
+        source = _source_identity(identities, signature)
+        token_bound = False
+        if source is None and signature:
+            # R11-6: credentials not byte-equal to a session's (server cookies added,
+            # or a token from before a refresh) but carrying a token the run issued
+            # to exactly one identity: the capture is that identity's request.
+            from harness import run_tokens
+            source = run_tokens.issued_identity(identities, exchange.request_headers,
+                                                getattr(run, "sessions", None))
+            token_bound = source is not None
         if source is None:
-            return result("skipped", "The captured GET's principal is not a registered session")
+            if not signature:
+                return result("skipped", "The captured GET carries no credentials (an anonymous "
+                                         "read); exposure proof needs an identified caller")
+            return result("skipped", "The captured GET's principal is not a registered session "
+                                     "(its credentials carry no token this run issued)")
         caller = _principal_for(source)
         if caller.provisional or caller.is_anonymous:
             return result("skipped", "An identified account is required for exposure proof")
 
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in {"host", "content-length"}}
+        if token_bound:
+            # Replay as the identity's current session: its own credentials, never
+            # the capture's (an earlier token, or cookies the server set).
+            headers = {k: v for k, v in headers.items() if not is_identity_credential_header(k)}
+            headers.update(source.get("headers") or {})
         anon_headers = {k: v for k, v in headers.items() if not is_identity_credential_header(k)}
 
         async def send(as_caller: bool):

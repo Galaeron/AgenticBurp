@@ -255,6 +255,10 @@ class ManagedSession:
     # the credentials -- a token, decoded claims, a cache key -- must key it on
     # (session_id, generation) so a refreshed session never serves stale state.
     generation: int = 0
+    # R11-6: digests (never values) of the credentials this session held before a
+    # replace_headers. A capture made with an earlier token is still this
+    # identity's request (run_tokens.issued_identity).
+    retired_credentials: set = field(default_factory=set, repr=False)
     # E5a health: "unverified" until a send is accepted, then "healthy"; "suspect"
     # after a 401 the run could not explain; "expired" once the health probe rejected
     # the credentials and no refresh restored them (sends are then refused unsent).
@@ -374,6 +378,9 @@ class SessionManager:
         session = self._by_id.get(session_id)
         if session is None:
             raise ValueError(f"unknown session reference: {session_id}")
+        from harness import run_tokens
+        old, _ = run_tokens.issued_digests(session.headers)
+        session.retired_credentials |= old
         session.headers = dict(headers or {})
         session.generation += 1
         session.health = "healthy"
