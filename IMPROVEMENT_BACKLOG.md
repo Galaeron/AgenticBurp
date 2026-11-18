@@ -5213,7 +5213,7 @@ Non-negotiables apply:
   - Negative controls: a genuine data-exposure finding on that route still confirms; a
     well_known finding still gets its observation.
 
-### [ ] R11-2 — Normalise class names before grouping issues
+### [x] R11-2 — Normalise class names before grouping issues
 - **Domain:** Issue accounting · **Effort:** S · **Mode:** LOOP (offline).
 - **Evidence (VERIFIED):** `issue_class` (`harness/issues.py:584-590`) falls back to the raw
   lowercased label. `exposed_metrics_endpoint`, `exposed metrics endpoint` and

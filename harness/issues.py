@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import NamedTuple
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-from harness.categories import canonicalize, distinctive_token
+from harness.categories import canonicalize, distinctive_token, grouping_class, is_lead_label
 from harness.engagement import normalize_path
 from harness import security
 
@@ -401,6 +401,14 @@ class Issue:
         return any(m.get("confirmed") for m in self.members)
 
     @property
+    def lead(self) -> bool:
+        """R11-2: every member is labelled a lead ("potential_idor"). The marker is a
+        flag, not part of the class: a lead and a confirmed finding of the class on
+        one route are one issue, which is no longer a lead."""
+        return bool(self.members) and all(
+            is_lead_label(m.get("vulnerability_class")) for m in self.members)
+
+    @property
     def oracle_verified(self) -> bool:
         """R06: the oracle-verification axis (orthogonal to `confirmed`, the
         legacy "a leg fired once" bar) must survive issue aggregation and
@@ -584,15 +592,21 @@ def issue_key(finding: dict, *, recorded_policy: bool = True) -> tuple:
 def issue_class(vulnerability_class: str) -> str:
     """The class an issue groups on: the canonical class, else a distinctive class
     token in the label ("Broken Access Control (BOLA) on Workflow Scope" -> idor), else
-    the raw lowercased label. Grouping only -- the stored finding fingerprint keeps
-    categories.legacy_canonicalize so suppressions stay valid."""
+    the label variant's class (R11-2: case and separators folded, a "potential_"/lead
+    marker dropped, "exposed_public_metrics_endpoint" -> metrics_exposure; see
+    categories.grouping_class), else the raw lowercased label. Grouping only -- the
+    stored finding fingerprint keeps categories.legacy_canonicalize so suppressions
+    stay valid."""
     vc = vulnerability_class or ""
-    return canonicalize(vc) or distinctive_token(vc) or vc.strip().lower()
+    return (canonicalize(vc) or distinctive_token(vc) or grouping_class(vc)
+            or vc.strip().lower())
 
 
 from harness.categories import CANONICAL_CATEGORIES as _CANONICAL_CATEGORIES  # noqa: E402
+from harness.categories import GROUPING_CLASSES as _GROUPING_CLASSES  # noqa: E402
 
-_CANONICAL_SET = frozenset(_CANONICAL_CATEGORIES)
+# Classes that name one issue on (host, family, method, class, boundary) by themselves.
+_CANONICAL_SET = frozenset(_CANONICAL_CATEGORIES) | frozenset(_GROUPING_CLASSES)
 # Classes whose identity is the injected input, not the route or object.
 _INPUT_BEARING_CLASSES = frozenset({
     "sqli", "nosql", "xss", "dom_xss", "command_injection", "ssti", "path_traversal",
