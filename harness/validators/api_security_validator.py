@@ -567,6 +567,18 @@ class ApiSecurityValidator(Validator):
             source_exchange_hash=exchange_hash,
         )
 
+    async def _mass_assignment_from_read(self, finding: Finding, exchange: HttpExchange):
+        """R11-6 (b): an update with no captured body (or only the crawler's guess)
+        is probed by the sequence leg with a body built from the object's own read
+        (settable fields only, snapshot restored and verified)."""
+        from .sequence_validator import SequenceValidator
+        seq = SequenceValidator(allowed_hosts=list(getattr(self, "allowed_hosts", None) or []),
+                                timeout=getattr(self, "timeout", 10.0))
+        res = await seq.validate_from_read(exchange)
+        res.validator = self.get_name()
+        res.finding_class = finding.vulnerability_class
+        return res
+
     async def validate(self, finding: Finding, exchange: HttpExchange) -> Any:
         tests: list[ApiSecurityTestResult] = []
         fc = finding.vulnerability_class.lower().replace("_", " ")
@@ -583,8 +595,16 @@ class ApiSecurityValidator(Validator):
                 evidence="", raw_output="[]",
             )
 
+        from harness.models import request_body_is_placeholder
+        from .sequence_validator import needs_read_body
+        if needs_read_body(exchange):
+            return await self._mass_assignment_from_read(finding, exchange)
+
         try:
-            if exchange.method.upper() in ("POST", "PUT", "PATCH") and exchange.request_body:
+            if (exchange.method.upper() in ("POST", "PUT", "PATCH") and exchange.request_body
+                    and not request_body_is_placeholder(exchange)):
+                # R11-6: a harness-guessed placeholder body is never sent as the
+                # write: it holds none of the endpoint's real fields.
                 result = await self._probe_mass_assignment(exchange, finding)
                 if result is not None:
                     tests.append(result)
