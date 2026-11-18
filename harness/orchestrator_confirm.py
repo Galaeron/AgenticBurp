@@ -235,15 +235,16 @@ class ConfirmMixin:
         from harness import confirmation_gate, plan_dispatch
         report = AgentReport(agent=specialty, model=model or "iterative", findings=list(findings))
         validation_reports: list = []
+        batch = [report]
         summary = await plan_dispatch.dispatch_plans(
-            self, exchange, plans, [report], validation_reports, run_context=run_context)
+            self, exchange, plans, batch, validation_reports, run_context=run_context)
         planned = {p.finding_class for p in plans}
         unplanned = [f for f in findings if f.vulnerability_class not in planned]
         cases = dict(summary.get("cases") or {})
         if unplanned:
-            more, proofs = await self._validate_findings(
-                exchange, [AgentReport(agent=specialty, model=report.model, findings=unplanned)],
-                run_context=run_context)
+            extra = [AgentReport(agent=specialty, model=report.model, findings=unplanned)]
+            more, proofs = await self._validate_findings(exchange, extra, run_context=run_context)
+            batch.extend(extra[1:])
             validation_reports.extend(more)
             for proof in proofs:
                 if proof.get("finding_ref") and proof.get("case_id"):
@@ -251,8 +252,14 @@ class ConfirmMixin:
         for f in findings:
             if not f.case_id and f.finding_id in cases:
                 f.case_id = cases[f.finding_id]
+        # R11-1: a proof of another class than the finding it was routed for was
+        # filed by _validate_findings as its own confirmed finding, in a report
+        # appended to the batch. `findings` is the held list the caller persists
+        # after this review (pivot_memory.integrate), so the filed finding is
+        # stored with its proof instead of leaving that proof without a finding.
+        findings.extend(f for r in batch[1:] for f in r.findings)
         confirmation_gate.apply_confirmation_suppression(
-            [report], validation_reports,
+            batch, validation_reports,
             live_verified_markers=await self.get_run_derived_live_markers(),
             config=getattr(self, "config", {}))
         return summary

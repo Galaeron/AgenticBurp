@@ -18,6 +18,7 @@ Fixtures are generic owned services and synthetic values.
 """
 import asyncio
 import hashlib
+from dataclasses import dataclass, field
 import json
 import os
 import shutil
@@ -262,6 +263,106 @@ class ExposureClassTests(_Base):
         filed = self.filed(reports)
         self.assertEqual([f.vulnerability_class for f in filed], ["excessive data exposure"])
         self.assertTrue(filed[0].confirmed)
+
+
+@dataclass
+class _IterativeResult:
+    agent: str = "iterative:injection"
+    findings: list = field(default_factory=list)
+    handoff_note: str = ""
+    stop_reason: str = "found"
+
+
+class IterativeReviewPathTests(_Base):
+    """The iterative agent's route: pivot_memory.integrate -> review ->
+    _review_iterative_findings -> plan dispatch -> _validate_findings, then the held
+    findings persist. An xss finding on a route returning the caller's own digest
+    earns the exposure plan by evidence; its proof is a data exposure, not xss."""
+    validators = ("api_security",)
+
+    def integrate(self, findings, review_list=lambda held: held):
+        from harness import pivot_memory
+        orch, cfg = self.orch()
+        self.server.doc = OWN_DIGEST
+        ex = HttpExchange(url=self.origin + "/api/profile?q=1", method="GET",
+                          request_headers={"Authorization": "Bearer a"}, response_status=200,
+                          response_headers={"Content-Type": "application/json"},
+                          response_body=json.dumps(OWN_DIGEST))
+
+        async def body(run):
+            async def review(held, plans):
+                self.assertIn("api_security_validation", [p.capability for p in plans])
+                await orch._review_iterative_findings(ex, "injection", review_list(held), plans,
+                                                      run_context=run)
+            return await pivot_memory.integrate(_IterativeResult(findings=list(findings)), ex,
+                                                review=review)
+        out = self.run_with(cfg, body)
+        return out, store.all_host_findings(ex.url)
+
+    def test_split_off_finding_is_stored_with_its_proof(self):
+        out, rows = self.integrate([_finding("xss")])
+        xss = [f for f in out.held_findings if f.vulnerability_class == "xss"]
+        self.assertEqual(len(xss), 1)
+        self.assertFalse(xss[0].confirmed)
+        self.assertEqual(xss[0].proof_id, "")
+        stored = [r for r in rows if r["vulnerability_class"] == "excessive data exposure"]
+        self.assertEqual(len(stored), 1, [(r["vulnerability_class"], r.get("proof_id")) for r in rows])
+        self.assertTrue(stored[0]["confirmed"])
+        self.assertTrue(stored[0]["proof_id"])
+        bound = [pr for pr in store.proofs_for_case(stored[0]["case_id"])
+                 if pr["proof_id"] == stored[0]["proof_id"]]
+        self.assertEqual(len(bound), 1, stored[0])
+        self.assertEqual(bound[0]["verdict"], "confirmed")
+        self.assertEqual(bound[0]["case"]["finding_ref"], stored[0]["finding_id"])
+        self.assertEqual(bound[0]["validator"], "api_security_validator")
+        stored_xss = [r for r in rows if r["vulnerability_class"] == "xss"]
+        self.assertEqual(len(stored_xss), 1)
+        self.assertFalse(stored_xss[0]["confirmed"])
+        self.assertFalse(stored_xss[0]["proof_id"])
+
+    def test_defect_injection_a_review_on_a_copy_orphans_the_proof(self):
+        """The pre-fix behaviour: the filed finding never reaches the held list."""
+        _out, rows = self.integrate([_finding("xss")], review_list=list)
+        self.assertEqual([r for r in rows if r["vulnerability_class"] == "excessive data exposure"], [])
+
+
+class JwtResetTokenClassTests(_Base):
+    """jwt_forge still runs on a reset-token finding (applies() routes it through the
+    weak_token declaration), but its confirmation is not that finding's proof."""
+    validators = ("jwt_forge",)
+
+    def exchange(self):
+        token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2ln"
+        return HttpExchange(url=self.origin + "/api/reset?q=1", method="GET",
+                            request_headers={"Authorization": f"Bearer {token}"},
+                            response_status=200, response_body="{}")
+
+    def validate_forged(self, finding):
+        async def forged(leg, f, ex):
+            return ValidationResult("jwt_forge", "confirmed", f.vulnerability_class,
+                                    confirmed=True, confidence=0.95, summary="forged token accepted")
+        with patch("harness.validators.jwt_forge_validator.JwtForgeValidator.validate", forged):
+            return self.validate(self.exchange(), [finding], agent="auth")
+
+    def test_reset_token_finding_is_routed_but_not_confirmed(self):
+        from harness.validators.jwt_forge_validator import JwtForgeValidator
+        for label in ("reset_token", "weak_token", "reset token"):
+            with self.subTest(label=label):
+                lead = _finding(label)
+                self.assertTrue(JwtForgeValidator().applies(lead, self.exchange()))
+                reports, validations, _ = self.validate_forged(lead)
+                self.assertEqual([v.validator for v in validations][:1], ["jwt_forge"])
+                self.assertFalse(lead.confirmed)
+                self.assertEqual([f.vulnerability_class for f in self.filed(reports)], ["jwt"])
+
+    def test_control_jwt_finding_still_confirms(self):
+        for label in ("jwt", "JWT None Algorithm", "broken_authentication"):
+            with self.subTest(label=label):
+                lead = _finding(label)
+                reports, _validations, _ = self.validate_forged(lead)
+                self.assertTrue(lead.confirmed)
+                self.assertEqual(lead.confirmed_by_leg, "jwt_forge")
+                self.assertEqual(self.filed(reports), [])
 
 
 class _Shape(Validator):

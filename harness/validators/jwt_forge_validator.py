@@ -245,8 +245,16 @@ def _kid_forgeries(header: dict, payload: dict) -> list[tuple[str, str]]:
     return out
 
 
+# R11-1: the canonical classes a forged JWT's acceptance proves -- the token
+# itself, and the authentication it stands for (broken_authentication -> auth).
+_JWT_CLAIM_CLASSES = frozenset({"jwt", "auth"})
+
+
 class JwtForgeValidator(Validator):
     name = "jwt_forge"
+    # R11-1: a forged token's acceptance, filed apart from a finding of another
+    # class, is a jwt finding (not "auth", the first of finding_classes' canonicals).
+    mechanism_class = "jwt"
     finding_classes = {"jwt", "algorithm_confusion", "jwt_algorithm_confusion",
                        "authentication_bypass", "broken_authentication", "weak_token"}
     active = True
@@ -265,16 +273,19 @@ class JwtForgeValidator(Validator):
         return jwtish and _extract_jwt(exchange.request_headers or {}) is not None
 
     def claims_class(self, finding: Finding, exchange: HttpExchange | None = None) -> bool:
-        """R11-1: the class half of applies(), without the JWT-present shape. A bare
-        "token" label is a JWT claim only when it names no other canonical class
-        (a reset token or a CSRF token is not a JWT forgery)."""
+        """R11-1: the class half of applies(), without the JWT-present shape. A
+        finding whose issue class is another canonical class is never a JWT
+        forgery's to confirm -- a reset token or a CSRF token is not a JWT, even
+        though finding_classes' "weak_token" canonicalises to reset_token and so
+        still routes such a finding here (applies() is unchanged; the leg runs)."""
         from harness.categories import CANONICAL_CATEGORIES
         from harness.issues import issue_class
         low = (finding.vulnerability_class or "").lower()
-        if Validator.applies(self, finding, exchange) or "jwt" in low or "algorithm" in low:
-            return True
-        return "token" in low and (issue_class(low) == "jwt"
-                                   or issue_class(low) not in CANONICAL_CATEGORIES)
+        cls = issue_class(low)
+        if cls in CANONICAL_CATEGORIES and cls not in _JWT_CLAIM_CLASSES:
+            return False
+        return (Validator.applies(self, finding, exchange)
+                or "jwt" in low or "algorithm" in low or "token" in low)
 
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "jwt", summary=why)

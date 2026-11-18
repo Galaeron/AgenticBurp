@@ -5210,11 +5210,15 @@ Non-negotiables apply:
   - Duck-typed validators without `claims_class` also keep `applies` as their claim.
   - The agent-fallback route is still bound by `_fallback_result_binds`, the existing
     guard, and is unchanged.
-- **Follow-ups found:**
-  - In the iterative review path (`_review_iterative_findings`), the proof filed apart is
-    persisted, but the finding is not added to the held findings it persists.
-  - jwt_forge declares `weak_token`, which canonicalises to `reset_token`, so jwt_forge
-    claims reset_token findings by class. This is R11-2 territory.
+- **Follow-ups, fixed in the second commit:**
+  - The iterative review path (`_review_iterative_findings`) now adds the finding filed
+    apart to the held list that `pivot_memory.integrate` persists. The finding is stored
+    with its proof.
+  - jwt_forge `claims_class` declines any canonical class other than jwt and auth, so
+    reset-token findings are no longer claimed. `applies` is unchanged, so the leg still
+    runs. A forgery filed apart is named `jwt` (`Validator.mechanism_class`).
+- **Left for R11-2:** free-text labels that resolve to no canonical class (for example
+  "password reset token") are still claimed through the "token" substring.
 - **Domain:** Confirmation correctness · **Effort:** M · **Mode:** LOOP (offline).
 - **Evidence (VERIFIED):**
   - `WellKnownValidator.applies` (`harness/validators/exposure_leads.py:1117-1122`) accepts any

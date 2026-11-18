@@ -291,10 +291,14 @@ def _validator_classes(validator) -> list[str]:
 
 def mechanism_class_of(validator, result) -> str:
     """The class a result proves when it does not prove the routed finding's:
-    the result's own mechanism, else the validator's first canonical class."""
+    the result's own mechanism, else the validator's declared primary class
+    (`mechanism_class`), else its first canonical class."""
     named = [c for c in (getattr(result, "mechanism_classes", ()) or ()) if c]
     if named:
         return named[0]
+    primary = getattr(validator, "mechanism_class", "")
+    if isinstance(primary, str) and primary:
+        return primary
     own = _validator_classes(validator)
     return own[0] if own else (getattr(validator, "name", "") or getattr(result, "validator", ""))
 
