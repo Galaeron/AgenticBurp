@@ -209,6 +209,18 @@ class UnauthorizedUpdateTests(_Fixture):
         self.assertIn("declared protected", result.summary)
         self.assert_restored(run)
 
+    async def test_an_engagement_protected_path_confirms_an_anonymous_change(self):
+        reg, run = self.build(owners=False)
+        run.protected_paths = ["PUT /api/things/*"]
+        finding, ex = self.capture(UNAUTHORIZED_UPDATE, "/api/things/1")
+        leg = [v for v in reg.bind_run_context(reg.for_finding(finding, ex), run)
+               if v.name == "write_integrity"][0]
+        async with run:
+            result = await leg.validate(finding, ex)
+        self.assertEqual(result.status, "confirmed", result.summary)
+        self.assertIn("engagement protected_paths", result.summary)
+        self.assert_restored(run)
+
     async def test_a_restore_that_cannot_be_verified_is_a_loud_error(self):
         result, run = await self.direct("/api/sticky/1")
         self.assertEqual(result.status, "error", result.summary)

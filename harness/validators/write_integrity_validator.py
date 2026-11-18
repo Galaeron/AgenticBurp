@@ -1736,13 +1736,15 @@ class WriteIntegrityValidator(Validator):
     def _declared_boundary(self, writer, url: str, method: str) -> str:
         """Why a change `writer` (None: anonymous) made to the object at `url`
         crosses a boundary the operator declared, or "": an anonymous write to a
-        route on authz.protected_paths, or an authz.owners declaration that does not
+        route on authz.protected_paths or the engagement's protected_paths, or an authz.owners declaration that does not
         entitle the writer. Self-observed ownership is not a declaration."""
         if writer is None:
             try:
                 from harness import protected_routes
                 hit = protected_routes.ProtectedRoutes.for_target(
-                    getattr(self.run_context, "config", None) or {}, url).match(method, url)
+                    getattr(self.run_context, "config", None) or {}, url,
+                    engagement_paths=getattr(self.run_context, "protected_paths", None) or None,
+                ).match(method, url)
             except Exception:
                 log.debug("write_integrity: protected routes failed", exc_info=True)
                 hit = None
