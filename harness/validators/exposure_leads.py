@@ -1121,6 +1121,13 @@ class WellKnownValidator(_GetLeg):
                 or any(t in raw for t in ("security.txt", "security_txt", "well-known", "well_known", "csaf"))
                 or path.startswith("/.well-known/"))
 
+    def claims_class(self, finding, exchange=None) -> bool:
+        """R11-1: the class half of applies(); the /.well-known/ path alone routes a
+        finding here but its observation is never that finding's proof."""
+        raw, _canonical = _class_tokens(finding)
+        return (Validator.applies(self, finding, exchange)
+                or any(t in raw for t in ("security.txt", "security_txt", "well-known", "well_known", "csaf")))
+
     async def validate(self, finding, exchange) -> ValidationResult:
         early = self._precheck(finding, exchange)
         if early is not None:
@@ -1178,6 +1185,7 @@ class WellKnownValidator(_GetLeg):
                 finding, "confirmed",
                 f"Observation (not a vulnerability): {origin} publishes {published}",
                 confirmed=True, severity="info", evidence="; ".join(notes),
+                observation=True, mechanism_classes=("security_txt" if security else "csaf",),
             ).with_artifacts(baseline=baseline, attack=attack, controls=[control])
         else:
             result = self._result(

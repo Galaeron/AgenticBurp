@@ -531,6 +531,12 @@ class ApiSecurityValidator(Validator):
         field in the captured GET's response or the finding's evidence body."""
         return super().applies(finding, exchange) or bool(exposure_evidence(finding, exchange))
 
+    def claims_class(self, finding: Finding, exchange: HttpExchange | None = None) -> bool:
+        """R11-1: the label half of applies(). A finding routed here by response
+        evidence alone is bound only by the exposure result's own mechanism
+        (data exposure; access control when another account's object leaked)."""
+        return Validator.applies(self, finding, exchange)
+
     def _routed_by_evidence(self, finding, exchange) -> bool:
         return (not super().applies(finding, exchange)
                 and bool(exposure_evidence(finding, exchange)))
@@ -664,11 +670,16 @@ class ApiSecurityValidator(Validator):
         from .cross_identity_validator import (CrossIdentityValidator, _auth_signature,
                                                 _principal_for, _source_identity)
 
-        def result(status, summary, evidence="", limitation=""):
+        def result(status, summary, evidence="", limitation="", other_account=False):
+            # R11-1: what an exposure proof proves -- a data exposure, plus an
+            # object-level access-control break when the secret is another account's.
+            proves = ("excessive data exposure", "info_disclosure") + (
+                ("idor",) if other_account else ())
             return ValidationResult(self.get_name(), status, finding.vulnerability_class,
                                     confirmed=status == "confirmed",
                                     confidence=0.9 if status == "confirmed" else 0.0,
-                                    summary=summary, evidence=evidence, limitation=limitation)
+                                    summary=summary, evidence=evidence, limitation=limitation,
+                                    mechanism_classes=proves if status == "confirmed" else ())
 
         if (exchange.method or "GET").upper() != "GET":
             return result("skipped", "Sensitive-field exposure is checked on a captured GET only")
@@ -758,7 +769,8 @@ class ApiSecurityValidator(Validator):
              f"secret(s) ({', '.join(sorted({k for *_x, k in token_hits}))})"] if token_hits else [])
         return result("confirmed", f"Credential-secret exposure confirmed: GET {exchange.url} as "
                                    f"{caller.id} " + " and ".join(parts),
-                      evidence).with_artifacts(baseline=baseline, attack=attack, controls=[control])
+                      evidence, other_account=any(owner != caller.id for _p, owner, *_r in stable)
+                      ).with_artifacts(baseline=baseline, attack=attack, controls=[control])
 
     @staticmethod
     def _declared_visible(exchange, caller) -> dict | None:

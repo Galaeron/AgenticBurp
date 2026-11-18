@@ -5175,7 +5175,46 @@ Non-negotiables apply:
 - `full` must be green before close.
 - Nothing may be specific to Juice Shop.
 
-### [ ] R11-1 — A confirmation counts only for the class whose mechanism it proves  ★
+### [x] R11-1 — A confirmation counts only for the class whose mechanism it proves  ★
+- **Done (2026-11-18, branch `fix/r11-1-confirm-class`):**
+  - `Validator.claims_class` checks the class only. By default it is `applies`. It is
+    overridden where `applies` also routes by shape: well_known (path), api_security
+    (response evidence), open_redirect (redirect params), xxe (XML body), path_traversal
+    (file-shaped exchange) and jwt_forge (JWT present; a bare "token" label counts only
+    when it names no other canonical class).
+  - `ValidationResult.mechanism_classes` lists the classes a result proves.
+    `ValidationResult.observation` marks a result as an observation.
+  - The exposure oracle proves data exposure, and also `idor` when the secret belongs to
+    another account (so the r7 BOLA path still confirms). The .well-known probe returns
+    a `security_txt` or `csaf` observation.
+  - In `_validate_findings`, `proves_finding_class` gates every confirmed result.
+    - On a mismatch, the routed finding is recorded as `skipped` and its own verdict is
+      left open.
+    - The proof is filed once per (validator, class, proof) per run, as a confirmed
+      finding of the proved class, in a report appended to `reports`.
+      `plan_dispatch` keeps that report with the caller's.
+    - An observation never confirms a canonical vulnerability class; `recon` is the
+      one exception.
+  - Tests: `harness/test_r11_confirm_class.py` runs the real dispatch and the plan path
+    against owned loopback services. It covers both acceptance cases, both controls,
+    another account's secret still proving a BOLA, and defect injection with the gate
+    off.
+- **Audit (c), left as is:**
+  - The graph loop `_confirm` (`orchestrator_chain.py`) routes by class substring by
+    construction.
+  - The coverage drive (`_bind_stored`) is already pre-filtered by
+    `bind_confirmation_proof`, which matches on the proof's class.
+  - The class-extension legs keep `applies` as their claim: idor_read and cross_identity
+    (access-control markers), the listing/filter/metrics/sensitive-file matchers, and
+    write_integrity `_kind_of`. They route by class already.
+  - Duck-typed validators without `claims_class` also keep `applies` as their claim.
+  - The agent-fallback route is still bound by `_fallback_result_binds`, the existing
+    guard, and is unchanged.
+- **Follow-ups found:**
+  - In the iterative review path (`_review_iterative_findings`), the proof filed apart is
+    persisted, but the finding is not added to the held findings it persists.
+  - jwt_forge declares `weak_token`, which canonicalises to `reset_token`, so jwt_forge
+    claims reset_token findings by class. This is R11-2 territory.
 - **Domain:** Confirmation correctness · **Effort:** M · **Mode:** LOOP (offline).
 - **Evidence (VERIFIED):**
   - `WellKnownValidator.applies` (`harness/validators/exposure_leads.py:1117-1122`) accepts any

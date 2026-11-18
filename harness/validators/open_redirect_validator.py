@@ -155,6 +155,11 @@ class OpenRedirectValidator(Validator):
         return (super().applies(finding, exchange) and bool(_redirect_params(exchange))) \
             or bool(_redirect_params(exchange))
 
+    def claims_class(self, finding: Finding, exchange: HttpExchange | None = None) -> bool:
+        """R11-1: applies() also routes by redirect-shaped parameters; a confirmation proves
+        this validator's class only for a finding of that class."""
+        return Validator.applies(self, finding, exchange)
+
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "open_redirect", summary=why)
 

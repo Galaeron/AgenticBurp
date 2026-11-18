@@ -264,6 +264,18 @@ class JwtForgeValidator(Validator):
         jwtish = super().applies(finding, exchange) or "jwt" in low or "token" in low or "algorithm" in low
         return jwtish and _extract_jwt(exchange.request_headers or {}) is not None
 
+    def claims_class(self, finding: Finding, exchange: HttpExchange | None = None) -> bool:
+        """R11-1: the class half of applies(), without the JWT-present shape. A bare
+        "token" label is a JWT claim only when it names no other canonical class
+        (a reset token or a CSRF token is not a JWT forgery)."""
+        from harness.categories import CANONICAL_CATEGORIES
+        from harness.issues import issue_class
+        low = (finding.vulnerability_class or "").lower()
+        if Validator.applies(self, finding, exchange) or "jwt" in low or "algorithm" in low:
+            return True
+        return "token" in low and (issue_class(low) == "jwt"
+                                   or issue_class(low) not in CANONICAL_CATEGORIES)
+
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "jwt", summary=why)
 
