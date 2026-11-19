@@ -10,6 +10,7 @@ Through the production caller (Orchestrator._validate_findings) against a loopba
 service.
 """
 import json
+import unittest
 
 from harness.models import HttpExchange
 from harness.test_oracle_gaps_api_security import _BCRYPT
@@ -43,7 +44,7 @@ class _Recording(ApiSecurityValidator):
         return res
 
 
-class AnonymousExposureCallerTests(_Base):
+class AnonymousExposureCallerTests(_Base, unittest.TestCase):
     def setUp(self):
         super().setUp()
         self.server.RequestHandlerClass = _Public
@@ -92,5 +93,4 @@ class AnonymousExposureCallerTests(_Base):
 
 
 if __name__ == "__main__":
-    import unittest
     unittest.main()
