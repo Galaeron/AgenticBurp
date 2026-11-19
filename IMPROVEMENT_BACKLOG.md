@@ -5275,7 +5275,7 @@ Non-negotiables apply:
   - Negative control: two different unknown classes on one route stay two issues.
   - `test_issue_*`/report tests are unchanged.
 
-### [ ] R11-3 — Keep sqlmap off transport endpoints and cap its time per endpoint
+### [x] R11-3 — Keep sqlmap off transport endpoints and cap its time per endpoint
 - **Domain:** Scheduling / cost · **Effort:** M · **Mode:** LOOP (offline); efficacy OWNER/LIVE.
 - **Evidence (SUPPORTED, r11):**
   - sqlmap sent 52% of target requests (115,137 gate authorisations; r10 51%).
