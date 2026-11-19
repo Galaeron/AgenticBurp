@@ -1387,6 +1387,22 @@ CHECK_CATALOG: tuple[Check, ...] = (
               "checkout_tamper", "checkout tampering", "settlement_tamper", "payment_bypass",
               "payment bypass", "payment_skip", "order_total_tamper", "wallet_payment_skip",
           )),
+    Check("AV-BUSL-COUPON-01", "Coupon or voucher misuse (forged, expired, another user's code)",
+          Phase.ENDPOINT, "coupon_misuse", _flow_shape("coupon_misuse"), "business_flow",
+          "Apply a forged code, an expired code and another run identity's code to the captured "
+          "coupon write; confirm when the basket or order read-back shows the discount, then "
+          "clear the code again.",
+          "Business logic vulnerabilities",
+          external_refs=(
+              ExternalRef("WSTG", "WSTG-BUSL-10",
+                          "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/10-Business_Logic_Testing/10-Test-Payment-Functionality",
+                          "Test Payment Functionality"),
+          ),
+          specific_classes=(
+              "coupon_misuse", "coupon misuse", "coupon_forgery", "coupon forgery",
+              "coupon_reuse", "expired_coupon", "voucher_misuse", "promo_code_abuse",
+              "discount_code_abuse", "cross_user_coupon",
+          )),
 )
 
 CHECKS_BY_ID: dict[str, Check] = {c.id: c for c in CHECK_CATALOG}

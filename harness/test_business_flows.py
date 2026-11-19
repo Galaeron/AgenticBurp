@@ -281,6 +281,44 @@ class PaymentSkipTests(_Fixture):
         self.assertEqual(self.user()["tier"], "free")
 
 
+class CouponMisuseTests(_Fixture):
+    def flow(self):
+        o = self.origin
+        return [
+            _cap(o, "GET", "/api/basket", answer={"data": {"items": [], "coupon": None,
+                                                           "discount": 0, "total": 10}}),
+            _cap(o, "PUT", "/api/basket/coupon", body={"couponCode": "OLD5"}, status=400,
+                 answer={"error": "coupon expired"}),
+            _cap(o, "PUT", "/api/basket/coupon", body={"couponCode": "BOB20"}, who="Bearer b"),
+            _cap(o, "PUT", "/api/basket/coupon", body={"couponCode": "WELCOME10"}),
+        ]
+
+    def seed(self):
+        self.user()["basket"] = [{"productId": 7, "quantity": 1, "price": 10}]
+        self.user("Bearer b")
+
+    async def test_forged_code_discount_confirmed_and_removed(self):
+        self.seed()
+        self.server.modes.add("accept_any")
+        result, run = await self.dispatch("coupon_misuse", "PUT", "/api/basket/coupon",
+                                          {"couponCode": "WELCOME10"}, captured=self.flow())
+        self.assertEqual(result.status, "confirmed", result.summary)
+        self.assertIn("a forged code", result.summary)
+        self.assertEqual(result.mechanism_classes, ("coupon_misuse",))
+        self.assertIsNone(self.user()["coupon"], "the forged code was not removed")
+        self.assertNotIn("LEFT IN PLACE", result.summary)
+        self.assertFalse(run.change_log.failed_restores())
+
+    async def test_checked_codes_hold(self):
+        self.seed()
+        result, _run = await self.dispatch("coupon_misuse", "PUT", "/api/basket/coupon",
+                                           {"couponCode": "WELCOME10"}, captured=self.flow())
+        self.assertEqual(result.status, "not_confirmed", result.summary)
+        coupon_writes = [p for m, p in self.writes() if p == "/api/basket/coupon"]
+        self.assertEqual(len(coupon_writes), 3, "forged, expired and another identity's code")
+        self.assertIsNone(self.user()["coupon"])
+
+
 class DefaultsSendNothingTests(_Fixture):
     async def test_committed_config_sends_nothing(self):
         cfg = yaml.safe_load((Path(__file__).parent / "config.yaml").read_text(encoding="utf-8"))

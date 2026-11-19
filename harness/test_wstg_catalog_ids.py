@@ -12,9 +12,9 @@ Pins:
   - negative controls: an id in neither the current list nor the alias table is
     rejected (never silently aliased), and a current WSTG id with no catalog row
     is not mapped onto a neighbouring row;
-  - the requirement manifest still has one requirement per catalog row (63: 38 from
+  - the requirement manifest still has one requirement per catalog row (64: 38 from
     WG-1, the 11 WG-2 rows, WG-3's SESS-06, WG-2's BUSL-08, the 11 internal
-    rows main added before the port, and R11-7's BUSL-10).
+    rows main added before the port, and R11-7's BUSL-10 and AV-BUSL-COUPON-01).
 
 A row added later must be added to the hand-checked tables below (WG-2's rows are in
 ADDED_ROWS; internal AV-* rows are in INTERNAL_ROWS).
@@ -109,7 +109,7 @@ ADDED_ROWS: dict[str, tuple[str, str, str]] = {
     # WG-2: the benign disallowed-extension upload leg. "WSTG-BUSL-08" is also a
     # scheme-1 alias (REKEYED_ROWS) and is declared in REUSED_LEGACY_IDS.
     "WSTG-BUSL-08": ("Upload of Unexpected File Types", "file_upload", "file_upload"),
-    # R11-7: the business-flow leg (checkout tamper / payment skip).
+    # R11-7: the business-flow legs (checkout tamper / payment skip, 2FA disable).
     "WSTG-BUSL-10": ("Payment Functionality", "payment_tamper", "business_flow"),
 }
 
@@ -129,6 +129,7 @@ INTERNAL_ROWS: dict[str, tuple[str, str]] = {
     "AV-WRITE-BIZ-01": ("business_rule_tamper", "write_integrity"),
     "AV-MASSASSIGN-02": ("mass_assignment_create", "write_integrity"),
     "AV-WRITE-VALID-01": ("create_validation", "write_integrity"),
+    "AV-BUSL-COUPON-01": ("coupon_misuse", "business_flow"),
 }
 
 
@@ -372,7 +373,7 @@ class ManifestCountTests(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp(prefix="cov_wg1_count_"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         rep = cm.reconcile(evidence_dir=tmp, run_id="RUN_EMPTY")
-        self.assertEqual(rep["totals"]["requirements"], 63)
+        self.assertEqual(rep["totals"]["requirements"], 64)
         self.assertEqual({r["check_id"] for r in rep["requirements"]}, set(CHECKS_BY_ID))
         for spec in cm.REQUIREMENT_TESTS:
             self.assertIn(spec.check_id, CHECKS_BY_ID)
