@@ -147,6 +147,10 @@ CONFIRMABLE_CLASS_MARKERS = frozenset({
     # R11-8 (b): a session JWT with no exp claim (WSTG-SESS-07), auth_sequence's
     # decode-only expiry check. Provisional: fixture-verified only.
     "session_expiry",
+    # R11-8 (b): the password-change leg (a write; gated by the mutating ceiling).
+    "session_after_password_change",
+    "token survives password change",
+    "session survives password change",
     "session expiry",
     "token never expires",
     "missing exp claim",

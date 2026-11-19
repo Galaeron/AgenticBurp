@@ -969,6 +969,23 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "session_expiry", _has_auth_endpoint, "auth_sequence",
           "Decode the session bearer JWT (the login's token, the run identities' "
           "credentials) and check that it carries an exp claim; nothing is sent"),
+    # R11-8 (b): a run-owned identity's token kept across its own password change
+    # (and restored). A write: needs the mutating ceiling for this check >= 2.
+    Check("AV-PWCHANGE-01", "Session token survives a password change", Phase.ENDPOINT,
+          "session_after_password_change", _has_auth_endpoint, "password_change_session",
+          "For a run-owned identity: log in (token T1), change its password through the "
+          "captured change-password flow, read its account with T1, then change the "
+          "password back and verify the original logs in. T1 still accepted confirms",
+          external_refs=(
+              ExternalRef("WSTG", "WSTG-ATHN-09",
+                          "https://owasp.org/www-project-web-security-testing-guide/v42/"
+                          "4-Web_Application_Security_Testing/04-Authentication_Testing/"
+                          "09-Testing_for_Weak_Password_Change_or_Reset_Functionalities",
+                          "Testing for Weak Password Change or Reset Functionalities",
+                          version="4.2"),
+              ExternalRef("CWE", "CWE-613", "https://cwe.mitre.org/data/definitions/613.html",
+                          "Insufficient Session Expiration"),
+          )),
     # The file_upload leg uploads only a BENIGN disallowed-extension (.html) file and
     # checks it is stored and served back: BUSL-08 (unexpected file types). In
     # scheme-1 data (pre-WG-1, unmarked) "WSTG-BUSL-08" meant the TOCTOU row and still

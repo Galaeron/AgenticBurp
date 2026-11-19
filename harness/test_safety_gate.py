@@ -516,6 +516,11 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
             # sends (challenge GETs hardcoded; the captured submission's own method)
             # go through the gate-routed RunContext executor, never a raw client.
             "challenge_echo_validator.py",
+            # password_change_session (R11-8 b): the captured change-password
+            # flow is resent with its own method (and restored) through the run's
+            # gate-routed transport (send_creds), charged to the check's mutating
+            # ceiling; it holds no raw client.
+            "password_change_validator.py",
         }
 
         violations = []

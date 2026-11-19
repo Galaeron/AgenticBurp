@@ -202,6 +202,7 @@ class TestChainRuleCoverageIsDocumented(unittest.TestCase):
         "insecure_transport", "missing_headers",
         # R11-8 (b): a never-expiring session token is standalone hardening, no rule.
         "session_expiry",
+        "session_after_password_change",
     })
 
     def test_categories_with_no_chain_rule_are_the_known_documented_set(self):

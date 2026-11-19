@@ -9,6 +9,10 @@ entered RunContext) against an owned loopback app, with a matched negative.
            real login still succeeds with no throttle: no lockout or rate limit on
            failed logins (rate_limit). Negatives: a login that locks the account
            (named as left locked) and one that throttles with 429.
+  pwchange a run-owned identity's token T1 still reads its account after its own
+           password change (then restored and verified): the session survives a
+           password change (session_after_password_change, AV-PWCHANGE-01).
+           Negatives: an app that revokes T1, and one whose restore fails (named).
 """
 import asyncio
 import json
@@ -266,6 +270,206 @@ class FailedLoginBurstTests(_LegBase):
     def test_login_at_another_path_gets_no_wrong_password(self):
         app, _report = self._run(_LoginApp(), login=dict(_LOGIN, path="/other/login"))
         self.assertNotIn(True, [b.get("password") != _PW for b in self._bodies(app)])
+
+
+
+# ------------------------------------------------- token across password change
+class _AccountApp:
+    """One account (_ANN). Login mints a fresh JWT; GET change-password changes the
+    password (current/new/repeat in the query, with a valid token); `revoke`
+    revokes every earlier token on a change; `restore_fails` refuses every change
+    after the first."""
+
+    def __init__(self, *, revoke=False, restore_fails=False):
+        self.password, self.revoke, self.restore_fails = _PW, revoke, restore_fails
+        self.valid, self.minted, self.changes = set(), 0, 0
+
+    def _token(self, query_or_auth):
+        return query_or_auth.removeprefix("Bearer ").strip()
+
+    def handle(self, method, path, query, body):
+        raise AssertionError("handle_with_headers is used")
+
+    def serve(self, method, path, query, body, headers):
+        token = self._token(headers.get("Authorization", ""))
+        if path == "/rest/user/login" and method == "POST":
+            doc = json.loads(body or "{}")
+            if doc.get("email") == _ANN and doc.get("password") == self.password:
+                self.minted += 1
+                fresh = _jwt(100 + self.minted, _ANN)
+                self.valid.add(fresh)
+                return 200, {"authentication": {"token": fresh}}
+            return 401, {"error": "Invalid email or password."}
+        if path == "/rest/user/whoami":
+            return (200, {"user": {"email": _ANN}}) if token in self.valid else (401, {"user": {}})
+        if path == "/rest/user/change-password":
+            if token not in self.valid:
+                return 401, {"error": "Blocked illegal activity"}
+            q = {k: v[0] for k, v in query.items()}
+            if self.restore_fails and self.changes >= 1:
+                return 500, {"error": "Password change failed"}
+            if q.get("current") != self.password or q.get("new") != q.get("repeat"):
+                return 401, {"error": "Current password is not correct."}
+            self.password, self.changes = q["new"], self.changes + 1
+            if self.revoke:
+                self.valid = set()
+            return 200, {"user": {"email": _ANN}}
+        return 404, {}
+
+
+class _HeaderApp:
+    """_App with request headers passed to the model."""
+
+    def __init__(self, model):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import parse_qs, urlsplit
+        import threading
+        self.received = []
+        app = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _serve(self):
+                url = urlsplit(self.path)
+                size = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(size).decode() if size else ""
+                query = parse_qs(url.query)
+                app.received.append({"method": self.command, "path": url.path,
+                                     "query": query, "body": body})
+                status, doc = model.serve(self.command, url.path, query, body, self.headers)
+                raw = json.dumps(doc).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            do_GET = do_POST = _serve
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.origin = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+_CEILING = {"mutating_ceiling_by_check": {"password_change_session": 2}}
+
+
+class PasswordChangeSessionTests(_LegBase):
+    def _run(self, model, *, login=_LOGIN, gate=_CEILING, finding="session_after_password_change"):
+        from harness.models import HttpExchange
+        app = _HeaderApp(model)
+        self.addCleanup(app.close)
+        capture = HttpExchange(
+            url=app.origin + "/rest/user/change-password?current=old-pw&new=new-pw&repeat=new-pw",
+            method="GET", request_headers={"Authorization": "Bearer " + _jwt(90, _ANN)},
+            response_status=200, response_headers={"Content-Type": "application/json"},
+            response_body=json.dumps({"user": {"email": _ANN}}))
+
+        def setup(run):
+            if login is not None:
+                run.sessions.set_login("s0", login, app.origin)
+
+        report = self.run_finding(self.orch("password_change_session"), capture,
+                                  _finding(finding), identities=[_ANN], gate=gate, setup=setup)
+        return app, model, report
+
+    def assertRedacted(self, report):
+        for text in (report.summary, report.evidence):
+            self.assertNotIn(_ANN, text)
+            self.assertNotIn(_PW, text)
+            self.assertNotIn("Av9!", text)
+
+    def _changes(self, app):
+        return [r["query"] for r in app.received if r["path"] == "/rest/user/change-password"]
+
+    def test_token_surviving_the_change_confirms_and_is_restored(self):
+        app, model, report = self._run(_AccountApp())
+        self.assertEqual(report.status, "confirmed", report.summary)
+        self.assertEqual(report.finding_class, "session_after_password_change")
+        self.assertIn("survives a password change", report.summary)
+        self.assertIn("eval-user-1", report.summary)
+        self.assertIn("Password restored", report.evidence)
+        self.assertEqual(model.password, _PW, "the original password was not restored")
+        changes = self._changes(app)
+        self.assertEqual(len(changes), 2)
+        self.assertEqual(changes[0]["current"], [_PW])
+        self.assertEqual(changes[1]["new"], [_PW])
+        self.assertRedacted(report)
+
+    def test_revoked_token_is_a_negative(self):
+        _app, model, report = self._run(_AccountApp(revoke=True))
+        self.assertEqual(report.status, "not_confirmed", report.summary)
+        self.assertFalse(report.confirmed)
+        self.assertIn("revoked on a password change", report.summary)
+        self.assertEqual(model.password, _PW, "the original password was not restored")
+        self.assertRedacted(report)
+
+    def test_failed_restore_is_named(self):
+        _app, model, report = self._run(_AccountApp(restore_fails=True))
+        self.assertEqual(report.status, "confirmed", report.summary)
+        self.assertIn("RESTORE FAILED", report.summary)
+        self.assertIn("eval-user-1", report.summary)
+        self.assertNotEqual(model.password, _PW)
+        self.assertRedacted(report)
+
+    def test_failed_restore_is_named_on_a_negative_too(self):
+        _app, _model, report = self._run(_AccountApp(revoke=True, restore_fails=True))
+        self.assertEqual(report.status, "not_confirmed", report.summary)
+        self.assertIn("RESTORE FAILED", report.summary)
+
+    def test_default_ceiling_sends_nothing(self):
+        app, model, report = self._run(_AccountApp(), gate={})
+        self.assertEqual(report.status, "skipped", report.summary)
+        self.assertEqual(app.received, [])
+
+    def test_no_mutating_replay_sends_nothing(self):
+        app, _model, report = self._run(_AccountApp(),
+                                        gate=dict(_CEILING, allow_mutating_replay=False))
+        self.assertEqual(app.received, [])
+
+    def test_identity_without_a_declared_login_sends_nothing(self):
+        app, _model, report = self._run(_AccountApp(), login=None)
+        self.assertEqual(report.status, "skipped", report.summary)
+        self.assertIn("run-owned identity", report.summary)
+        self.assertEqual(app.received, [])
+
+    def test_coverage_row_capability_and_class_gate(self):
+        from harness.categories import canonicalize
+        from harness.coverage_model import CHECK_CATALOG
+        from harness.run_context import RunContext
+        from harness.validators.base import proves_finding_class
+        from harness.validators.password_change_validator import PasswordChangeSessionValidator
+        row = next(c for c in CHECK_CATALOG if c.id == "AV-PWCHANGE-01")
+        self.assertEqual(row.vulnerability_class, "session_after_password_change")
+        self.assertEqual(canonicalize("token survives password change"),
+                         "session_after_password_change")
+        self.assertNotEqual(canonicalize("session not invalidated"),
+                            "session_after_password_change")
+        capture = _ex("http://127.0.0.1:1/rest/user/change-password?current=a&new=b&repeat=b")
+        orch = self.orch("password_change_session")
+        for cfg, want in (({}, "policy_denied"), (_CEILING, "ready")):
+            run = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=10,
+                                    gate_config=dict({"active_enabled": True,
+                                                      "allow_mutating_replay": True}, **cfg))
+            decision = orch.validator_registry.capability_for_check(row, capture, run_context=run)
+            self.assertEqual(decision["status"], want, decision)
+        read = _ex("http://127.0.0.1:1/api/items/5")
+        self.assertEqual(orch.validator_registry.capability_for_check(
+            row, read, run_context=run)["status"], "unsupported")
+        validator = PasswordChangeSessionValidator()
+        self.assertFalse(validator.applies(_finding("session_after_password_change"), read))
+        from harness.validators.base import ValidationResult
+        result = ValidationResult("password_change_session", "confirmed",
+                                  "session_after_password_change", confirmed=True,
+                                  mechanism_classes=("session_after_password_change",))
+        self.assertFalse(proves_finding_class(validator, result, _finding("session_timeout"),
+                                              capture))
 
 
 if __name__ == "__main__":
