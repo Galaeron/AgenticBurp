@@ -5317,6 +5317,61 @@ Non-negotiables apply:
   - `phase_timings` is filled.
   - Negative control: no extra pass starts after the soft-cancel deadline.
 
+### [x] R11-4b — Close the three follow-ups from the R11-4 review
+- **Domain:** Scheduling / instrumentation · **Effort:** S · **Mode:** LOOP (offline).
+- **Evidence (VERIFIED, code read 2026-11-19):**
+  - The final pass's `drive_legs` and `held_replays` steps were tested only on the coverage
+    tracker. The caller tests stubbed the coverage drive, so neither step ran through
+    `investigate_engagement`.
+  - `server.py`'s cancelled-job result had no instrumentation block. A cancelled job reported
+    no `phase_timings` or `sqlmap_targeting`, and its manifest's `phase_timings` was empty.
+    This may be why the r11 post-mortem read `phase_timings` as empty.
+  - `experiments_final` got only the coverage deadline:
+    - With no `coverage_drive_seconds`, it ran with no time bound at all.
+    - The coverage deadline is not clamped to the investigation deadline unless rollover is
+      on, so the pass could run into finalise's reserve or past the run's deadline.
+    - Once the deadline had passed (the retry rounds and the final pass run past it), the
+      pass sent nothing. It only re-evaluated and marked READY tasks deferred ("stage
+      deadline reached"), but the phase record showed it as begun with no budget.
+- **DONE (2026-11-19, branch `claude/r11-4b-final-pass-fa21d0`):**
+  1. `harness/test_final_pass_callers.py` runs the real coverage drive through
+     `investigate_engagement` on one fake clock:
+     - A leg the drive queued and never attempted is sent by the final pass, and nothing the
+       drive sent is sent again.
+     - A replay the per-endpoint share held is sent once, and the cell's held list empties.
+     - Controls: the pass off; no time left; only the finalise reserve left.
+     - No bug found. Unplugging either step fails the positive tests.
+  2. A cancelled job now reports phase timings:
+     - `investigate_engagement` leaves its `RunInstrumentation` on the run
+       (`RunContext.instrumentation`).
+     - The server's cancelled-job result adds the same `{instrumentation, costs}` a finished
+       job reports. The phase the cancel cut is closed with `interrupted: true`
+       (`PhaseRecorder.abort`).
+     - Test: `harness/test_cancelled_instrumentation.py`. Its controls: a finished job is
+       unchanged; a job cancelled before any engagement started reports no block.
+     - This covers the `CancelledError` path that a cancel (or a soft-cancel deadline sent
+       through `/cancel`) takes. A job cancelled before its coroutine's first step
+       (`_ensure_cancelled`) still has no block, since no engagement started.
+  3. `experiments_final` is bounded by the coverage deadline and by the investigation
+     deadline less the finalise reserve (`engagement.final_pass.reserve_seconds`, which
+     applies whether the final pass is on or off):
+     - Once that bound has passed, the phase is recorded as skipped, with why:
+       - `PhaseRecorder.skip` writes a `skipped: <reason>` record;
+       - the handoff lists it under `phases.skipped`;
+       - `experiment_final_pass.skipped` carries the same reason.
+     - The pass then only marks READY tasks deferred and sends nothing.
+     - `experiments_final` is now in `CONDITIONAL_PHASES`.
+     - Fake-clock caller tests are in `test_final_pass.FinalPassCallerTests`:
+       - no drive deadline: the pass is bounded at deadline less reserve;
+       - a drive deadline past the run's deadline: bounded by the run's deadline;
+       - skipped with only the reserve left;
+       - skipped once the final pass ran past the drive deadline.
+       - Control: it still runs, within the drive deadline, when time remains.
+- **Tests that fail before the change:** the item 2 server test and the
+  run-registration test; the item 3 tests. The item 3 control's deadline check passed
+  before; it fails before only on the new `budget_s`. The item 1 tests pass on the old code,
+  since they only add coverage.
+
 ### [x] R11-5 — Find why thousands of successful writes produced no write verdict
 - **Domain:** Authorization / write checks · **Effort:** M · **Depends on:** HU-1 for intent
   on non-owned objects · **Mode:** LOOP (offline investigation from the r11 store, then a fix).

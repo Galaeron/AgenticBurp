@@ -3442,17 +3442,41 @@ class ChainMixin:
 
         # AR-FP: the bounded final re-evaluation of experiment tasks over the values
         # and sessions every later phase left, before proofs are projected and the
-        # dispositions taken. Inside the coverage stage's deadline; best-effort like
-        # the experiments phase.
-        _instr.phases.begin("experiments_final")
+        # dispositions taken. Best-effort like the experiments phase.
+        # R11-4b: bounded by the coverage stage's deadline AND the investigation
+        # deadline less the finalise reserve (engagement.final_pass.reserve_seconds,
+        # read whether the final pass is on or not). Before, it took the coverage
+        # deadline alone: with no coverage_drive_seconds it ran unbounded, and the
+        # coverage deadline (not clamped to the investigation deadline) could let it
+        # run into finalise's reserve or past the run's deadline. Once that bound has
+        # passed (the retry rounds and final pass run past the coverage deadline), the
+        # phase is recorded as skipped, with why; the pass then only re-evaluates and
+        # marks the READY tasks deferred ("stage deadline reached") -- nothing is sent.
+        _exp_final_bounds = [(d, why) for d, why in (
+            (_coverage_deadline, "the coverage stage's deadline has passed"),
+            (None if _investigation_deadline is None
+             else _investigation_deadline - _final_cfg.reserve_seconds,
+             "the investigation deadline less the finalise reserve "
+             f"({_final_cfg.reserve_seconds:.0f} s) has passed")) if d is not None]
+        _exp_final_stop_at, _exp_final_why = min(_exp_final_bounds, key=lambda b: b[0],
+                                                 default=(None, None))
+        _exp_final_skipped = (_exp_final_why if _exp_final_stop_at is not None
+                              and time.monotonic() >= _exp_final_stop_at else None)
+        if _exp_final_skipped:
+            _instr.phases.skip("experiments_final", _exp_final_skipped)
+        else:
+            _instr.phases.begin("experiments_final")
+            _instr.phases.set_budget("experiments_final", _budget_left(_exp_final_stop_at))
         _experiment_final_pass = None
         try:
             _experiment_final_pass = await self._final_experiment_pass(
                 state, _asm, run_context, base_url=base_url, captured=_all_captured,
-                ownership=ownership, deadline=_coverage_deadline)
+                ownership=ownership, deadline=_exp_final_stop_at)
         except Exception as e:
             log.warning("investigate_engagement: final experiment pass failed: %s", e)
             _errors.append({"phase": "experiments_final", "error": f"{type(e).__name__}: {e}"})
+        if _exp_final_skipped and isinstance(_experiment_final_pass, dict):
+            _experiment_final_pass["skipped"] = _exp_final_skipped
 
         from harness.experiment import project_proofs
         try:
