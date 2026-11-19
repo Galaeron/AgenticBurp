@@ -313,6 +313,10 @@ _PYTHON_ONLY: tuple[CapabilityOwnership, ...] = (
     _python_only("well_known", "well_known",
                  note="AV-WELLKNOWN-01 leg: security.txt and CSAF provider metadata once per "
                       "origin, reported as observations. GET-only; no Java case."),
+    _python_only("challenge_echo", "challenge_echo",
+                 note="WSTG-BUSL-07 leg: a challenge response that carries its own answer, "
+                      "read from captured issue/submit pairs; the active submit is off by "
+                      "default (challenge_echo_validator.py). No Java case."),
 )
 
 CAPABILITY_MATRIX: dict[str, CapabilityOwnership] = {

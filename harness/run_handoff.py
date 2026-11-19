@@ -49,9 +49,10 @@ SCHEMA_VERSION = 1
 # order (test_run_handoff checks this list against orchestrator_chain's source).
 RUN_PHASES = ("discovery", "header_audit", "business_context", "experiments", "worklist",
               "recrawl", "capture_review", "chain_rounds", "second_order", "coverage_drive",
-              "retry_rounds", "experiments_final", "finalise")
-# Opened only when their feature is on (engagement.recrawl / engagement.retry_rounds).
-CONDITIONAL_PHASES = frozenset({"recrawl", "retry_rounds"})
+              "retry_rounds", "final_pass", "experiments_final", "finalise")
+# Opened only when their feature is on (engagement.recrawl / engagement.retry_rounds /
+# engagement.final_pass).
+CONDITIONAL_PHASES = frozenset({"recrawl", "retry_rounds", "final_pass"})
 TERMINAL_PHASE = "finalise"
 # Sends after this phase begins count as testing a worklist node.
 _TESTING_FROM = "worklist"
