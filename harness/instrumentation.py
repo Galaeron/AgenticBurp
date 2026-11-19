@@ -41,10 +41,13 @@ class PhaseRecorder:
     sequential form for a function whose phases follow one another: it ends the
     phase that is open and starts the next, so each boundary is a single line.
 
-    A record is {phase, started_s (since this recorder was created), elapsed_s,
-    requests_used_delta, model_calls_delta}; a delta is None when its counter is
-    unavailable. Each finished phase is announced on the activity feed
-    ("phase X finished in Ns")."""
+    A record is {phase, started_s (since this recorder was created), ended_s,
+    elapsed_s, budget_s, unused_s, requests_used_delta, model_calls_delta}; a delta
+    is None when its counter is unavailable. `budget_s` is the wall time the phase
+    was allowed (`set_budget`, or `begin(name, budget_s=...)`), None when nothing
+    bounded it; `unused_s` is what it left of that budget (R11-4: r11's records
+    had no budget, so time a phase left could not be read from the manifest).
+    Each finished phase is announced on the activity feed ("phase X finished in Ns")."""
 
     def __init__(self, *, requests=None, model_calls=None, announce=True, clock=time.monotonic,
                  on_event=None):
@@ -59,10 +62,17 @@ class PhaseRecorder:
         self._records: list[tuple[int, dict]] = []     # (entry order, record)
         self._entries = itertools.count()
         self._open = None
+        self._open_name = None
+        self._open_entry_id = None
+        self._last_entry = None
+        self._budgets: dict[int, float] = {}   # entry -> budget seconds
 
     @contextlib.contextmanager
-    def phase(self, name: str):
+    def phase(self, name: str, budget_s: float | None = None):
         entry = next(self._entries)
+        self._last_entry = entry
+        if budget_s is not None:
+            self._budgets[entry] = budget_s
         started = self._clock()
         requests_before, calls_before = _count(self._requests), _count(self._model_calls)
         self._notify("begin", name)
@@ -74,11 +84,16 @@ class PhaseRecorder:
             raise
         finally:
             self._notify("abort" if aborted else "end", name)
-            elapsed = max(0.0, self._clock() - started)
+            ended = self._clock()
+            elapsed = max(0.0, ended - started)
+            budget = self._budgets.pop(entry, None)
             self._records.append((entry, {
                 "phase": name,
                 "started_s": round(started - self._t0, 3),
+                "ended_s": round(ended - self._t0, 3),
                 "elapsed_s": round(elapsed, 3),
+                "budget_s": None if budget is None else round(budget, 3),
+                "unused_s": None if budget is None else round(max(0.0, budget - elapsed), 3),
                 "requests_used_delta": _delta(requests_before, _count(self._requests)),
                 "model_calls_delta": _delta(calls_before, _count(self._model_calls)),
             }))
@@ -98,16 +113,27 @@ class PhaseRecorder:
         except Exception:   # bookkeeping never sinks the run
             log.debug("phase event hook failed", exc_info=True)
 
-    def begin(self, name: str) -> None:
+    def begin(self, name: str, budget_s: float | None = None) -> None:
         """End the open phase (if any) and start `name`."""
         self.finish()
-        cm = self.phase(name)
+        cm = self.phase(name, budget_s)
         cm.__enter__()
         self._open = cm
+        self._open_name = name
+        self._open_entry_id = self._last_entry
+
+    def set_budget(self, name: str, budget_s: float | None) -> None:
+        """Record the wall-time budget of the open `begin` phase `name`, decided
+        after it began (a slice is computed when the phase starts its work). A
+        name that is not the open phase, or a None budget, changes nothing."""
+        if budget_s is None or self._open is None or self._open_name != name:
+            return
+        self._budgets[self._open_entry_id] = max(0.0, float(budget_s))
 
     def finish(self) -> None:
         """End the open phase, if any. Safe to call repeatedly."""
         cm, self._open = self._open, None
+        self._open_name = None
         if cm is not None:
             cm.__exit__(None, None, None)
 
@@ -172,7 +198,7 @@ class RunInstrumentation:
     Created at the start: it takes a baseline of the process-wide counters (model
     client, store) so the result reports this run's share, and owns the phase
     recorder. `snapshot()` builds the `instrumentation` block for the job result:
-    {model_metrics, phase_timings, tool_lifecycle, store_timing[, health]}.
+    {model_metrics, phase_timings, tool_lifecycle, store_timing, sqlmap_targeting[, health]}.
 
     The counters are process-wide, so a second engagement running at the same time
     in the same process is counted in both; one engagement at a time is exact."""
@@ -238,6 +264,14 @@ class RunInstrumentation:
                 log.debug("health_report failed", exc_info=True)
         if self.context_preflight is not None:
             out["context_preflight"] = self.context_preflight
+        # R11-3/R11-4: sqlmap's held targets per endpoint family and the transport
+        # endpoints it skipped, beside the phase walls (None: sqlmap never asked).
+        try:
+            from harness import sqlmap_targeting
+            out["sqlmap_targeting"] = sqlmap_targeting.run_report(self._run_context)
+        except Exception:
+            log.debug("sqlmap targeting report failed", exc_info=True)
+            out["sqlmap_targeting"] = None
         return out
 
     def result_blocks(self) -> dict:

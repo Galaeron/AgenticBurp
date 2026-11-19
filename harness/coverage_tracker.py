@@ -801,16 +801,71 @@ class CoverageTracker:
                 self.matrix.record(ident, ep_key, check.id, status=CellStatus.INCONCLUSIVE,
                                    reason="validator dispatch returned no result", validator=check.confirmation)
                 continue
-            status = _covered_status(res, _LEG_STATUS.get(getattr(res, "status", ""), _LEG_STATUS_UNKNOWN))
-            executed, fresh, referenced = _attempt_facts(res, status)
-            self.matrix.record(
-                ident, ep_key, check.id, status=status,
-                reason=(getattr(res, "summary", "") or f"{check.confirmation} leg driven off the matrix")[:180],
-                confidence=getattr(res, "confidence", None),
-                validator=getattr(res, "validator", None) or check.confirmation,
-                evidence=(getattr(res, "evidence", "") or "")[:200],
-                executed=executed, attempts=fresh, referenced_attempts=referenced)
+            self._record_leg_result(ident, ep_key, check, res)
         return spent
+
+    def _record_leg_result(self, ident, ep_key, check, res) -> None:
+        status = _covered_status(res, _LEG_STATUS.get(getattr(res, "status", ""), _LEG_STATUS_UNKNOWN))
+        executed, fresh, referenced = _attempt_facts(res, status)
+        self.matrix.record(
+            ident, ep_key, check.id, status=status,
+            reason=(getattr(res, "summary", "") or f"{check.confirmation} leg driven off the matrix")[:180],
+            confidence=getattr(res, "confidence", None),
+            validator=getattr(res, "validator", None) or check.confirmation,
+            evidence=(getattr(res, "evidence", "") or "")[:200],
+            executed=executed, attempts=fresh, referenced_attempts=referenced)
+
+    # --- R11-4 final pass (harness/final_pass.py): the drive goes on, same tracker ---
+
+    def reopen_unattempted(self) -> int:
+        """Put back to PENDING each queued cell the drive never attempted, which
+        finalize_pending_reasons had closed as SKIPPED with nothing sent. A cell
+        with child cases needs nothing: its unrun cases are still PENDING. Returns
+        how many cells were reopened."""
+        n = 0
+        for key in sorted(self.queued - self.attempted):
+            cell = self.matrix.cells().get(key)
+            if (cell is None or cell.executed or cell.status != CellStatus.SKIPPED
+                    or self.matrix.has_cases(*key)):
+                continue
+            self.matrix.record(*key, status=CellStatus.PENDING, reason="")
+            n += 1
+        return n
+
+    async def drive_remaining(self, run_leg, *, case_mode: bool, budget: int,
+                              deadline: float | None,
+                              field_cap: int = PER_PARAMETER_FIELD_CAP) -> dict:
+        """Drive what the first drive left (queued, never attempted), with the
+        dispatches its leg budget has left, until `deadline`. The drive's own
+        stop reason and counters are kept; this returns this pass's."""
+        first_stop = self.stopped_by
+        self.stopped_by = None
+        reopened = 0 if case_mode else self.reopen_unattempted()
+        before = len(self.attempted)
+        passive_before = self.passive_judged
+        if case_mode:
+            driven = await self.drive_coverage_cases(run_leg, driveable=self.driveable, budget=budget,
+                                                     deadline=deadline, field_cap=field_cap)
+        else:
+            driven = await self.drive_coverage_legs(run_leg, driveable=self.driveable, budget=budget,
+                                                    deadline=deadline)
+        out = {"reopened": reopened, "cells_attempted": len(self.attempted) - before,
+               "dispatches": driven, "passive_judged": self.passive_judged - passive_before,
+               "stopped_by": self.stopped_by,
+               "queued_not_attempted": len(self.queued - self.attempted)}
+        self.stopped_by = first_stop
+        return out
+
+    def record_held_result(self, ident, ep_key, check, case_key, res) -> None:
+        """Record the verdict of a cell (or case, with `case_key`) whose held
+        replays the final pass ran, the same way the drive records one."""
+        if res is None:
+            return
+        if case_key is None:
+            self._record_leg_result(ident, ep_key, check, res)
+        else:
+            self._record_case_result(ident, ep_key, check, case_key, res,
+                                     f"{check.confirmation} driven with its held replays")
 
     def expand_parameter_cases(self, endpoints: dict[str, dict], *,
                                driveable: set[str] | None = None,
@@ -1491,6 +1546,21 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     report["queued_not_attempted"] = len(tracker.queued - tracker.attempted)
     if tracker_out is not None:
         tracker_out.append(tracker)
+    return report
+
+
+def report_after_final_pass(tracker, previous: dict, investigated_keys: set[str] | None = None,
+                            final_pass: dict | None = None) -> dict:
+    """Re-issue a driven coverage report once the final pass (R11-4) has driven more
+    cells on `tracker`. The first drive's statistics in `previous` are kept, and
+    the pass's own counts go under `final_pass`."""
+    tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
+    report = tracker.report()
+    for key, value in previous.items():
+        report.setdefault(key, value)
+    report["queued_not_attempted"] = len(tracker.queued - tracker.attempted)
+    if final_pass is not None:
+        report["final_pass"] = final_pass
     return report
 
 

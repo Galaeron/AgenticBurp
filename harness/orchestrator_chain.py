@@ -1143,7 +1143,12 @@ class ChainMixin:
         # re-crawl rounds, and per-phase time-slices of the deadline above.
         from harness.phase_schedule import PhaseSchedule
         from harness.route_feed import RecrawlConfig, RouteFeed, endpoint_route_keys
-        _schedule = PhaseSchedule.from_config(self.config, _investigation_deadline)
+        _schedule = PhaseSchedule.from_config(self.config, _investigation_deadline,
+                                              clock=time.monotonic)
+
+        def _budget_left(deadline):
+            """R11-4: a phase's wall-time budget, for phase_timings (None: unbounded)."""
+            return None if deadline is None else max(0.0, deadline - time.monotonic())
         _recrawl_cfg = RecrawlConfig.from_config(self.config)
         _per_principal = bool((self.config.get("engagement") or {}).get("crawl_per_principal", False))
         _run_budget = getattr(run_context or _run_context_mod.current_run_context(), "budget", None)
@@ -1274,6 +1279,19 @@ class ChainMixin:
             _retry_ledger = retry_rounds.RetryLedger()
             _worklist_kwargs = _retry_ledger.wire(_worklist_kwargs)
             _review_kwargs["model_failed"] = _retry_ledger.review_failed
+        # R11-4 engagement.final_pass (off by default): before finalise, the time left
+        # goes to the budget-skipped worklist nodes, the drive legs never attempted and
+        # the replays the per-endpoint share held (harness/final_pass.py). It needs the
+        # retry ledger's record of what each sweep settled; it shares the retry rounds'.
+        from harness import final_pass as _final_pass_mod
+        _final_cfg = _final_pass_mod.FinalPassConfig.from_config(self.config)
+        _final_ledger = _retry_ledger
+        _final_report: dict = {"enabled": False}
+        if _final_cfg.enabled and _investigation_deadline is None:
+            _final_report = {"enabled": True, "steps": [], "stopped_by": "no_deadline"}
+        elif _final_cfg.enabled and _final_ledger is None:
+            _final_ledger = retry_rounds.RetryLedger()
+            _worklist_kwargs = _final_ledger.wire(_worklist_kwargs)
         # The shape-driven legs one sweep may attempt: by default no count bound when
         # the run is time-boxed (its deadline bounds them), else 24.
         _max_precondition_legs = worklist_investigator.resolve_precondition_legs(
@@ -2199,6 +2217,7 @@ class ChainMixin:
                 return
             _instr.phases.begin("recrawl")
             deadline = _schedule.deadline_for("recrawl", _investigation_deadline)
+            _instr.phases.set_budget("recrawl", _budget_left(deadline))
             while (_recrawl_report["rounds"] < _recrawl_cfg.max_rounds
                    and feed.pending() >= _recrawl_cfg.min_new_routes):
                 if run_context.cancel.cancelled:
@@ -2262,8 +2281,9 @@ class ChainMixin:
                     known={key for ep in state.endpoints.values()
                            for key in endpoint_route_keys(ep)})
                 run_context.route_feed = _route_feed
-            outcomes, all_findings = await _investigate(
-                state, roles, deadline=_schedule.deadline_for("worklist", _investigation_deadline))
+            _worklist_deadline = _schedule.deadline_for("worklist", _investigation_deadline)
+            _instr.phases.set_budget("worklist", _budget_left(_worklist_deadline))
+            outcomes, all_findings = await _investigate(state, roles, deadline=_worklist_deadline)
             _journal_phase("worklist")
             await _recrawl_rounds(_route_feed)
 
@@ -2356,6 +2376,7 @@ class ChainMixin:
         # phase_slices: review gets its share of what is left, so the chain rounds
         # after it are not starved; an explicit capture_review_seconds still binds.
         _review_deadline = _schedule.deadline_for("capture_review", _review_deadline)
+        _instr.phases.set_budget("capture_review", _budget_left(_review_deadline))
         # engagement.review_overlap: when that share would stop a model-bound review
         # short of its own deadline, the review keeps going in the background while
         # the request-bound phases below send theirs, and is drained before the retry
@@ -2418,6 +2439,7 @@ class ChainMixin:
         chains = list(link["chain_findings"])
         creds, rounds, seen_ident = link["credential_caps"], 0, set()
         _chain_deadline = _schedule.deadline_for("chain_rounds", _investigation_deadline)
+        _instr.phases.set_budget("chain_rounds", _budget_left(_chain_deadline))
         while creds and rounds < max_chain_rounds:
             if _chain_deadline is not None and time.monotonic() >= _chain_deadline:
                 _errors.append({"phase": "chain_rounds",
@@ -2631,13 +2653,30 @@ class ChainMixin:
             if _overlap is not None:   # the reserve is the drive's: the review stops here
                 await _overlap.drain("coverage request reserve")
             _run_budget.release_hold()
-        _coverage_deadline = (time.monotonic() + self.coverage_drive_seconds
+        # R11-4 engagement.coverage_drive_rollover (off by default): the drive also gets
+        # the time the last sliced phase left unused (PhaseSchedule.rollover), up to
+        # the investigation deadline. r11's chain rounds used 0.4 s of a 3 h slice
+        # while the drive stopped at its own 5 h with 283 legs not attempted. The
+        # per-endpoint check share stays a share of coverage_drive_seconds.
+        _coverage_rollover = 0.0
+        if (self.coverage_drive_seconds > 0
+                and (self.config.get("engagement") or {}).get("coverage_drive_rollover", False)):
+            _coverage_rollover = _schedule.rollover()
+        _coverage_deadline = (time.monotonic() + self.coverage_drive_seconds + _coverage_rollover
                               if self.coverage_drive_seconds > 0 else None)
+        if _coverage_rollover and _investigation_deadline is not None:
+            _coverage_deadline = min(_coverage_deadline, _investigation_deadline)
+        _instr.phases.set_budget("coverage_drive", _budget_left(_coverage_deadline))
         coverage: dict = {}
         # The driven tracker, kept so retry rounds' findings can be recorded into it
         # (coverage_tracker.refresh_after_retry_rounds).
         _coverage_trackers: list = []
         _prerequisite_blocks: dict = {}   # (endpoint, identity) -> grouped entry (E5b)
+        # R11-4: what the final pass needs to go on with the drive -- its leg callable,
+        # its mode, the replays the per-endpoint share held, and the share ledger.
+        _drive_hooks: dict = {}
+        _held_cells: dict = {}            # cell key -> the held replays of that cell
+        _held_pass: dict = {"active": False, "stop_at": None}
         try:
             from harness import coverage_tracker
             # E7: a caller's checkpoint wins; otherwise the journal's, when an earlier attempt
@@ -2961,6 +3000,14 @@ class ChainMixin:
                     outcomes, held_back = [], []
                     share_key = (ep_key, check.id) + (
                         (identity,) if check.confirmation in _PER_IDENTITY_SHARE else ())
+                    # R11-4: a replay the share held is remembered, with the verdicts
+                    # of the replays that ran, so the final pass sends only it.
+                    cell_key = (identity, ep_key, check.id,
+                                case_key.coord_id() if case_key is not None else None)
+                    held_entry = _held_cells.get(cell_key) if _held_pass["active"] else None
+                    if held_entry is not None:
+                        outcomes = list(held_entry["prior"])
+                    held_nodes: set = set()
                     # A per-parameter dispatch of a query or body input replays only
                     # the captures that carry that input; any other capture cannot
                     # test it, and the leg would only decline it.
@@ -2970,6 +3017,9 @@ class ChainMixin:
                     for node in worklist_investigator.captured_nodes(
                             dict(ep.to_dict(), capture_variants=variants), base_url, selected_roles,
                             include_probes=True):
+                        replay_key = worklist_investigator.node_key(node)
+                        if held_entry is not None and replay_key not in held_entry["nodes"]:
+                            continue   # its verdict is in `prior`; it is not sent again
                         problem = worklist_investigator.capture_problem(node)
                         if problem:
                             outcomes.append(_unbuilt(_VR(
@@ -2982,9 +3032,12 @@ class ChainMixin:
                                 check.confirmation, "skipped", check.vulnerability_class,
                                 summary=f"no capture of this identity carries {case_key.label()}, "
                                         "so this leg cannot test it on its own; nothing was sent")))
-                        elif (_endpoint_check_cap is not None
-                              and _endpoint_check_spent.get(share_key, 0.0) >= _endpoint_check_cap):
+                        elif ((_endpoint_check_cap is not None
+                               and _endpoint_check_spent.get(share_key, 0.0) >= _endpoint_check_cap)
+                              or (held_entry is not None
+                                  and time.monotonic() >= _held_pass["stop_at"])):
                             # A started replay always finishes; only the next one waits.
+                            held_nodes.add(replay_key)
                             capped = _endpoint_check_capped.setdefault(share_key, {
                                 "endpoint": ep_key, "check": check.id,
                                 "identity": identity if len(share_key) > 2 else None,
@@ -3006,6 +3059,16 @@ class ChainMixin:
                                 _endpoint_check_spent[share_key] = (
                                     _endpoint_check_spent.get(share_key, 0.0)
                                     + time.monotonic() - started)
+                    # R11-4: remember the held replays for the final pass (or forget
+                    # them once it ran them all, or a capture of the cell confirmed).
+                    if held_back and not any(r is not None and r.confirmed for r in outcomes):
+                        _held_cells[cell_key] = {
+                            "identity": identity, "method": method, "path": path, "check": check,
+                            "case_key": case_key, "remainder_only": remainder_only,
+                            "share_key": share_key, "prior": list(outcomes),
+                            "nodes": held_nodes, "replays": len(held_back)}
+                    else:
+                        _held_cells.pop(cell_key, None)
                     # A replay the time share held back leaves the cell open, unless
                     # another capture of it already confirmed (that proof was recorded).
                     if not any(r is not None and r.confirmed for r in outcomes):
@@ -3055,6 +3118,10 @@ class ChainMixin:
                         checkpoint=coverage_checkpoint,
                         context_key=coverage_tracker.resume_context_key(self.config),
                         deadline=_coverage_deadline, **_coverage_kwargs)
+                _drive_hooks.update(run_leg=(_run_leg_core if self.engagement_coverage_case_drive
+                                             else _run_leg),
+                                    case_mode=bool(self.engagement_coverage_case_drive),
+                                    spent=_endpoint_check_spent)
                 if coverage.get("checkpoint"):
                     _journal_put("coverage:checkpoint", coverage["checkpoint"])
                     _journal_phase("coverage")
@@ -3171,7 +3238,8 @@ class ChainMixin:
         # worklist and review captures again with growing budgets, for the nodes and
         # captures earlier passes left (harness/retry_rounds.py). Off by default.
         if _retry_ledger is not None:
-            _instr.phases.begin("retry_rounds")
+            _instr.phases.begin("retry_rounds", budget_s=_budget_left(
+                _investigation_deadline - _retry_cfg.reserve_seconds))
 
             async def _retry_sweep(budgets, deadline):
                 summary: dict = {}
@@ -3211,7 +3279,132 @@ class ChainMixin:
             log.info("investigate_engagement: retry rounds -- %d round(s), stopped by %s",
                      len(_retry_report.get("rounds") or []), _retry_report.get("stopped_by"))
 
-        if (_retry_ledger is not None and _retry_report.get("rounds")) or _overlap is not None:
+        # R11-4 engagement.final_pass: with time left before the deadline (less its
+        # reserve for finalise), one pass in priority order over the worklist nodes a
+        # budget skipped, the drive legs never attempted and the replays the
+        # per-endpoint share held (harness/final_pass.py). Every leg goes through the
+        # same dispatch, gates and caps as before; the pass only reuses time.
+        if _final_cfg.enabled and _final_ledger is not None:
+            _final_stop_at = _investigation_deadline - _final_cfg.reserve_seconds
+            _instr.phases.begin("final_pass", budget_s=_budget_left(_final_stop_at))
+            _final_rounds = len(_retry_report.get("rounds") or [])
+
+            def _final_cancelled():
+                return bool(run_context is not None and run_context.cancel.cancelled)
+
+            async def _final_worklist_nodes(stop_at):
+                last = (_retry_report.get("rounds") or [None])[-1]
+                by_reason = (last if last is not None
+                             else (worklist_summary.get("skipped_by_reason") or {}))
+                left = (by_reason.get("budget_exhausted", 0) or 0) + (by_reason.get("time_budget", 0) or 0)
+                unsettled = len(_final_ledger.outcomes) - len(_final_ledger.settled())
+                if not left and not unsettled:
+                    return None
+                budgets = retry_rounds.round_budgets(
+                    {"max_nodes": max_nodes, "step_budget": step_budget,
+                     "max_precondition_legs": _max_precondition_legs}, _retry_cfg, _final_rounds + 1)
+                summary: dict = {}
+                outs = await worklist_investigator.investigate_worklist(
+                    _probe, state, base_url, roles, confirm_fn=_confirm,
+                    precondition_fn=_precondition, max_nodes=budgets["max_nodes"],
+                    step_budget=budgets["step_budget"],
+                    max_precondition_legs=budgets["max_precondition_legs"],
+                    summary_out=summary, stop_on_confirm=stop_on_confirm, deadline=stop_at,
+                    **_final_ledger.sweep_kwargs())
+                fresh = [o for o in outs if not o.get("resumed")]
+                for o in fresh:
+                    o["final_pass"] = True
+                outcomes.extend(fresh)
+                all_findings.extend(f for o in fresh for f in o.get("findings_detail", []))
+                skipped = summary.get("skipped_by_reason") or {}
+                return {"budgets": budgets, "skipped_before": left, "ran": len(fresh),
+                        "settled": sum(1 for o in fresh if retry_rounds.is_settled(o)),
+                        "findings": sum(len(o.get("findings_detail") or []) for o in fresh),
+                        "budget_exhausted": skipped.get("budget_exhausted", 0),
+                        "time_budget": skipped.get("time_budget", 0)}
+
+            async def _final_drive_legs(stop_at):
+                if not _drive_hooks or not _coverage_trackers:
+                    return None
+                tracker = _coverage_trackers[-1]
+                if not (tracker.queued - tracker.attempted):
+                    return None
+                used = coverage.get("cases_driven" if _drive_hooks["case_mode"] else "legs_driven") or 0
+                budget_left = max(0, int(self.coverage_leg_budget) - int(used))
+                if budget_left <= 0:
+                    return {"stopped_by": "leg budget", "dispatches": 0,
+                            "queued_not_attempted": len(tracker.queued - tracker.attempted)}
+                return await tracker.drive_remaining(
+                    _drive_hooks["run_leg"], case_mode=_drive_hooks["case_mode"], budget=budget_left,
+                    deadline=stop_at, field_cap=self.coverage_parameter_field_cap)
+
+            async def _final_held_replays(stop_at):
+                if not _held_cells or not _coverage_trackers:
+                    return None
+                tracker = _coverage_trackers[-1]
+                cells = len(_held_cells)
+                replays = sum(e["replays"] for e in _held_cells.values())
+                # Each (endpoint, check) held gets its share again, for this pass.
+                for entry in _held_cells.values():
+                    _drive_hooks["spent"][entry["share_key"]] = 0.0
+                _held_pass.update(active=True, stop_at=stop_at)
+                ran = confirmed = 0
+                stopped = None
+                try:
+                    for key in list(_held_cells):
+                        if _final_cancelled():
+                            stopped = "cancelled"
+                            break
+                        if time.monotonic() >= stop_at:
+                            stopped = "deadline"
+                            break
+                        entry = _held_cells[key]
+                        ep_key = f"{entry['method']} {entry['path']}"
+                        res = await _run_leg_core(entry["identity"], entry["method"], entry["path"],
+                                                  entry["check"], entry["case_key"],
+                                                  remainder_only=entry["remainder_only"])
+                        tracker.record_held_result(entry["identity"], ep_key, entry["check"],
+                                                   entry["case_key"], res)
+                        ran += 1
+                        confirmed += bool(res is not None and res.confirmed)
+                finally:
+                    _held_pass.update(active=False, stop_at=None)
+                return {"cells": cells, "replays": replays, "cells_run": ran, "confirmed": confirmed,
+                        "cells_still_held": len(_held_cells),
+                        "replays_still_held": sum(e["replays"] for e in _held_cells.values()),
+                        "stopped_by": stopped}
+
+            try:
+                _final_report = await _final_pass_mod.run_final_pass(
+                    _final_cfg, deadline=_investigation_deadline,
+                    steps={"worklist_nodes": _final_worklist_nodes,
+                           "drive_legs": _final_drive_legs,
+                           "held_replays": _final_held_replays},
+                    cancelled=_final_cancelled, clock=time.monotonic)
+            except Exception as e:  # the pass is a bonus -- never sink the run
+                log.warning("investigate_engagement: final pass failed: %s", e)
+                _errors.append({"phase": "final_pass", "error": f"{type(e).__name__}: {e}"})
+            for _step in _final_report.get("steps") or []:
+                if _step.get("error"):
+                    _errors.append({"phase": f"final_pass.{_step['step']}", "error": _step["error"]})
+            if coverage and _coverage_trackers and any(
+                    _step.get("result") and _step["step"] in ("drive_legs", "held_replays")
+                    for _step in _final_report.get("steps") or []):
+                try:
+                    coverage = coverage_tracker.report_after_final_pass(
+                        _coverage_trackers[-1], coverage, investigated_keys=investigated_keys,
+                        final_pass={_step["step"]: _step.get("result")
+                                    for _step in _final_report.get("steps") or []})
+                except Exception as e:  # coverage is a report layer -- never sink the run
+                    log.warning("investigate_engagement: coverage after final pass failed: %s", e)
+                    _errors.append({"phase": "coverage_refresh",
+                                    "error": f"{type(e).__name__}: {e}"})
+            log.info("investigate_engagement: final pass -- %d step(s), stopped by %s",
+                     len(_final_report.get("steps") or []), _final_report.get("stopped_by"))
+        _final_ran = bool(_final_report.get("steps"))
+
+        if ((_retry_ledger is not None and _retry_report.get("rounds")) or _overlap is not None
+                or _final_ran):
             try:   # the server errors the rounds' (or the background review's) sends drew
                 _server_error_changed += await _server_error_pass()
             except Exception as e:
@@ -3221,7 +3414,7 @@ class ChainMixin:
             _server_error_report["ledger"] = run_context.server_errors.report()
         # The matrix was built before the rounds and the server-error follow-up (and
         # while a background review was still running): record what they found into it.
-        if coverage and (_server_error_changed or _overlap is not None
+        if coverage and (_server_error_changed or _overlap is not None or _final_ran
                          or (_retry_ledger is not None and _retry_report.get("rounds"))):
             try:
                 if _coverage_trackers:
@@ -3342,6 +3535,8 @@ class ChainMixin:
                 "review_overlap": _overlap.report() if _overlap is not None else None,
                 "idle_review": _idle_review.report() if _idle_review is not None else None,
                 "retry_rounds": _retry_report,
+                # R11-4: the final pass over the work the phase budgets left.
+                "final_pass": _final_report,
                 "session_events": list(getattr(run_context.freshness(), "events", []) or [])
                                   if run_context is not None and hasattr(run_context, "freshness") else [],
             },
@@ -3375,7 +3570,9 @@ class ChainMixin:
                               "outer_wall_seconds": None, "outer_wall_owner": "caller",
                               "capture_review_seconds": self.capture_review_seconds,
                               "investigation_seconds": self.investigation_seconds,
-                              "coverage_drive_seconds": self.coverage_drive_seconds},
+                              "coverage_drive_seconds": self.coverage_drive_seconds,
+                              # R11-4: time the drive took over from the last sliced phase.
+                              "coverage_drive_rollover_seconds": round(_coverage_rollover, 3)},
             "workflows": workflow_results,
             "task_graph": state.graph.to_dict(),
             "ready_tasks": state.pending(),

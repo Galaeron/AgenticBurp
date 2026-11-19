@@ -554,6 +554,22 @@ engagement:
     max_step_budget: 1024
     breaker_wait_seconds: 120
     max_idle_rounds: 3
+  # Final pass (harness/final_pass.py, R11-4). When on, with investigation_seconds set:
+  # after the retry rounds, while the clock is before the deadline less reserve_seconds
+  # (kept for finalise), one pass in priority order over the worklist nodes a budget
+  # skipped, the coverage-drive legs queued and never attempted, and the captured
+  # replays the per-endpoint check share held (each such check gets its share again).
+  # Same legs, gates, write rules and per-leg caps; no step starts past the deadline.
+  # r11 ended 51 min early with 176 budget-skipped nodes, 283 legs and 47 replays left.
+  # DEFAULT OFF: it sends active traffic.
+  final_pass:
+    enabled: false
+    reserve_seconds: 60
+  # When on, with phase_slices and coverage_drive_seconds set, the coverage drive also
+  # gets the time the last sliced phase left unused (r11: the chain rounds used 0.4 s
+  # of a 3 h slice), up to investigation_seconds. DEFAULT OFF: the drive keeps exactly
+  # coverage_drive_seconds.
+  coverage_drive_rollover: false
   # Server errors the run's own sends drew (harness/server_errors.py). The transport
   # scans the first bodies of each route's 5xx answers (passive: nothing is sent, only
   # parameter names are kept). A stack trace becomes a confirmed verbose_error_disclosure;
