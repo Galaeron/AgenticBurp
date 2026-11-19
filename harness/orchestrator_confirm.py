@@ -14,8 +14,9 @@ import functools
 from harness import confirmation_gate
 from harness.orchestrator_helpers import *  # noqa: F401,F403  (shared imports/helpers/constants)
 from harness.execution_registry import ExecutionRegistry
-from harness.validators.base import (ValidationResult, observed_result_of, proof_artifact_kwargs,
-                                     proof_limitation_of)
+from harness.validators.base import (ValidationResult, is_observation, mechanism_class_of,
+                                     observed_result_of, proof_artifact_kwargs,
+                                     proof_limitation_of, proves_finding_class)
 
 
 def _fallback_result_binds(result, routed) -> bool:
@@ -234,15 +235,16 @@ class ConfirmMixin:
         from harness import confirmation_gate, plan_dispatch
         report = AgentReport(agent=specialty, model=model or "iterative", findings=list(findings))
         validation_reports: list = []
+        batch = [report]
         summary = await plan_dispatch.dispatch_plans(
-            self, exchange, plans, [report], validation_reports, run_context=run_context)
+            self, exchange, plans, batch, validation_reports, run_context=run_context)
         planned = {p.finding_class for p in plans}
         unplanned = [f for f in findings if f.vulnerability_class not in planned]
         cases = dict(summary.get("cases") or {})
         if unplanned:
-            more, proofs = await self._validate_findings(
-                exchange, [AgentReport(agent=specialty, model=report.model, findings=unplanned)],
-                run_context=run_context)
+            extra = [AgentReport(agent=specialty, model=report.model, findings=unplanned)]
+            more, proofs = await self._validate_findings(exchange, extra, run_context=run_context)
+            batch.extend(extra[1:])
             validation_reports.extend(more)
             for proof in proofs:
                 if proof.get("finding_ref") and proof.get("case_id"):
@@ -250,8 +252,14 @@ class ConfirmMixin:
         for f in findings:
             if not f.case_id and f.finding_id in cases:
                 f.case_id = cases[f.finding_id]
+        # R11-1: a proof of another class than the finding it was routed for was
+        # filed by _validate_findings as its own confirmed finding, in a report
+        # appended to the batch. `findings` is the held list the caller persists
+        # after this review (pivot_memory.integrate), so the filed finding is
+        # stored with its proof instead of leaving that proof without a finding.
+        findings.extend(f for r in batch[1:] for f in r.findings)
         confirmation_gate.apply_confirmation_suppression(
-            [report], validation_reports,
+            batch, validation_reports,
             live_verified_markers=await self.get_run_derived_live_markers(),
             config=getattr(self, "config", {}))
         return summary
@@ -480,6 +488,89 @@ class ConfirmMixin:
             command=first.command,
         )
 
+    async def _file_split_offs(self, exchange, reports, split_offs, case_for, run_context,
+                               output, proofs) -> None:
+        """R11-1: file each proof a validator reached for a finding of another class
+        as one finding of the class it proves, in its own report appended to
+        `reports` -- once per (validator, class, proof) per run, and not when a
+        finding of that class in `reports` already rests on that validator."""
+        from harness.issues import issue_class
+        seen = getattr(run_context, "_r11_split_offs", None)
+        if seen is None:
+            seen = set()
+            try:
+                run_context._r11_split_offs = seen
+            except Exception:
+                pass
+        held = {(f.confirmed_by_leg, issue_class(f.vulnerability_class))
+                for r in reports for f in r.findings if f.confirmed}
+        added: dict[str, AgentReport] = {}
+        for proved, validator, source, proved_class in split_offs:
+            classes = {issue_class(c) for c in (proved.mechanism_classes or (proved_class,)) if c}
+            if any((proved.validator, c) in held for c in classes):
+                continue
+            key = (proved.validator, issue_class(proved_class),
+                   (proved.summary or "").split(" (probed once per origin")[0], proved.evidence or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            report = added.get(proved.validator)
+            if report is None:
+                report = added[proved.validator] = AgentReport(
+                    agent=proved.validator, model="validator", findings=[])
+            new = Finding(
+                vulnerability_class=proved_class,
+                confidence=min(1.0, max(proved.confidence, 0.0)),
+                severity=("info" if is_observation(proved)
+                          else proved.severity or source.severity or "medium"),
+                summary=proved.summary or f"{proved.validator} confirmed {proved_class}",
+                evidence=proved.evidence or "",
+                suggested_test=(f"Proved by {proved.validator} while testing a "
+                                f"{source.vulnerability_class!r} finding on this request"),
+                basis="derived",
+                principal_id=source.principal_id,
+                request_template_id=source.request_template_id,
+            )
+            report.findings.append(new)
+            case = case_for(new, report, len(reports) + len(added), len(report.findings) - 1)
+            ok, proof_dict, reason = await self._persist_confirmation_proof(
+                case=case, validator_name=proved.validator,
+                validator_version=getattr(validator, "version", ""),
+                status=proved.status, confirmed=True,
+                observed_result=observed_result_of(proved),
+                expected_invariant=getattr(validator, "expected_invariant", ""),
+                proof_artifacts=proof_artifact_kwargs(proved),
+                limitation=proof_limitation_of(proved),
+                finding_ref=new.finding_id,
+                ledger_summary=(f"{proved.validator}: confirmed {proved_class} (filed apart "
+                                f"from {source.vulnerability_class!r}) -- {proved.summary}"),
+                ledger_data={"validator": proved.validator, "status": proved.status,
+                             "confirmed": True, "confidence": proved.confidence,
+                             "proved_class": proved_class,
+                             "routed_from": source.finding_id,
+                             "evidence": (proved.evidence or "")[:1000]},
+            )
+            if not ok:
+                log.warning("failed to persist split-off proof for %s: %s", proved.validator, reason)
+                report.findings.pop()
+                continue
+            proofs.append(proof_dict)
+            new.confirmed = True
+            new.review_verdict = "validator-confirmed"
+            new.review_note = proved.summary
+            new.proof_id = proof_dict["proof_id"]
+            new.case_id = case.case_id
+            new.confirmed_by_leg = proved.validator
+            new.header_fingerprint = getattr(proved, "header_fingerprint", "") or ""
+            held.add((proved.validator, issue_class(proved_class)))
+            output.append(ValidationReport(
+                validator=proved.validator, status=proved.status, finding_class=proved_class,
+                confidence=proved.confidence, confirmed=True, summary=proved.summary,
+                evidence=proved.evidence, url=getattr(exchange, "url", ""),
+                method=getattr(exchange, "method", ""), principal_id=new.principal_id))
+            await self._oracle_gate(new, exchange)
+        reports.extend(r for r in added.values() if r.findings)
+
     async def _validate_findings(
         self, exchange: HttpExchange, reports: list[AgentReport], *, run_context=None,
         only_validators=None,
@@ -649,6 +740,7 @@ class ConfirmMixin:
         results = await bounded_gather(jobs, getattr(self, "max_concurrent_validations", 6))
         output: list[ValidationReport] = []
         proofs: list[dict] = []
+        split_offs: list = []  # R11-1: (proof, validator, source finding, proved class)
         for result, plan, meta in zip(results, plans, metas):
             finding, validator, case, routed = meta
             if isinstance(result, Exception):
@@ -727,6 +819,22 @@ class ConfirmMixin:
                     )
                 else:
                     result = replace(result, finding_class=finding.vulnerability_class)
+            # R11-1: a confirmation is this finding's proof only when the validator's
+            # mechanism is the finding's class. A leg routed here by path or
+            # response evidence (the .well-known probe, the exposure oracle) that
+            # proved something else leaves this finding's verdict open; its proof
+            # is filed below as a finding of the class it does prove. An
+            # observation never confirms a vulnerability class.
+            if result.confirmed and not proves_finding_class(validator, result, routed, exchange):
+                from dataclasses import replace
+                proved_class = mechanism_class_of(validator, result)
+                split_offs.append((result, validator, finding, proved_class))
+                result = replace(
+                    result, confirmed=False, status="skipped", confidence=0.0,
+                    finding_class=finding.vulnerability_class,
+                    summary=(f"{result.validator} proved {proved_class!r}, not this finding's "
+                             f"class {finding.vulnerability_class!r}; filed as its own "
+                             f"{proved_class!r} finding ({result.summary})"))
             output.append(ValidationReport(
                 validator=result.validator,
                 status=result.status,
@@ -871,7 +979,11 @@ class ConfirmMixin:
                         "failed to persist local-tool validation result for plan %s: %s",
                         plan.id, reason
                     )
-        
+
+        if split_offs:
+            await self._file_split_offs(exchange, reports, split_offs, _case_for,
+                                        run_context, output, proofs)
+
         # Deterministic cross-identity REJECT -> downgrade. A validator normally
         # may only CONFIRM (above), never lower a finding -- but an ACTIVE
         # cross-identity probe that showed every other identity and the anon

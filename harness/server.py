@@ -1398,6 +1398,23 @@ async def engagement_advance(host: str, req: AdvanceRequest, authorization: str 
             "ready_tasks": st.pending(), "blocked_tasks": st.blocked(), "summary": st.summary()}
 
 
+def _cancelled_instrumentation(run_context, job_id: str) -> dict:
+    """{instrumentation, costs} for a cancelled job's partial result, from the
+    RunInstrumentation investigate_engagement left on its run (R11-4b): a cancelled
+    job reported no phase_timings, so its manifest's were empty. The phase the
+    cancel interrupted is closed as interrupted. {} when no engagement started;
+    {"instrumentation_error": ...} when the snapshot failed (never hides the cancel)."""
+    instr = getattr(run_context, "instrumentation", None)
+    if instr is None:
+        return {}
+    try:
+        instr.phases.abort()
+        return instr.result_blocks()
+    except Exception as exc:
+        log.warning("cancelled job %s: instrumentation snapshot failed (%s)", job_id, type(exc).__name__)
+        return {"instrumentation_error": type(exc).__name__}
+
+
 # --- Flagship graph investigation as a tracked, cancellable job (R18) ----------
 # Before this, server.py exposed run/advance/crawl but NEVER invoked
 # investigate_engagement, so the Burp UI could not reach the flagship path at all.
@@ -2073,6 +2090,10 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             except Exception as exc:
                 job['result']['accounting_error'] = type(exc).__name__
                 log.warning("cancelled job %s: issue accounting failed (%s)", job_id, type(exc).__name__)
+            # R11-4b: the same instrumentation block (phase_timings, sqlmap_targeting,
+            # ...) and costs a finished job reports, from the engagement's recorder;
+            # the phase the cancel interrupted is closed as interrupted. Best effort.
+            job['result'].update(_cancelled_instrumentation(run_context, job_id))
             _finish_manifest("cancelled", result=job['result'])
             raise
         except Exception as e:  # a failed job must report, never crash the server

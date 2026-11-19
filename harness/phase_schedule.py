@@ -30,6 +30,12 @@ With `engagement.review_on_idle_seconds` (0, off, by default) the review can als
 start earlier, inside the worklist and recrawl slices, once the model has sat idle
 that long (IdleReview); the capture_review slice then takes only what it left.
 
+R11-4: `rollover()` is the slack the last sliced phase left: the time from now to
+the end of its slice. r11 (2026-11-18) granted the chain rounds 3 h and they used
+0.4 s; the coverage drive after them kept its fixed `coverage_drive_seconds` and
+stopped with 283 legs not attempted. With `engagement.coverage_drive_rollover` the
+drive is given that slack on top of its own seconds (orchestrator_chain).
+
 OFF by default: with no `phase_slices` (or no `investigation_seconds`, the deadline
 the slices divide) every phase keeps exactly today's deadline.
 """
@@ -57,6 +63,7 @@ class PhaseSchedule:
             if phase in PHASES and value > 0:
                 self.shares[phase] = value
         self.granted: dict[str, float] = {}
+        self._ends: dict[str, float] = {}   # phase -> the clock value its slice ends at
 
     @classmethod
     def from_config(cls, config: dict | None, deadline: float | None, **kwargs) -> "PhaseSchedule":
@@ -78,7 +85,20 @@ class PhaseSchedule:
         later = sum(self.shares[p] for p in PHASES[PHASES.index(phase):] if p in self.shares)
         sliced = now + remaining * self.shares[phase] / later
         self.granted[phase] = round(sliced - now, 3)
+        self._ends[phase] = sliced
         return sliced if explicit is None else min(sliced, explicit)
+
+    def rollover(self) -> float:
+        """Seconds the last sliced phase granted so far left unused: from now to the
+        end of its slice (0 when it ran to its slice end, or nothing was sliced).
+        Earlier phases' slack already went to the later sliced phases, because
+        each slice is a share of the time left when it begins."""
+        if not self.active:
+            return 0.0
+        last = next((p for p in reversed(PHASES) if p in self._ends), None)
+        if last is None:
+            return 0.0
+        return max(0.0, self._ends[last] - self.clock())
 
     def report(self) -> dict:
         return {"shares": dict(self.shares), "granted_seconds": dict(self.granted)}

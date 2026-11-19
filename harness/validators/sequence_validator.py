@@ -40,7 +40,7 @@ from urllib.parse import urlsplit, parse_qsl, urlencode
 import httpx
 
 from harness import global_throttle
-from harness.models import Finding, HttpExchange
+from harness.models import Finding, HttpExchange, request_body_is_placeholder
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
 from harness.validators.sqlmap import _looks_like_json, _content_type_of
@@ -65,6 +65,9 @@ _AUTHORITY_RE = re.compile(
     r"trust|confirm|elevat|is_|_admin|entitl|quota|credit|balance",
     re.I,
 )
+
+
+_HIDES_OBJECT = re.compile(r"delet|remov|ban|block|lock|disabl|suspend|archiv|hidden|expir", re.I)
 
 
 def _is_priv(value, priv) -> bool:
@@ -168,6 +171,8 @@ class SequenceValidator(Validator):
             return False
         if (exchange.method or "").upper() not in ("POST", "PUT", "PATCH"):
             return False
+        if needs_read_body(exchange):
+            return True
         kind, _ = self._parse_body(exchange)
         return kind is not None
 
@@ -211,6 +216,14 @@ class SequenceValidator(Validator):
         if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
         method = (exchange.method or "").upper()
+        if needs_read_body(exchange):
+            return await self.validate_from_read(exchange)
+        if request_body_is_placeholder(exchange):
+            # R11-6: the crawler's guessed body names no field of the endpoint; a
+            # create (POST) has no object to read a body from or restore.
+            return self._skip("the request body is a harness-guessed placeholder, not the "
+                              "endpoint's parameters, and a create has no object to build a body "
+                              "from; nothing was written")
         kind, base_body = self._parse_body(exchange)
         if base_body is None:
             return self._skip("request body is not a JSON object or urlencoded form")
@@ -285,3 +298,177 @@ class SequenceValidator(Validator):
                          f"single-shot echo check misses.")
         return self._not_confirmed(
             "no injected privileged field persisted across the write->re-read differential")
+
+    # -- R11-6 (b): an update with no captured body, built from the object's read --
+
+    def _read_candidates(self, fields: dict) -> dict:
+        """Authority fields the READ itself holds (top level, settable, not already
+        privileged), each with the privileged value to try. Only fields present in
+        the read are injected: their snapshot value is what the restore writes back,
+        so nothing is stored that the restore could not undo."""
+        out: dict = {}
+        for key, value in fields.items():
+            if not isinstance(key, str) or not (key in _PRIV_FIELDS or _AUTHORITY_RE.search(key)):
+                continue
+            if _HIDES_OBJECT.search(key):
+                continue   # a flag that could hide or lock the object from its own restore
+            if isinstance(value, bool):
+                if value is not True:
+                    out[key] = True
+            elif isinstance(value, str) and not isinstance(_PRIV_FIELDS.get(key), bool):
+                if not _is_priv(value, "admin"):
+                    out[key] = "admin"
+        return out
+
+    async def _read(self, client, url, headers):
+        await global_throttle.acquire()
+        resp = await client.request("GET", url, headers=headers or None)
+        try:
+            doc = json.loads(resp.text or "")
+        except (ValueError, TypeError):
+            doc = None
+        return resp, (doc if 200 <= resp.status_code < 300 else None)
+
+    async def validate_from_read(self, exchange: HttpExchange) -> ValidationResult:
+        """Mass assignment on a PUT/PATCH of one object whose write was never
+        captured (or only guessed): GET the object, send its settable fields back
+        with the authority fields it holds set privileged, re-read it, then write
+        the snapshot back and verify the object equals it (docs/WRITE_CHECKS.md:
+        an update is restored to its snapshot and verified equal). The attack and
+        its restore are both preflighted before either is sent."""
+        import asyncio
+        from harness.engagement import normalize_path
+        from .base import artifact_id_of
+        from .cross_identity_validator import _stable
+        from .read_body import body_from_read, read_object, settable_fields
+        method, url = (exchange.method or "").upper(), exchange.url
+        path = normalize_path(url)
+        if self.allowed_hosts and not scope_lock.host_in_scope(url, self.allowed_hosts):
+            return self._skip(f"host {urlsplit(url).hostname!r} out of scope")
+        gate = get_default_gate()
+        _, _, ceiling = gate.mutating_headroom(None, self.name)
+        if ceiling < 2:
+            return self._skip(f"a write built from the read and its restore need 2 mutating sends "
+                              f"(validators.mutating_ceiling_by_check.sequence >= 2; ceiling is {ceiling}); "
+                              f"nothing was written")
+        headers = {k: v for k, v in (exchange.request_headers or {}).items()
+                   if k.lower() not in ("content-length", "host", "content-type")}
+        headers["Content-Type"] = "application/json"
+        read_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+        wrote = after_doc = restored = check_doc = None
+        attempted, failure, cancelled = False, "", False
+        try:
+            async with GatedAsyncClient(gate, self.name, timeout=self.timeout,
+                                        follow_redirects=False, verify=False) as client:
+                snap_resp, doc = await self._read(client, url, read_headers)
+                fields, why = body_from_read(doc) if doc is not None else (
+                    None, f"GET -> {snap_resp.status_code}")
+                if fields is None:
+                    return self._skip(f"no write body could be built from the read of {path} "
+                                      f"({why}); nothing was written")
+                original = read_object(doc)
+                withheld = sorted(k for k in original if k not in fields)
+                cands = self._read_candidates(fields)
+                if not cands:
+                    return self._skip(f"the read of {path} holds no non-privileged authority field "
+                                      f"to flip; nothing was written")
+                attack_body, restore_body = {**fields, **cands}, dict(fields)
+                for body in (attack_body, restore_body):
+                    decision = gate.authorize(validator_name=self.name, method=method, url=url,
+                                              body=json.dumps(body))
+                    if not decision.allowed:
+                        return self._skip(f"write/restore preflight refused: {decision.reason}; "
+                                          f"nothing was written")
+
+                async def restore():
+                    nonlocal restored, check_doc
+                    from harness import run_handoff
+                    with run_handoff.restore_scope(f"sequence_restore:{path}"):
+                        await global_throttle.acquire()
+                        restored = await client.request(method, url, headers=headers,
+                                                        content=json.dumps(restore_body))
+                    _, check_doc = await self._read(client, url, read_headers)
+
+                try:
+                    attempted = True
+                    await global_throttle.acquire()
+                    wrote = await client.request(method, url, headers=headers,
+                                                 content=json.dumps(attack_body))
+                    _, after_doc = await self._read(client, url, read_headers)
+                except SafetyGateBlocked as e:
+                    attempted = wrote is not None
+                    failure = f"write not authorized: {e.decision.reason}"
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception as e:
+                    failure = f"write raised {type(e).__name__}"
+                finally:
+                    if attempted:
+                        task = asyncio.ensure_future(restore())
+                        try:
+                            try:
+                                await asyncio.shield(task)
+                            except asyncio.CancelledError:
+                                cancelled = True
+                                await task
+                        except Exception as e:
+                            failure += f"; restore raised {type(e).__name__}"
+        except httpx.HTTPError as e:
+            if not attempted:
+                return self._skip(f"request failed: {e.__class__.__name__}")
+            failure += f"; {e.__class__.__name__}"
+
+        restore_ok = (not attempted) or (
+            restored is not None and 200 <= restored.status_code < 300
+            and read_object(check_doc) is not None
+            and _stable(settable_fields(read_object(check_doc))) == _stable(fields))
+        evidence = (f"body_source=read of GET {path}; sent_fields={sorted(fields)}; "
+                    f"injected={sorted(cands)}; withheld_read_only={withheld}; "
+                    f"write_status={getattr(wrote, 'status_code', None)}; "
+                    f"restore={'sent' if restored is not None else 'not_sent'}; "
+                    f"restore_status={getattr(restored, 'status_code', None)}; "
+                    f"restore_succeeded={str(restore_ok).lower()}")
+        try:
+            from harness import run_handoff
+            from harness.run_context import current_run_context
+            ids = [i for i in [artifact_id_of(wrote)] if i]
+            run_handoff.mark_restore(current_run_context(), ids, ok=restore_ok,
+                                     detail=f"sequence restore {'verified' if restore_ok else 'NOT verified'} "
+                                            f"on {path}")
+        except Exception:
+            pass
+        if not restore_ok:
+            message = (f"RESTORE FAILED: sequence could not write {path} back to its snapshot and "
+                       f"verify it -- restore fields {sorted(cands)} by hand. {evidence}"
+                       + (f" {failure}" if failure else ""))
+            if cancelled:
+                raise asyncio.CancelledError(message)
+            return ValidationResult(self.name, "error", "mass_assignment", confidence=0.0,
+                                    confirmed=False, summary=message, evidence=evidence)
+        if cancelled:
+            raise asyncio.CancelledError
+        if wrote is None:
+            return self._skip(f"mutating replay not authorized ({failure}); nothing was written")
+        stored = read_object(after_doc) or {}
+        flipped = sorted(f for f, v in cands.items()
+                         if _is_priv(stored.get(f), v) and not _is_priv(original.get(f), v))
+        if flipped and 200 <= wrote.status_code < 300:
+            return ValidationResult(
+                self.name, "confirmed", "mass_assignment", confidence=0.9, confirmed=True,
+                summary=f"Mass-assignment / privilege escalation confirmed: field(s) {flipped} of "
+                        f"{path} became privileged after a {method} built from the object's own "
+                        f"read, and persisted across an independent re-read. Snapshot restored "
+                        f"and verified.",
+                evidence=evidence).with_artifacts(baseline=snap_resp, attack=wrote)
+        return self._not_confirmed(
+            f"no injected authority field persisted after a {method} built from the read of "
+            f"{path} (write HTTP {wrote.status_code}); snapshot restored and verified. "
+            f"{evidence}" + (f" {failure}" if failure else ""))
+
+
+def needs_read_body(exchange: HttpExchange) -> bool:
+    """R11-6: a PUT/PATCH of one object (its path ends in an id) whose request body
+    is absent or the crawler's guess: the leg builds its body from the object's read."""
+    if (exchange.method or "").upper() not in ("PUT", "PATCH") or not _names_an_item(exchange.url):
+        return False
+    return not (exchange.request_body or "").strip() or request_body_is_placeholder(exchange)

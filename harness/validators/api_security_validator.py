@@ -286,7 +286,12 @@ def _owner_keys(value) -> set:
 _UNREGISTERED = "unregistered-account:"
 
 
-def _exposure_hits(outcome, accounts: dict, caller_id: str) -> list[tuple]:
+# R11-9: the owner an anonymous read's account object is attributed to when no
+# registered session holds it (an anonymous caller owns no account).
+_ANY_ACCOUNT = "an account no session holds"
+
+
+def _exposure_hits(outcome, accounts: dict, caller_id: str, anonymous: bool = False) -> list[tuple]:
     """(field path, owner, object path, value digest) for each unmasked secret
     field on an object owned by exactly one identified account in `accounts`,
     that is either another account's or a _SELF_SECRETS field of the caller's.
@@ -294,7 +299,11 @@ def _exposure_hits(outcome, accounts: dict, caller_id: str) -> list[tuple]:
     key, a TOTP seed: _credential_material) counts on any identified account's
     object, the caller's included, and on an account object whose email is
     shown to differ from the caller's (an account no session is registered
-    for). A JWT value is read as its claims. Only a 2xx JSON answer is read."""
+    for). A JWT value is read as its claims. Only a 2xx JSON answer is read.
+
+    `anonymous` (R11-9): the caller sent no credentials, so every account is
+    another's: an account object (it carries an owner key) that no session holds
+    counts too, for credential material and allowlisted secret fields only."""
     import hashlib
     if not 200 <= (outcome.status or 0) < 300:
         return []
@@ -327,6 +336,8 @@ def _exposure_hits(outcome, accounts: dict, caller_id: str) -> list[tuple]:
                 # An account object whose email is not the caller's: another
                 # account, though no session is registered for it.
                 owner = _UNREGISTERED + sorted(emails)[0].split(":", 1)[1]
+            elif anonymous and not owner:
+                owner = _ANY_ACCOUNT
             object_path = path
         for key, item in value.items():
             field = _field_key(key)
@@ -339,6 +350,7 @@ def _exposure_hits(outcome, accounts: dict, caller_id: str) -> list[tuple]:
                      and ((owner != caller_id and not unregistered) or field in _SELF_SECRETS))
             # A compound name counts only on a registered other account's object.
             if owner and (material or exact or (owner != caller_id and not unregistered
+                                                and owner != _ANY_ACCOUNT
                                                 and _compound_secret(key, item))):
                 digest = hashlib.sha256(str(item).encode()).hexdigest()[:16]
                 hits.append((f"{path}.{key}", owner, object_path, digest))
@@ -531,6 +543,12 @@ class ApiSecurityValidator(Validator):
         field in the captured GET's response or the finding's evidence body."""
         return super().applies(finding, exchange) or bool(exposure_evidence(finding, exchange))
 
+    def claims_class(self, finding: Finding, exchange: HttpExchange | None = None) -> bool:
+        """R11-1: the label half of applies(). A finding routed here by response
+        evidence alone is bound only by the exposure result's own mechanism
+        (data exposure; access control when another account's object leaked)."""
+        return Validator.applies(self, finding, exchange)
+
     def _routed_by_evidence(self, finding, exchange) -> bool:
         return (not super().applies(finding, exchange)
                 and bool(exposure_evidence(finding, exchange)))
@@ -561,6 +579,18 @@ class ApiSecurityValidator(Validator):
             source_exchange_hash=exchange_hash,
         )
 
+    async def _mass_assignment_from_read(self, finding: Finding, exchange: HttpExchange):
+        """R11-6 (b): an update with no captured body (or only the crawler's guess)
+        is probed by the sequence leg with a body built from the object's own read
+        (settable fields only, snapshot restored and verified)."""
+        from .sequence_validator import SequenceValidator
+        seq = SequenceValidator(allowed_hosts=list(getattr(self, "allowed_hosts", None) or []),
+                                timeout=getattr(self, "timeout", 10.0))
+        res = await seq.validate_from_read(exchange)
+        res.validator = self.get_name()
+        res.finding_class = finding.vulnerability_class
+        return res
+
     async def validate(self, finding: Finding, exchange: HttpExchange) -> Any:
         tests: list[ApiSecurityTestResult] = []
         fc = finding.vulnerability_class.lower().replace("_", " ")
@@ -577,8 +607,16 @@ class ApiSecurityValidator(Validator):
                 evidence="", raw_output="[]",
             )
 
+        from harness.models import request_body_is_placeholder
+        from .sequence_validator import needs_read_body
+        if needs_read_body(exchange):
+            return await self._mass_assignment_from_read(finding, exchange)
+
         try:
-            if exchange.method.upper() in ("POST", "PUT", "PATCH") and exchange.request_body:
+            if (exchange.method.upper() in ("POST", "PUT", "PATCH") and exchange.request_body
+                    and not request_body_is_placeholder(exchange)):
+                # R11-6: a harness-guessed placeholder body is never sent as the
+                # write: it holds none of the endpoint's real fields.
                 result = await self._probe_mass_assignment(exchange, finding)
                 if result is not None:
                     tests.append(result)
@@ -664,11 +702,16 @@ class ApiSecurityValidator(Validator):
         from .cross_identity_validator import (CrossIdentityValidator, _auth_signature,
                                                 _principal_for, _source_identity)
 
-        def result(status, summary, evidence="", limitation=""):
+        def result(status, summary, evidence="", limitation="", other_account=False):
+            # R11-1: what an exposure proof proves -- a data exposure, plus an
+            # object-level access-control break when the secret is another account's.
+            proves = ("excessive data exposure", "info_disclosure") + (
+                ("idor",) if other_account else ())
             return ValidationResult(self.get_name(), status, finding.vulnerability_class,
                                     confirmed=status == "confirmed",
                                     confidence=0.9 if status == "confirmed" else 0.0,
-                                    summary=summary, evidence=evidence, limitation=limitation)
+                                    summary=summary, evidence=evidence, limitation=limitation,
+                                    mechanism_classes=proves if status == "confirmed" else ())
 
         if (exchange.method or "GET").upper() != "GET":
             return result("skipped", "Sensitive-field exposure is checked on a captured GET only")
@@ -677,22 +720,48 @@ class ApiSecurityValidator(Validator):
             return result("skipped", "Sensitive-field exposure needs a run with registered sessions")
         cross = CrossIdentityValidator(run_context=run)
         identities = cross._run_identities(urlparse(exchange.url).hostname or "")
-        source = _source_identity(identities, _auth_signature(exchange.request_headers))
-        if source is None:
-            return result("skipped", "The captured GET's principal is not a registered session")
-        caller = _principal_for(source)
-        if caller.provisional or caller.is_anonymous:
-            return result("skipped", "An identified account is required for exposure proof")
+        signature = _auth_signature(exchange.request_headers)
+        source = _source_identity(identities, signature)
+        token_bound = False
+        if source is None and signature:
+            # R11-6: credentials not byte-equal to a session's (server cookies added,
+            # or a token from before a refresh) but carrying a token the run issued
+            # to exactly one identity: the capture is that identity's request.
+            from harness import run_tokens
+            source = run_tokens.issued_identity(identities, exchange.request_headers,
+                                                getattr(run, "sessions", None))
+            token_bound = source is not None
+        # R11-9 (owner decision 2026-11-19): a capture with no credentials at all is
+        # an anonymous caller's read. It proves a data exposure only: no owner is
+        # compared (BOLA/BFLA stays authz.owners-bound) and no missing-auth claim
+        # is made (that stays authz.protected_paths-bound).
+        anonymous = source is None and not signature
+        if source is None and not anonymous:
+            return result("skipped", "The captured GET's principal is not a registered session "
+                                     "(its credentials carry no token this run issued)")
+        if anonymous:
+            import harness.principals as _pr
+            caller = _pr.Principal.anonymous()
+        else:
+            caller = _principal_for(source)
+            if caller.provisional or caller.is_anonymous:
+                return result("skipped", "An identified account is required for exposure proof")
 
         headers = {k: v for k, v in (exchange.request_headers or {}).items()
                    if k.lower() not in {"host", "content-length"}}
+        if token_bound:
+            # Replay as the identity's current session: its own credentials, never
+            # the capture's (an earlier token, or cookies the server set).
+            headers = {k: v for k, v in headers.items() if not is_identity_credential_header(k)}
+            headers.update(source.get("headers") or {})
         anon_headers = {k: v for k, v in headers.items() if not is_identity_credential_header(k)}
 
         async def send(as_caller: bool):
             return await run.executor().execute(
                 TypedRequest("GET", exchange.url, headers=headers if as_caller else anon_headers),
                 capability=self.get_name(),
-                session_ref=source.get("session_ref") if as_caller else cross._anonymous_session_ref())
+                session_ref=(source.get("session_ref") if as_caller and source is not None
+                             else cross._anonymous_session_ref()))
 
         def unsent(out, role):
             status = "error" if out.outcome == "error" else "blocked"
@@ -704,7 +773,7 @@ class ApiSecurityValidator(Validator):
         if not baseline.ok:
             return unsent(baseline, "baseline")
         accounts = self._exposure_accounts(identities, run, _principal_for)
-        hits = _exposure_hits(baseline, accounts, caller.id)
+        hits = _exposure_hits(baseline, accounts, caller.id, anonymous)
         # Credential material inside the caller's own session token (a JWT whose
         # payload carries its password hash or second-factor seed), counted only
         # when the server accepted that token on this replay: it issued it.
@@ -719,7 +788,7 @@ class ApiSecurityValidator(Validator):
         attack = await send(True)
         if not attack.ok:
             return unsent(attack, "repeat")
-        repeat = {h[:2]: h for h in _exposure_hits(attack, accounts, caller.id)}
+        repeat = {h[:2]: h for h in _exposure_hits(attack, accounts, caller.id, anonymous)}
         stable = [h for h in hits if repeat.get(h[:2]) == h]
         if not 200 <= (attack.status or 0) < 300:
             token_hits = []
@@ -739,15 +808,22 @@ class ApiSecurityValidator(Validator):
                               f"{allowed['operator']}); {len(declared)} other-account "
                               "credential field(s) are not an exposure under that "
                               "expectation").with_artifacts(baseline=baseline, attack=attack)
-        control = await send(False)
-        if not control.ok:
-            return unsent(control, "anonymous control")
-        anon_leaks = {h[:2] for h in _exposure_hits(control, accounts, caller.id)}
+        controls = []
+        if anonymous:
+            # The caller IS the anonymous read: its two reads are the evidence.
+            anon_leaks = {h[:2] for h in stable}
+        else:
+            control = await send(False)
+            if not control.ok:
+                return unsent(control, "anonymous control")
+            controls = [control]
+            anon_leaks = {h[:2] for h in _exposure_hits(control, accounts, caller.id)}
         evidence = " | ".join(
             [f"field={path}; object={obj}; owner={owner}; reader={caller.id}; "
              f"{'own credential secret' if owner == caller.id else 'another account'}; "
-             f"anonymous read {'also shows it' if (path, owner) in anon_leaks else 'does not'}; "
-             f"value=[withheld]"
+             + ("read with no credentials, twice; " if anonymous else
+                f"anonymous read {'also shows it' if (path, owner) in anon_leaks else 'does not'}; ")
+             + "value=[withheld]"
              for path, owner, obj, _digest in stable]
             + [f"claim={path}; {kind} in the caller's {where}, which the server accepted on "
                f"this GET (HTTP {baseline.status}, twice); a JWT payload is readable by anyone "
@@ -758,7 +834,9 @@ class ApiSecurityValidator(Validator):
              f"secret(s) ({', '.join(sorted({k for *_x, k in token_hits}))})"] if token_hits else [])
         return result("confirmed", f"Credential-secret exposure confirmed: GET {exchange.url} as "
                                    f"{caller.id} " + " and ".join(parts),
-                      evidence).with_artifacts(baseline=baseline, attack=attack, controls=[control])
+                      evidence, other_account=not anonymous and any(
+                          owner != caller.id for _p, owner, *_r in stable)
+                      ).with_artifacts(baseline=baseline, attack=attack, controls=controls)
 
     @staticmethod
     def _declared_visible(exchange, caller) -> dict | None:

@@ -697,7 +697,8 @@ class SqlmapValidator(Validator):
                  level: int = 1, risk: int = 1, container_image: str | None = None,
                  run_context=None, allowed_hosts: list[str] | None = None,
                  quick_only: bool = False,
-                 create_endpoint_max_requests: int = DEFAULT_CREATE_ENDPOINT_MAX_REQUESTS):
+                 create_endpoint_max_requests: int = DEFAULT_CREATE_ENDPOINT_MAX_REQUESTS,
+                 endpoint_family_seconds: float | None = None):
         self.binary = binary
         self.timeout_seconds = timeout_seconds
         self.level = max(1, min(level, 2))
@@ -718,6 +719,13 @@ class SqlmapValidator(Validator):
         self.quick_only = bool(quick_only)
         # Hard cap on the requests one light (create-endpoint) sqlmap scan may send.
         self.create_endpoint_max_requests = max(1, int(create_endpoint_max_requests))
+        # R11-3: per-endpoint-family wall-time share (harness/sqlmap_targeting.py).
+        # None reads validators.sqlmap.endpoint_family_seconds from the run's config.
+        self.endpoint_family_seconds = endpoint_family_seconds
+
+    def _targeting(self):
+        from harness.sqlmap_targeting import targeting_for
+        return targeting_for(self.run_context, self, self.endpoint_family_seconds)
 
     def full_scan_covers(self, finding: Finding, exchange: HttpExchange):
         """(location, name) of the parameter-only finding's input when a full scan
@@ -752,6 +760,8 @@ class SqlmapValidator(Validator):
     def plan(self, finding: Finding, exchange: HttpExchange) -> TestPlan | None:
         if not self.applies(finding, exchange):
             return None
+        if self._targeting().transport_reason(exchange):
+            return None  # a long-polling transport endpoint is never queued (R11-3)
         return TestPlan(
             # The id ignores cache-buster parameters (planner.plan_key_fingerprint);
             # the binding below stays the exact capture.
@@ -791,6 +801,32 @@ class SqlmapValidator(Validator):
             return ValidationResult(self.name, "skipped", finding.vulnerability_class,
                                     summary=scope_lock.out_of_scope_reason(exchange.url, self.allowed_hosts))
 
+        # R11-3: a long-polling transport endpoint's parameters are transport state
+        # (protocol version, transport, session id, cache-buster), not application
+        # input; nothing is sent to it. Past the endpoint family's time share the
+        # next target waits; a started scan always finishes.
+        targeting = self._targeting()
+        transport = targeting.transport_reason(exchange)
+        if transport:
+            targeting.note_transport_skip(exchange)
+            why = (f"{urlsplit(exchange.url).path or '/'} is a long-polling transport endpoint "
+                   f"({transport}); its parameters are transport state, not application input")
+            return ValidationResult(self.name, "skipped", finding.vulnerability_class,
+                                    summary=f"sqlmap not launched: {why}",
+                                    limitation=f"skipped: {why}; not a negative result")
+        held = targeting.hold_reason(exchange.method, exchange.url)
+        if held:
+            return ValidationResult(self.name, "inconclusive", finding.vulnerability_class,
+                                    summary=f"sqlmap held: {held}",
+                                    limitation=f"held: {held}; not a negative result")
+        token = targeting.start(exchange.method, exchange.url)
+        try:
+            return await self._validate_scoped(finding, exchange, light)
+        finally:
+            targeting.finish(token)
+
+    async def _validate_scoped(self, finding: Finding, exchange: HttpExchange,
+                               light: dict) -> ValidationResult:
         # Per-parameter dispatch (coverage case driver): test the named parameter
         # alone, so a clean result is bound to it and to nothing else.
         only = None
@@ -810,6 +846,18 @@ class SqlmapValidator(Validator):
                             "parameter of the replayed request, so it was not tested",
                     control_outcome=NAMED_PARAMETER_UNTESTED)
             only = [(loc, name)]
+        from .injection_targets import guessed_body  # (cycle: it imports us)
+        if only is None and guessed_body(exchange):
+            # R11-9: the crawler's guessed body names no parameter of the endpoint;
+            # only the query string's parameters are inputs to test.
+            queries = _query_top_level_params(exchange.url)
+            if not queries:
+                why = ("the request body is a harness-guessed placeholder, not the endpoint's "
+                       "parameters, and the request has no query parameter")
+                return ValidationResult(self.name, "skipped", finding.vulnerability_class,
+                                        summary=f"sqlmap not launched: {why}",
+                                        limitation=f"skipped: {why}; not a negative result")
+            only = [("query", q) for q in queries]
         result = await self._validate_request(finding, exchange, only, light)
         if only and result is not None:
             # Every send below targets `only` (-p and the probes' only_params).
@@ -968,7 +1016,7 @@ class SqlmapValidator(Validator):
             if path_point:
                 cmd += ["--param-filter", "URI"]
             elif only:
-                cmd += ["-p", only[0][1]]
+                cmd += ["-p", ",".join(name for _, name in only)]
             # Deliberately no --smart: verified directly against a live
             # target (OWASP Juice Shop's login endpoint, a genuinely
             # injectable, well-known case) that --smart's cheap "is this

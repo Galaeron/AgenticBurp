@@ -474,6 +474,14 @@ engagement:
   # by the bound are reported as inconclusive (endpoint_check_time_share) and listed
   # under coverage.endpoint_check_time_capped. A fraction from 0 to 1; 0 = no bound.
   coverage_endpoint_check_share: 0.05
+  # R11-10 (owner decision 2026-11-19): when an identity holds no capture of an
+  # endpoint, an identity-bound check (access control, sessions, exposure ...) replays
+  # another identity's capture of it with ONLY this identity's credentials (none for
+  # anonymous). It goes through the safety gate like any replay. A capture whose
+  # query or body carries a credential is not used. Takes effect only inside
+  # coverage_drive_legs; passive-only forces it off. false: the cell stays
+  # missing_principal.
+  coverage_identity_substitution: true
   # Phase time-slices of investigation_seconds (harness/phase_schedule.py). A map of
   # phase -> share for worklist, recrawl, capture_review and chain_rounds: each phase
   # gets its share of the time LEFT when it begins (time a phase leaves unused rolls
@@ -554,6 +562,25 @@ engagement:
     max_step_budget: 1024
     breaker_wait_seconds: 120
     max_idle_rounds: 3
+  # Final pass (harness/final_pass.py, R11-4). When on, with investigation_seconds set:
+  # after the retry rounds, while the clock is before the deadline less reserve_seconds
+  # (kept for finalise), one pass in priority order over the worklist nodes a budget
+  # skipped, the coverage-drive legs queued and never attempted, and the captured
+  # replays the per-endpoint check share held (each such check gets its share again).
+  # Same legs, gates, write rules and per-leg caps; no step starts past the deadline.
+  # r11 ended 51 min early with 176 budget-skipped nodes, 283 legs and 47 replays left.
+  # DEFAULT OFF: it sends active traffic. reserve_seconds, on or off, also bounds the
+  # final experiment pass (experiments_final): it stops at the investigation deadline
+  # less this reserve (and at the coverage deadline), and is recorded as skipped once
+  # that bound has passed (R11-4b).
+  final_pass:
+    enabled: false
+    reserve_seconds: 60
+  # When on, with phase_slices and coverage_drive_seconds set, the coverage drive also
+  # gets the time the last sliced phase left unused (r11: the chain rounds used 0.4 s
+  # of a 3 h slice), up to investigation_seconds. DEFAULT OFF: the drive keeps exactly
+  # coverage_drive_seconds.
+  coverage_drive_rollover: false
   # Server errors the run's own sends drew (harness/server_errors.py). The transport
   # scans the first bodies of each route's 5xx answers (passive: nothing is sent, only
   # parameter names are kept). A stack trace becomes a confirmed verbose_error_disclosure;
@@ -884,6 +911,13 @@ validators:
     # scan, enforced by the run's tool proxy (outside a run they are not scanned).
     # Every request may create an object; the reason and cap go in the proof.
     create_endpoint_max_requests: 200
+    # Wall-time share per endpoint family (method, origin, and path with object-id
+    # segments folded), all of the run's sqlmap legs together (R11-3). A started scan
+    # always finishes; past the share the next target on that family is held,
+    # reported as inconclusive with the reason, never a negative. Seconds; 0 = no bound.
+    # Long-polling transport endpoints (Engine.IO / SockJS response framing) are
+    # never scanned: their parameters are transport state (harness/sqlmap_targeting.py).
+    endpoint_family_seconds: 900
   # Cross-identity (Autorize-style) access-control validator. The single-exchange
   # idor/auth agents can only GUESS at broken access control; this replays the
   # request as ANOTHER identity (+ anonymous) and compares, the only way to tell
@@ -934,6 +968,22 @@ validators:
     enabled: true
     timeout: 10.0
     min_attempts: 12
+    # R11-8 (c): wrong-answer guessing at a run-owned account's reset/recovery-answer
+    # write confirms (owner decision 2026-11-19); false records a LEAD instead.
+    confirm_reset_answer: true
+  # R11-8 (c): a recovery lookup (GET naming an account) that answers a run
+  # identity's account unlike an unknown one records a LEAD via the new lookup
+  # paths confirms (owner decision 2026-11-19); false records a LEAD instead.
+  auth_sequence:
+    confirm_lookup: true
+  # R11-8 (c): a challenge whose response carries its own answer. Reads captured
+  # challenge/submission pairs and sends nothing unless active_submit is on.
+  challenge_echo:
+    enabled: true
+    timeout: 10.0
+    confirm: true           # a 2+-pair (or active) echo confirms (owner, 2026-11-19); false: a LEAD
+    active_submit: false    # true submits a wrong-value control, then echoed candidates
+    max_submissions: 4      # cap on active submissions per challenge
   # Reset-token entropy leg (V3): samples reset tokens observable in responses and
   # confirms only unambiguous predictability (constant/sequential/timestamp/below
   # 64-bit floor/derived). Trigger is a mutating POST (needs allow_mutating_replay).
@@ -959,6 +1009,24 @@ validators:
   write_integrity:
     enabled: true
     restore_routes: []
+  # R11-7 multi-step business flows (checkout tamper, coupon misuse, 2FA disable
+  # without step-up) on run-owned identities. Sends nothing unless active_enabled,
+  # allow_mutating_replay AND mutating_ceiling_by_check.business_flow are all set
+  # (a flow is several writes; 8 pays for a 3-step cart + settlement control and
+  # one tamper). read_backs: extra "GET /path" reads of the settled state;
+  # coupons: {expired: [...], by_identity: {name: code}}; mfa_status_reads: [...].
+  business_flow:
+    enabled: true
+    read_backs: []
+    mfa_status_reads: []
+    # R11-7c: tampered variants per payment_tamper finding (hard cap 4; the
+    # mutating ceiling bounds them again).
+    max_variants: 2
+    # R11-7c: concurrent settlements of one filled basket after an unconfirmed
+    # payment_tamper check. Off by default; also needs validators.max_burst_size >= 2
+    # and a business_flow ceiling that pays for 2 * cart steps + 2 + race_copies.
+    settlement_race: false
+    race_copies: 2
 
 # Autonomous scope-discovery MVP (harness/scope_discovery.py). Off by
 # default -- the harness has never, until this option exists, decided on

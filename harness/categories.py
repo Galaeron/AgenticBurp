@@ -44,6 +44,11 @@ CANONICAL_CATEGORIES: tuple[str, ...] = (
     # no canonical home, so every wording was its own class. No specialist agent or
     # validator owns them yet; they exist for issue grouping and the coverage ledger.
     "insecure_transport", "missing_headers", "bfla",
+    # R11-8 (b): a session token that never expires (WSTG-SESS-07), its own class so
+    # the proof never stands for the logout check (session_timeout).
+    "session_expiry",
+    # R11-8 (b): a token issued before a password change still works after it.
+    "session_after_password_change",
 )
 
 # Deliberately generous but not promiscuous: each entry is a phrase an
@@ -197,6 +202,21 @@ _SYNONYMS: dict[str, str] = {
     "session_timeout": "session_timeout", "session timeout": "session_timeout",
     "logout invalidation": "session_timeout", "logout_invalidation": "session_timeout",
     "session not invalidated": "session_timeout",
+    "session_expiry": "session_expiry", "session expiry": "session_expiry",
+    "token never expires": "session_expiry", "session never expires": "session_expiry",
+    "jwt never expires": "session_expiry", "jwt without exp": "session_expiry",
+    "jwt without expiration": "session_expiry", "jwt no exp": "session_expiry",
+    "jwt without exp claim": "session_expiry", "jwt without an exp claim": "session_expiry",
+    "missing exp claim": "session_expiry", "no exp claim": "session_expiry",
+    "token without expiry": "session_expiry", "non-expiring token": "session_expiry",
+    "never-expiring token": "session_expiry", "no token expiration": "session_expiry",
+    "missing token expiration": "session_expiry",
+    "session_after_password_change": "session_after_password_change", "session after password change": "session_after_password_change",
+    "token survives password change": "session_after_password_change", "session survives password change": "session_after_password_change",
+    "session not revoked on password change": "session_after_password_change",
+    "sessions not invalidated on password change": "session_after_password_change",
+    "session not invalidated after password change": "session_after_password_change",
+    "token valid after password change": "session_after_password_change",
     "behavioral anomaly": "anomaly", "suspicious behavior": "anomaly",
 }
 
@@ -236,6 +256,10 @@ _DEDUP_SYNONYMS: dict[str, str] = {
     "create_validation": "business_logic", "create validation": "business_logic",
     "mass_assignment_create": "api_security", "mass assignment create": "api_security",
     "write_integrity": "business_logic", "write integrity": "business_logic",
+    # business_flow_validator's classes (R11-7: multi-step flows on run-owned accounts).
+    "payment_tamper": "business_logic", "payment tamper": "business_logic",
+    "coupon_misuse": "business_logic", "coupon misuse": "business_logic",
+    "mfa_disable_stepup": "business_logic", "mfa disable stepup": "business_logic",
 }
 
 
@@ -378,6 +402,65 @@ def distinctive_token(raw: str | None) -> str | None:
         return None
     hits = {_DISTINCTIVE_TOKENS[m.group(1).lower()] for m in _DISTINCTIVE_RE.finditer(raw)}
     return next(iter(hits)) if len(hits) == 1 else None
+
+
+# R11-2 (r11, 2026-11-18): issue GROUPING reads agent label variants that canonicalize()
+# leaves alone. r11 filed one metrics exposure as `exposed_metrics_endpoint`, `exposed
+# metrics endpoint` and `exposed_public_metrics_endpoint`, and `potential_idor` beside
+# `idor`; each spelling was its own issue. Grouping only: canonicalize() routes
+# validators and keys the coverage ledger, legacy_canonicalize() keys the stored
+# fingerprint, and neither reads this.
+#
+# Classes an issue may group on that are not CANONICAL_CATEGORIES: an existing
+# capability's own name (exposure_leads' metrics_exposure leg), so its label variants
+# have one home instead of folding into the broader info_disclosure.
+GROUPING_CLASSES: tuple[str, ...] = ("metrics_exposure",)
+
+# A leading hedge word marks a lead (an unconfirmed hypothesis), not another class.
+_LEAD_WORDS = frozenset({"potential", "possible", "suspected", "probable", "likely"})
+# Words a metrics-exposure label is built from. A label maps only when it names
+# metrics and every other word is from this set, so "metrics injection" or
+# "metrics sql injection" stays unmapped.
+_METRICS_WORDS = frozenset({
+    "metrics", "metric", "prometheus", "exposed", "exposure", "public", "publicly",
+    "unauthenticated", "unauthorized", "unprotected", "open", "accessible", "endpoint",
+    "endpoints", "page", "route", "path"})
+
+
+def fold_label(raw: str | None) -> str:
+    """Case and separators folded: "Exposed_Metrics-Endpoint" -> "exposed metrics endpoint"."""
+    return re.sub(r"[\s_\-]+", " ", (raw or "").strip().lower()).strip()
+
+
+def _lead_split(folded: str) -> tuple[str, bool]:
+    words = folded.split(" ")
+    lead = False
+    if len(words) > 1 and words[0] in _LEAD_WORDS:
+        words, lead = words[1:], True
+    if len(words) > 1 and words[-1] in {"lead", "leads"}:
+        words, lead = words[:-1], True
+    return " ".join(words), lead
+
+
+def is_lead_label(raw: str | None) -> bool:
+    """True when the label carries a lead marker ("potential_idor", "idor lead")."""
+    return _lead_split(fold_label(raw))[1]
+
+
+def grouping_class(raw: str | None) -> str | None:
+    """The class an agent label variant groups on, or None: case and separators folded,
+    a lead marker dropped (see is_lead_label), then canonicalize() or a GROUPING_CLASSES
+    rule. Exact matching after folding, as canonicalize(): an unknown label stays None."""
+    folded, _lead = _lead_split(fold_label(raw))
+    if not folded:
+        return None
+    found = canonicalize(folded) or canonicalize(folded.replace(" ", "_"))
+    if found:
+        return found
+    words = set(folded.split(" "))
+    if words & {"metrics", "metric"} and words <= _METRICS_WORDS:
+        return "metrics_exposure"
+    return None
 
 
 def all_known_phrases() -> dict[str, str]:
