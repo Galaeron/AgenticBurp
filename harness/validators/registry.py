@@ -583,7 +583,11 @@ class ValidatorRegistry:
                             "a long-polling transport request carries framing, not application input")
         if check.id == "WSTG-SESS-07":
             # R11-8 (b): decodes the session JWTs the run already holds; sends nothing,
-            # so it needs no mutating-replay permission.
+            # so it needs no mutating-replay permission, and no JWT means no case.
+            from .auth_sequence_validator import _session_jwts
+            if not _session_jwts(exchange, run_context):
+                return decision("needs_prerequisite", "missing_credentials",
+                                "no session JWT in the capture or the run's identities")
             return decision("ready", "ready", "decode-only token expiry check") | {
                 "mechanism_id": "auth.token_expiry"}
         method = (exchange.method or "GET").upper()
