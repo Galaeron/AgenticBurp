@@ -12,7 +12,9 @@ operator differential on the finding's OWN request -- same method, URL, headers
 and body, with one parameter at a time replaced. `{"$ne": t}` must behave
 differently from `{"$eq": t}`, while `{"$eq": t}` behaves like the plain string
 `t`, and both operator responses must repeat. Every send goes through the run's
-transport, so the scope, active and mutating-replay gates apply.
+transport, so the scope, active and mutating-replay gates apply. The body's own
+id-like fields are tried first; a body the crawler guessed (r11: `name`/`value`
+on every review write) is not the endpoint's inputs and is never a target.
 
 A backend that rejects `$eq` itself (an "unrecognised operator" error) leaves the
 leg without an equality control, so `{"$in": [t]}` stands in for it when `$eq` does
@@ -43,7 +45,7 @@ from harness.feature_workflow import extract_forms
 from harness.models import Finding, HttpExchange
 from .base import ValidationResult, Validator
 from .injection_targets import (
-    PARTIAL_COVERAGE, QUERY, coverage_note, param_targets,
+    BODY, PARTIAL_COVERAGE, QUERY, coverage_note, param_targets,
     replay_headers, select_targets, tested_inputs)
 from .sqlmap import _content_type_of, _looks_like_json, _mutate_json_param
 
@@ -56,6 +58,8 @@ _MAX_PATH_SEGMENTS = 2
 _PATH_ID = re.compile(
     r"^(?:\d{1,19}|(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9][A-Za-z0-9_-]{3,79})$")
 _VERSION_SEGMENT = re.compile(r"^v\d+$", re.I)
+# A body field naming the object a write or lookup matches on.
+_ID_FIELD = re.compile(r"^(?:(?i:_?id)|.+(?:_id|Id|ID))$")
 # Fields a JSON response uses to say how many objects a filter matched or a write
 # changed; matched counts first, so a repeated no-op write still compares alike.
 _COUNT_KEYS = ("matchedCount", "matched", "nMatched", "n", "modifiedCount", "nModified",
@@ -99,14 +103,68 @@ def _login_boundary(exchange: HttpExchange) -> bool:
             and all(_credential_names(exchange.request_body or "")))
 
 
+def _json_object(body: str | None):
+    try:
+        doc = json.loads(body or "")
+    except (TypeError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def guessed_body(exchange: HttpExchange) -> bool:
+    """True when the request body is the role crawler's guess, not a captured
+    request's inputs: a placeholder body, or one a leg built on top of it (r11:
+    a mass-assignment probe added privilege fields to `{"name": "probe", "value":
+    "probe"}` and was stored as a capture variant). Every key/value of a guess
+    still present means the guess is what the endpoint was sent."""
+    from harness.models import request_body_is_placeholder
+    if request_body_is_placeholder(exchange):
+        return True
+    doc = _json_object(exchange.request_body)
+    if not doc:
+        return False
+    from harness.role_crawl import synthesized_bodies
+    for guess in synthesized_bodies():
+        fields = _json_object(guess)
+        if fields and all(k in doc and doc[k] == v for k, v in fields.items()):
+            return True
+    return False
+
+
+def _id_like(name: str) -> bool:
+    return bool(_ID_FIELD.match(name or ""))
+
+
 def operator_targets(exchange: HttpExchange) -> list[tuple[str, str]]:
     """The inputs the operator differential can carry an operator in: query and
     body parameters, but only query parameters on a GET/HEAD (a body there is not
-    the request's input)."""
+    the request's input).
+
+    A guessed body's fields are not the endpoint's inputs, so none is a target
+    (r11: nine runs on the review writes put operators only into the crawler's
+    `name`/`value` guess). A body's own id-like fields (`id`, `_id`, `productId`)
+    come first, so the parameter cap never drops the key a filter matches on."""
     targets = param_targets(exchange)
     if (exchange.method or "GET").upper() in ("GET", "HEAD"):
         targets = [t for t in targets if t[0] == QUERY]
-    return targets
+    elif guessed_body(exchange):
+        targets = [t for t in targets if t[0] != BODY]
+    return sorted(targets, key=lambda t: not (t[0] == BODY and _id_like(t[1])))
+
+
+def json_write_fields(exchange: HttpExchange) -> list[str]:
+    """The scalar top-level fields of a captured JSON object body on a PUT/PATCH,
+    which the operator differential can carry an operator in; [] for any other
+    request, for a guessed body, and for a body with no scalar field.
+
+    POST is left out: the differential replays the write six times and deletes
+    nothing, and the write checks' restore rule runs a create only when it can
+    delete what it made (docs/WRITE_CHECKS.md)."""
+    if (exchange.method or "GET").upper() not in ("PUT", "PATCH"):
+        return []
+    if _json_object(exchange.request_body) is None or guessed_body(exchange):
+        return []
+    return [p for loc, p in operator_targets(exchange) if loc == BODY]
 
 
 def _bracket_operator(pairs: list[tuple[str, str]], param: str, op: str | None,
@@ -282,6 +340,13 @@ class NosqlValidator(Validator):
         """$ne vs $eq vs plain-string differential on the finding's own request,
         then (GET/HEAD) the boolean-suffix differential on its id-like path segments."""
         targets, coverage = select_targets(finding, operator_targets(exchange), _MAX_PARAMS)
+        guessed = ((exchange.method or "GET").upper() not in ("GET", "HEAD")
+                   and guessed_body(exchange))
+        if guessed:
+            # The body's fields were never tested: not a negative for the endpoint.
+            note = (" (the request body is the crawler's guess, not the endpoint's "
+                    "inputs, so no body field was tested)") + note
+            coverage = coverage or PARTIAL_COVERAGE
         # A per-parameter dispatch is bound to the one input it names.
         segments = ([] if getattr(finding, "parameter_only", False)
                     else path_id_segments(exchange))
