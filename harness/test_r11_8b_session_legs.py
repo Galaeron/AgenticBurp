@@ -28,7 +28,7 @@ def _finding(cls, summary="", basis="derived"):
                    summary=summary or cls, evidence="", suggested_test="", basis=basis)
 
 
-class _LegBase(_Base):
+class _LegBase(_Base, unittest.TestCase):   # TestCase named for the static checks
     def run_finding(self, orch, exchange, finding, *, identities=(), gate=None,
                     max_requests=300, setup=None):
         """Dispatch one agent finding through _validate_findings inside a run."""
