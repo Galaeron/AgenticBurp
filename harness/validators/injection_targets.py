@@ -22,15 +22,47 @@ QUERY = "query"
 BODY = "body"
 
 
+def _json_object(body: str | None):
+    import json
+    try:
+        doc = json.loads(body or "")
+    except (TypeError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def guessed_body(exchange: HttpExchange) -> bool:
+    """True when the request body is the role crawler's guess, not a captured
+    request's inputs: a placeholder body, or one a leg built on top of it (r11:
+    a mass-assignment probe added privilege fields to `{"name": "probe", "value":
+    "probe"}` and was stored as a capture variant). Every key/value of a guess
+    still present means the guess is what the endpoint was sent."""
+    from harness.models import request_body_is_placeholder
+    if request_body_is_placeholder(exchange):
+        return True
+    doc = _json_object(exchange.request_body)
+    if not doc:
+        return False
+    from harness.role_crawl import synthesized_bodies
+    for guess in synthesized_bodies():
+        fields = _json_object(guess)
+        if fields and all(k in doc and doc[k] == v for k, v in fields.items()):
+            return True
+    return False
+
+
 def param_targets(exchange: HttpExchange) -> list[tuple[str, str]]:
     """Every (location, param) worth injecting into -- query params first, then
     JSON/form body params. Order is stable so a leg that stops at the first
-    confirmation is deterministic."""
+    confirmation is deterministic.
+
+    R11-9: a guessed body (`guessed_body`) names no parameter of the endpoint, so
+    its keys are never targets; only the query string's are."""
     out: list[tuple[str, str]] = []
     for k in _query_top_level_params(exchange.url):
         out.append((QUERY, k))
     body = exchange.request_body or ""
-    if body:
+    if body and not guessed_body(exchange):
         if _looks_like_json(body, _content_type_of(exchange)):
             for k in _json_top_level_params(body):
                 out.append((BODY, k))

@@ -45,7 +45,7 @@ from harness.feature_workflow import extract_forms
 from harness.models import Finding, HttpExchange
 from .base import ValidationResult, Validator
 from .injection_targets import (
-    BODY, PARTIAL_COVERAGE, QUERY, coverage_note, param_targets,
+    BODY, PARTIAL_COVERAGE, QUERY, coverage_note, guessed_body, param_targets,
     replay_headers, select_targets, tested_inputs)
 from .sqlmap import _content_type_of, _looks_like_json, _mutate_json_param
 
@@ -109,26 +109,6 @@ def _json_object(body: str | None):
     except (TypeError, ValueError):
         return None
     return doc if isinstance(doc, dict) else None
-
-
-def guessed_body(exchange: HttpExchange) -> bool:
-    """True when the request body is the role crawler's guess, not a captured
-    request's inputs: a placeholder body, or one a leg built on top of it (r11:
-    a mass-assignment probe added privilege fields to `{"name": "probe", "value":
-    "probe"}` and was stored as a capture variant). Every key/value of a guess
-    still present means the guess is what the endpoint was sent."""
-    from harness.models import request_body_is_placeholder
-    if request_body_is_placeholder(exchange):
-        return True
-    doc = _json_object(exchange.request_body)
-    if not doc:
-        return False
-    from harness.role_crawl import synthesized_bodies
-    for guess in synthesized_bodies():
-        fields = _json_object(guess)
-        if fields and all(k in doc and doc[k] == v for k, v in fields.items()):
-            return True
-    return False
 
 
 def _id_like(name: str) -> bool:

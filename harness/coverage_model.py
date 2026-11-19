@@ -362,8 +362,12 @@ def derive_input_cases_from_template(template: dict | None,
     """Convenience over `derive_input_cases` for an endpoint `template` dict
     (engagement.template_from_exchange: method/query/body/content_type/object_id)."""
     template = template or {}
+    from harness.models import body_is_placeholder
+    body = template.get("body", "") or ""
+    if body_is_placeholder(body):
+        body = ""   # R11-9: the crawler's guess names no input of the endpoint
     cases = derive_input_cases(
-        query=template.get("query", "") or "", body=template.get("body", "") or "",
+        query=template.get("query", "") or "", body=body,
         content_type=template.get("content_type", "") or "",
         object_id=template.get("object_id"), workflow_state_id=workflow_state_id)
     # A client-side route (client_routes.py) adds the inputs page script reads: a

@@ -846,6 +846,18 @@ class SqlmapValidator(Validator):
                             "parameter of the replayed request, so it was not tested",
                     control_outcome=NAMED_PARAMETER_UNTESTED)
             only = [(loc, name)]
+        from .injection_targets import guessed_body  # (cycle: it imports us)
+        if only is None and guessed_body(exchange):
+            # R11-9: the crawler's guessed body names no parameter of the endpoint;
+            # only the query string's parameters are inputs to test.
+            queries = _query_top_level_params(exchange.url)
+            if not queries:
+                why = ("the request body is a harness-guessed placeholder, not the endpoint's "
+                       "parameters, and the request has no query parameter")
+                return ValidationResult(self.name, "skipped", finding.vulnerability_class,
+                                        summary=f"sqlmap not launched: {why}",
+                                        limitation=f"skipped: {why}; not a negative result")
+            only = [("query", q) for q in queries]
         result = await self._validate_request(finding, exchange, only, light)
         if only and result is not None:
             # Every send below targets `only` (-p and the probes' only_params).
@@ -1004,7 +1016,7 @@ class SqlmapValidator(Validator):
             if path_point:
                 cmd += ["--param-filter", "URI"]
             elif only:
-                cmd += ["-p", only[0][1]]
+                cmd += ["-p", ",".join(name for _, name in only)]
             # Deliberately no --smart: verified directly against a live
             # target (OWASP Juice Shop's login endpoint, a genuinely
             # injectable, well-known case) that --smart's cheap "is this

@@ -278,6 +278,9 @@ class StoredXssValidator(Validator):
             return False
         if (exchange.method or "").upper() not in ("POST", "PUT", "PATCH"):
             return False
+        from .injection_targets import guessed_body
+        if guessed_body(exchange):
+            return False   # R11-9: a guessed body's fields are not the endpoint's inputs
         # need at least one text field to plant into (JSON string field or a form value)
         obj = self._json_object(exchange.request_body or "")
         if obj is not None:
