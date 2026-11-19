@@ -473,6 +473,23 @@ def _has_auth_endpoint(endpoint: dict) -> tuple[bool, str]:
         return True, "authentication-related endpoint"
     return False, "not an authentication endpoint"
 
+_LOOKUP_IDENTIFIERS = ("username", "user", "email", "login", "userid", "user_name")
+
+
+def _has_auth_endpoint_or_lookup(endpoint: dict) -> tuple[bool, str]:
+    """An auth endpoint, or a GET whose capture names an account in its query (a
+    recovery lookup such as ?email=). R11-8 (c): r11 never opened the enumeration
+    cell on a lookup whose path names no auth word."""
+    hit, reason = _has_auth_endpoint(endpoint)
+    if hit:
+        return hit, reason
+    if "GET" in (endpoint.get("methods") or ("GET",)) and any(
+            name.lower() in {f"query:{k}" for k in _LOOKUP_IDENTIFIERS}
+            for name in captured_parameter_names(endpoint)):
+        return True, "a captured GET names an account identifier in its query"
+    return False, reason
+
+
 def _has_file_path_segment(endpoint: dict) -> tuple[bool, str]:
     path = endpoint.get("path", "")
     if re.search(r"/(upload|file|download|media|attachment|avatar|image|doc|asset)s?(/|$)", path, re.I):
@@ -871,7 +888,7 @@ CHECK_CATALOG: tuple[Check, ...] = (
     # class to the leg, which routes bare "auth" to no check; a narrower synonym in
     # categories.py is the follow-up that lets the driver fire these legs.
     Check("WSTG-IDNT-04", "Account enumeration", Phase.ENDPOINT,
-          "auth", _has_auth_endpoint, "auth_sequence",
+          "auth", _has_auth_endpoint_or_lookup, "auth_sequence",
           "Test whether login/registration/reset responses distinguish existing from "
           "unknown usernames",
           "Authentication vulnerabilities",
@@ -1531,6 +1548,9 @@ VALIDATOR_ROW_EXCLUSIONS: dict[str, str] = {
                  "cross_identity (switching or adding a kind is an owner decision)",
     "verbose_error": "passive stack-trace scan; WSTG-ERRH-01 is judged by the passive "
                      "error_handling adapter instead",
+    "challenge_echo": "R11-8 (c): routed by capture shape on the analyze path; it records "
+                      "leads until the owner signs off, so a WSTG-BUSL-07 row (and its "
+                      "drive) is an owner decision",
 }
 
 # Current WSTG tests deliberately left without a row, each with the reason.

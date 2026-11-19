@@ -450,6 +450,23 @@ def _revocation_routes(bodies, exchange, ctx) -> list[tuple[str, str, str | None
     return unique
 
 
+# R11-8 (c): the summary the recovery-lookup shape leg gives its finding.
+RECOVERY_LOOKUP_SHAPE = "account identifier in the query"
+
+
+def is_recovery_lookup_leg(finding) -> bool:
+    """True for a finding the R11-8 (c) recovery-lookup paths raised: the shape
+    leg (its summary names RECOVERY_LOOKUP_SHAPE) or the coverage drive, whose
+    derived finding carries only its class (summary == class, no evidence). An
+    agent's finding carries its own summary and keeps the older behaviour."""
+    if getattr(finding, "basis", "") != "derived":
+        return False
+    summary = (getattr(finding, "summary", "") or "").strip()
+    return (RECOVERY_LOOKUP_SHAPE in summary
+            or (summary == (finding.vulnerability_class or "").strip()
+                and not (getattr(finding, "evidence", "") or "").strip()))
+
+
 def _query_identifier(exchange) -> tuple[str, str] | None:
     """(name, value) of a username/email query parameter, e.g. a lookup such as
     GET /account/question?email=..."""
@@ -484,9 +501,16 @@ class AuthSequenceValidator(Validator):
     }
     active = True
 
-    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0):
+    def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
+                 confirm_lookup: bool = False):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
+        # R11-8 (c): a GET lookup reached by the NEW recovery-lookup paths (the
+        # shape leg, or the coverage drive's IDNT-04 GET cell) that discriminates a
+        # run identity's account from an unknown one is a labelled LEAD until the
+        # owner signs off (validators.auth_sequence.confirm_lookup). The older
+        # agent-finding path (ed91ca34) keeps confirming, as before.
+        self.confirm_lookup = bool(confirm_lookup)
 
     def _skip(self, why: str, fc="broken_authentication") -> ValidationResult:
         return ValidationResult(self.name, "skipped", fc, summary=why)
@@ -592,7 +616,8 @@ class AuthSequenceValidator(Validator):
                 elif check == "logout":
                     result = await self._check_logout_invalidation(exchange)
                 else:
-                    result = await self._check_username_enum(exchange)
+                    result = await self._check_username_enum(
+                        exchange, new_lookup_leg=is_recovery_lookup_leg(finding))
                 if result.confirmed:
                     return result
                 last_result = result
@@ -1221,7 +1246,8 @@ class AuthSequenceValidator(Validator):
         return self._not(f"weak password rejected or not accepted (HTTP {resp.status_code})", fc)
 
     # --- username enumeration -------------------------------------------------
-    async def _check_username_enum(self, exchange) -> ValidationResult:
+    async def _check_username_enum(self, exchange, new_lookup_leg: bool = False
+                                   ) -> ValidationResult:
         """The same request with an existing account's identifier and a nonexistent
         one, after masking the echoed identifier and per-request tokens. The
         identifier is the captured login/reset body's username field, or -- for a
@@ -1318,6 +1344,23 @@ class AuthSequenceValidator(Validator):
                    else f"Same {where} lookup: the captured identifier")
         else:
             how = "Same wrong password: existing user"
+        if query is not None and new_lookup_leg and not self.confirm_lookup and (
+                vstatus != istatus or vmask.strip() != imask.strip()):
+            differ = (f"HTTP {vstatus} vs HTTP {istatus}" if vstatus != istatus
+                      else f"identical status ({vstatus}), different bodies after masking")
+            return ValidationResult(
+                self.name, "not_confirmed", fc, confidence=0.5, confirmed=False,
+                summary=(f"Lead, not confirmed (validators.auth_sequence.confirm_lookup is off, "
+                         f"owner sign-off pending): account enumeration through the lookup "
+                         f"{where}: an existing account and a non-existent one answer "
+                         f"differently ({differ})."),
+                evidence=(f"{how} and a random non-existent one: {differ}. The identifiers "
+                          f"are redacted here."),
+                limitation="a lookup discrimination confirms only with "
+                           "validators.auth_sequence.confirm_lookup: true",
+                manual_verification=("Look up a known account and an unknown one at the "
+                                     "same route; compare the answers."),
+            ).with_artifacts(**await proof())
         if vstatus != istatus:
             return ValidationResult(
                 self.name, "confirmed", fc, confidence=0.8, confirmed=True,

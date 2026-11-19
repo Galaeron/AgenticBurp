@@ -27,6 +27,7 @@ from .path_traversal_validator import PathTraversalValidator
 from .open_redirect_validator import OpenRedirectValidator
 from .sequence_validator import SequenceValidator
 from .auth_sequence_validator import AuthSequenceValidator
+from .challenge_echo_validator import ChallengeEchoValidator
 from .stored_xss_validator import StoredXssValidator
 from .verb_tamper_validator import VerbTamperValidator
 from .csrf_validator import CsrfValidator
@@ -264,7 +265,17 @@ class ValidatorRegistry:
         auth_cfg = cfg.get("auth_sequence", {})
         if auth_cfg.get("enabled", True):
             self.validators["auth_sequence"] = AuthSequenceValidator(
-                allowed_hosts=_allowed, timeout=float(auth_cfg.get("timeout", 10.0)))
+                allowed_hosts=_allowed, timeout=float(auth_cfg.get("timeout", 10.0)),
+                confirm_lookup=bool(auth_cfg.get("confirm_lookup", False)))
+        # R11-8 (c): a challenge response that carries its own answer. Passive over
+        # captured pairs; the active submit and confirmation are both opt-in.
+        ce_cfg = cfg.get("challenge_echo", {})
+        if ce_cfg.get("enabled", True):
+            self.validators["challenge_echo"] = ChallengeEchoValidator(
+                allowed_hosts=_allowed, timeout=float(ce_cfg.get("timeout", 10.0)),
+                confirm=bool(ce_cfg.get("confirm", False)),
+                active_submit=bool(ce_cfg.get("active_submit", False)),
+                max_submissions=int(ce_cfg.get("max_submissions", 4)))
         # Stored/second-order XSS leg -- plant via a write, confirm on an
         # independent HTML render. Active; mutating plant needs allow_mutating_replay.
         sxss_cfg = cfg.get("stored_xss", {})
@@ -315,7 +326,8 @@ class ValidatorRegistry:
         if rl_cfg.get("enabled", True):
             self.validators["rate_limit"] = RateLimitValidator(
                 allowed_hosts=_allowed, timeout=float(rl_cfg.get("timeout", 10.0)),
-                min_attempts=int(rl_cfg.get("min_attempts", 12)))
+                min_attempts=int(rl_cfg.get("min_attempts", 12)),
+                confirm_reset_answer=bool(rl_cfg.get("confirm_reset_answer", False)))
         # Predictable reset-token -- samples reset tokens and confirms only the
         # unambiguous predictability cases (sequential/timestamp/below-floor/
         # derived). Active; the reset trigger is a mutating POST (allow_mutating_replay).
@@ -573,8 +585,16 @@ class ValidatorRegistry:
         path = urlsplit(exchange.url).path.lower()
         if check.id in {"WSTG-ATHN-07", "WSTG-SESS-03", "WSTG-IDNT-04", "WSTG-ATHN-11", "WSTG-SESS-06"}:
             from .auth_sequence_validator import _parse_body, _find_key, _PASS_KEYS, _USER_KEYS
+            from .auth_sequence_validator import _query_identifier
             fields, _kind = _parse_body(exchange)
             password, user = _find_key(fields, _PASS_KEYS), _find_key(fields, _USER_KEYS)
+            if (check.id == "WSTG-IDNT-04" and method == "GET"
+                    and _query_identifier(exchange) is not None):
+                # R11-8 (c): a GET lookup that takes the account identifier in its
+                # query (a recovery lookup). r11 never dispatched one: only a
+                # captured credential write passed this gate.
+                return decision("ready", "ready", "identifier lookup") | {
+                    "mechanism_id": "auth.account_lookup"}
             if method not in {"POST", "PUT"}:
                 return decision("unsupported", "unsupported_method", "auth procedure needs a captured credential write")
             if check.id == "WSTG-ATHN-07":
