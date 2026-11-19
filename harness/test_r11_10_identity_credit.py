@@ -8,8 +8,9 @@ to the identity that holds the capture: `covered_by_identity` when that identity
 cell has a conclusive verdict, `open_on_identity` when it has none yet (the gap is
 counted once, on that cell). The credited cell is neither a gap nor a send of its
 own identity. Identity-bound checks (access control, sessions, authentication,
-exposure, cross-identity writes) keep `missing_principal`: nothing replays another
-identity's capture with this identity's credentials.
+exposure, cross-identity writes) keep `missing_principal` unless credential
+substitution (owner decision 2026-11-19, below) replays another identity's capture
+with only this identity's credentials.
 
 Through the production builder (`build_coverage_driven`) and, at caller level,
 `investigate_engagement` with the real builder and crawl (the R11 identity-probe
@@ -18,10 +19,14 @@ fixture), where an identity the crawl never ran holds no capture.
 import asyncio
 import unittest
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import harness.test_identity_probe_variants as probe_fixture
+from harness import safety_gate, worklist_investigator
 from harness.coverage_model import CHECK_CATALOG, CHECKS_BY_ID, _CALLER_INDEPENDENT_CHECKS
 from harness.coverage_tracker import CoverageTracker, build_coverage_driven
+from harness.engagement import capture_identity_key, capture_variant, substituted_variant
+from harness.validators.base import ValidationResult
 
 _EP = "POST /search"
 _NO_CAPTURE = {"status": "needs_prerequisite", "reason_code": "missing_principal",
@@ -200,7 +205,8 @@ class DriveCallerTests(probe_fixture._EngagementCallerBase, unittest.TestCase):
     def test_ghost_caller_independent_cells_are_credited_and_bound_cells_stay_blocked(self):
         result, calls = self._investigate([probe_fixture.ANON, probe_fixture.USER1,
                                            probe_fixture.GHOST],
-                                          crawled=[probe_fixture.ANON, probe_fixture.USER1])
+                                          crawled=[probe_fixture.ANON, probe_fixture.USER1],
+                                          substitution=False)
         ghost = [c for c in self.cells(result, "ghost") if c["shape_applicable"]]
         credited = [c for c in ghost if "covered_by" in c]
         blocked = [c for c in ghost if c["terminal_reason"] == "missing_principal"]
@@ -223,6 +229,186 @@ class DriveCallerTests(probe_fixture._EngagementCallerBase, unittest.TestCase):
         gaps = {(r["identity"], r["endpoint"], r["check"]) for r in result["coverage"]["not_tested"]}
         self.assertFalse({("ghost", c["endpoint"], c["check"]) for c in credited} & gaps)
         self.assertEqual(result["coverage"]["credited_by_identity"]["cells"], len(credited))
+
+
+# --- Credential substitution (owner decision 2026-11-19) -------------------------
+
+_ACCESS_CHECKS = {"WSTG-ATHZ-02", "WSTG-ATHZ-04"}   # the cross_identity leg
+
+
+def _sending_recorder(calls, confirm_as=None):
+    """The cross_identity leg, replaced: it sends the exchange it is handed through
+    the safety gate (inside the run, so the run's transport and gate admit it) and
+    records the request's headers and the response it was handed."""
+    async def validate(self, finding, exchange, *args, **kwargs):
+        async with safety_gate.GatedAsyncClient(safety_gate.get_default_gate(),
+                                                "cross_identity") as client:
+            await client.request(exchange.method, exchange.url,
+                                 headers=exchange.request_headers)
+        calls.append((urlsplit(exchange.url).path, dict(exchange.request_headers),
+                      exchange.response_status, exchange.response_body))
+        confirmed = (confirm_as is not None
+                     and exchange.request_headers.get("Authorization") == confirm_as)
+        return ValidationResult("cross_identity", "confirmed" if confirmed else "not_confirmed",
+                                "idor", confirmed=confirmed, confidence=0.9 if confirmed else 0.0,
+                                summary="recorded")
+    return validate
+
+
+def _credentials(headers):
+    return {k.lower(): v for k, v in headers.items() if k.lower() != "content-type"}
+
+
+class SubstitutionDriveTests(probe_fixture._EngagementCallerBase, unittest.TestCase):
+    """The crawl runs without one identity, so it holds no capture of either
+    endpoint; its access-control cells replay another identity's capture."""
+
+    _investigate = probe_fixture.DriveCallerTests._investigate
+    cells = staticmethod(probe_fixture.DriveCallerTests.cells)
+
+    def test_a_substituted_read_carries_only_the_target_identity_credentials(self):
+        result, calls = self._investigate(
+            [probe_fixture.ANON, probe_fixture.USER1, probe_fixture.GHOST],
+            crawled=[probe_fixture.ANON, probe_fixture.USER1], validate=_sending_recorder)
+        ghost = [c for c in calls if c[1].get("Authorization") == "Bearer ghost-token"]
+        self.assertEqual(sorted({c[0] for c in ghost}), ["/api/Products/1", "/api/Users"])
+        for path, headers, status, body in ghost:
+            # Only ghost's credential, never the source capture's.
+            self.assertEqual(_credentials(headers), {"authorization": "Bearer ghost-token"})
+            self.assertFalse(any("user1-token" in str(v) for v in headers.values()))
+            # The source identity's response is not handed over as ghost's.
+            self.assertIsNone(status)
+            self.assertEqual(body, "")
+        rows = [c for c in self.cells(result, "ghost") if c["check"] in _ACCESS_CHECKS]
+        self.assertTrue(rows)
+        self.assertTrue(all(c["sent"] and c["terminal_reason"] != "missing_principal"
+                            for c in rows), rows)
+        # Provenance on the cell: whose capture, whose credentials.
+        self.assertTrue(all(c["detail"].startswith("substituted_from:")
+                            and "with ghost's credentials substituted" in c["detail"]
+                            for c in rows), rows)
+        # Only the passive leg (it judges the captured response) stays blocked.
+        blocked = [c for c in self.cells(result, "ghost")
+                   if c["terminal_reason"] == "missing_principal"]
+        self.assertTrue(blocked)
+        self.assertEqual({c["confirmation"] for c in blocked}, {"content_exposure"})
+
+    def test_an_anonymous_target_is_no_longer_missing_principal(self):
+        """The crawl ran as user1 only. Anonymous's access-control cells get past
+        the missing capture (user1's is substituted) and stop at the leg's own
+        prerequisite, and nothing is sent as anonymous with user1's token."""
+        result, calls = self._investigate([probe_fixture.ANON, probe_fixture.USER1],
+                                          crawled=[probe_fixture.USER1],
+                                          validate=_sending_recorder)
+        rows = [c for c in self.cells(result, "anonymous") if c["check"] in _ACCESS_CHECKS]
+        self.assertTrue(rows)
+        self.assertFalse([c for c in rows if c["terminal_reason"] == "missing_principal"], rows)
+        self.assertFalse([b for b in result["prerequisite_blocks"]
+                          if b["identity"] == "anonymous" and b["checks_affected"] > 1])
+        self.assertTrue(all(c[1].get("Authorization") == "Bearer user1-token" for c in calls))
+
+    def test_the_switch_off_keeps_missing_principal(self):
+        result, calls = self._investigate(
+            [probe_fixture.ANON, probe_fixture.USER1, probe_fixture.GHOST],
+            crawled=[probe_fixture.ANON, probe_fixture.USER1], validate=_sending_recorder,
+            substitution=False)
+        self.assertFalse([c for c in calls if c[1].get("Authorization") == "Bearer ghost-token"])
+        rows = [c for c in self.cells(result, "ghost") if c["check"] in _ACCESS_CHECKS]
+        self.assertTrue(rows)
+        self.assertTrue(all(c["terminal_reason"] == "missing_principal" and not c["sent"]
+                            for c in rows), rows)
+
+    def test_a_confirmed_finding_says_it_was_substituted(self):
+        def confirming(calls):
+            return _sending_recorder(calls, confirm_as="Bearer ghost-token")
+        result, calls = self._investigate(
+            [probe_fixture.ANON, probe_fixture.USER1, probe_fixture.GHOST],
+            crawled=[probe_fixture.ANON, probe_fixture.USER1], validate=confirming)
+        mine = [f for f in result["findings"] if f.get("identity") == "ghost"
+                and f.get("confirmation_method") == "cross_identity"]
+        self.assertTrue(mine, [sorted(f) for f in result["findings"]])
+        for finding in mine:
+            self.assertTrue(finding["credential_substitution"])
+            self.assertIn(finding["replayed_from_identity"], {"anonymous", "user1"})
+            self.assertTrue(finding["summary"].startswith("substituted_from:"))
+        # No finding of an identity's own replay claims a substitution.
+        self.assertFalse([f for f in result["findings"] if f.get("identity") != "ghost"
+                          and f.get("credential_substitution")])
+
+
+_SOURCE = {"Authorization": "Bearer source-secret-token", "Cookie": "sid=cookie-secret-value"}
+_TARGET = {"Authorization": "Bearer target-token"}
+
+
+def _post_capture(body, url="http://127.0.0.1:9/api/items"):
+    return capture_variant({"url": url, "method": "POST",
+                            "request_headers": dict(_SOURCE, **{"Content-Type": "application/json"}),
+                            "request_body": body, "response_status": 201,
+                            "response_headers": {}, "response_body": '{"ok": true}'})
+
+
+class SubstitutedVariantTests(unittest.TestCase):
+    def test_the_variant_is_rekeyed_and_carries_its_provenance(self):
+        source = _post_capture('{"name": "x"}')
+        moved = substituted_variant(source, capture_identity_key(_TARGET), "src", _SOURCE)
+        self.assertEqual(moved["identity_key"], capture_identity_key(_TARGET))
+        self.assertEqual(moved["substituted_from"], "src")
+        self.assertEqual(moved["substituted_capture_id"], source["capture_id"])
+        self.assertNotEqual(moved["capture_id"], source["capture_id"])
+        self.assertEqual((moved["response_status"], moved["response_body"]), (None, ""))
+        self.assertEqual(moved["template"], source["template"])
+
+    def test_a_capture_carrying_a_credential_is_not_substituted(self):
+        target = capture_identity_key(_TARGET)
+        for body in ('{"csrfToken": "abc", "name": "x"}', "_csrf=abc&name=x",
+                     '{"password": "pw1"}', '{"note": "cookie-secret-value"}',
+                     '{"x": "source-secret-token"}'):
+            with self.subTest(body=body):
+                self.assertIsNone(substituted_variant(_post_capture(body), target, "src", _SOURCE))
+        self.assertIsNone(substituted_variant(
+            _post_capture("{}", url="http://127.0.0.1:9/api/items?session=abc"),
+            target, "src", _SOURCE))
+        # A field that only looks alike is kept.
+        self.assertIsNotNone(substituted_variant(
+            _post_capture('{"author": "a", "inside": 1}'), target, "src", _SOURCE))
+
+    def test_a_substituted_write_is_refused_without_allow_mutating_replay(self):
+        """The substituted exchange is built like any replay (target headers only)
+        and the gate classifies it as the mutating send it is."""
+        variant = substituted_variant(_post_capture('{"name": "x"}'),
+                                      capture_identity_key(_TARGET), "src", _SOURCE)
+        role = SimpleNamespace(role="user", headers=dict(_TARGET))
+        node, = worklist_investigator.captured_nodes(
+            {"method": "POST", "path": "/api/items", "capture_variants": [variant]},
+            "http://127.0.0.1:9", [role], include_probes=True)
+        ex = worklist_investigator._seed_exchange("http://127.0.0.1:9", node, role.headers, "")
+        self.assertEqual(_credentials(ex.request_headers), {"authorization": "Bearer target-token"})
+        for allow, expected in ((False, False), (True, True)):
+            gate = safety_gate.SafetyGate(safety_gate.SafetyGateConfig(
+                active_enabled=True, allow_mutating_replay=allow,
+                allowed_hosts=frozenset({"127.0.0.1"})))
+            decision = gate.authorize(validator_name="write_integrity", method=ex.method,
+                                      url=ex.url, body=ex.request_body, finding_id="f")
+            with self.subTest(allow_mutating_replay=allow):
+                self.assertEqual(decision.allowed, expected, decision.reason)
+                self.assertEqual(decision.tier, safety_gate.ActionRiskTier.MUTATING)
+
+    def test_an_anonymous_target_sends_no_credentials(self):
+        variant = substituted_variant(_post_capture('{"name": "x"}'),
+                                      capture_identity_key({}), "src", _SOURCE)
+        anonymous = SimpleNamespace(role="anonymous", headers={})
+        node, = worklist_investigator.captured_nodes(
+            {"method": "POST", "path": "/api/items", "capture_variants": [variant]},
+            "http://127.0.0.1:9", [anonymous], include_probes=True)
+        self.assertIs(node["probe_session"], anonymous)
+        ex = worklist_investigator._seed_exchange("http://127.0.0.1:9", node, anonymous.headers, "")
+        self.assertEqual(_credentials(ex.request_headers), {})
+        self.assertFalse(any(secret in str(ex.request_headers) + ex.url + ex.request_body
+                             for secret in ("source-secret-token", "cookie-secret-value")))
+
+    def test_passive_mode_forces_the_switch_off(self):
+        from harness.config_schema import _PASSIVE_FORCE_OFF_KNOBS
+        self.assertIn("engagement.coverage_identity_substitution", _PASSIVE_FORCE_OFF_KNOBS)
 
 
 if __name__ == "__main__":

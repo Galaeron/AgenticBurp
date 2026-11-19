@@ -474,6 +474,14 @@ engagement:
   # by the bound are reported as inconclusive (endpoint_check_time_share) and listed
   # under coverage.endpoint_check_time_capped. A fraction from 0 to 1; 0 = no bound.
   coverage_endpoint_check_share: 0.05
+  # R11-10 (owner decision 2026-11-19): when an identity holds no capture of an
+  # endpoint, an identity-bound check (access control, sessions, exposure ...) replays
+  # another identity's capture of it with ONLY this identity's credentials (none for
+  # anonymous). It goes through the safety gate like any replay. A capture whose
+  # query or body carries a credential is not used. Takes effect only inside
+  # coverage_drive_legs; passive-only forces it off. false: the cell stays
+  # missing_principal.
+  coverage_identity_substitution: true
   # Phase time-slices of investigation_seconds (harness/phase_schedule.py). A map of
   # phase -> share for worklist, recrawl, capture_review and chain_rounds: each phase
   # gets its share of the time LEFT when it begins (time a phase leaves unused rolls
