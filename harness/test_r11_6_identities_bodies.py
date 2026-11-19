@@ -198,11 +198,12 @@ class RunIssuedTokenTests(_Base):
         self.assertIn("not a registered session", report.summary)
         self.assertEqual(self.server.received, [], "nothing is sent for a foreign principal")
 
-    def test_anonymous_capture_gets_its_own_skip(self):
+    def test_anonymous_capture_is_read_as_the_anonymous_caller(self):
+        # R11-9 (owner decision 2026-11-19): no longer skipped. This service
+        # refuses anonymous reads, so nothing is exposed.
         report = self.exposure({})
-        self.assertEqual(report.status, "skipped", report.summary)
-        self.assertIn("no credentials", report.summary)
-        self.assertEqual(self.server.received, [])
+        self.assertEqual(report.status, "not_confirmed", report.summary)
+        self.assertEqual([h.get("Authorization") for _, _, h, _ in self.server.received], [None])
 
     def test_matching_rules(self):
         ids = [{"name": "a", "headers": {"Authorization": "Bearer t1", "Cookie": "sid=s1"}},
