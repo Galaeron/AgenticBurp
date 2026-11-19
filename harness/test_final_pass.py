@@ -18,11 +18,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from harness import (cache, config_schema, coverage_tracker, engagement_builder,
+from harness import (cache, run_handoff, config_schema, coverage_tracker, engagement_builder,
                      evidence_ledger, instrumentation, retry_rounds, safety_gate,
                      sqlmap_targeting, store, worklist_investigator)
 from harness.final_pass import STEPS, FinalPassConfig, run_final_pass
 from harness.orchestrator import Orchestrator
+from harness.orchestrator_chain import ChainMixin
 from harness.phase_schedule import PhaseSchedule
 from harness.role_crawl import RoleSession
 from harness.run_context import RunContext
@@ -185,6 +186,45 @@ class PhaseRecordTests(unittest.TestCase):
         self.assertIsNone(record["unused_s"])
 
 
+    def test_a_skipped_phase_records_why_and_an_aborted_one_is_interrupted(self):
+        # R11-4b: skip() for experiments_final past its deadline; abort() for the
+        # phase a cancel cut (the server's cancelled-job result).
+        clock = _Clock(0.0)
+        events = []
+        rec = instrumentation.PhaseRecorder(announce=False, clock=clock,
+                                            on_event=lambda *a: events.append(a))
+        rec.begin("final_pass", budget_s=50.0)
+        clock.now = 20.0
+        rec.skip("experiments_final", "deadline passed")
+        rec.begin("finalise")
+        clock.now = 25.0
+        rec.abort()
+        rec.abort()                                       # nothing open: no-op
+        fp, ef, fin = rec.timings()
+        self.assertEqual((fp["elapsed_s"], fp["unused_s"]), (20.0, 30.0))
+        self.assertNotIn("interrupted", fp)
+        self.assertEqual((ef["skipped"], ef["elapsed_s"], ef["started_s"]), ("deadline passed", 0.0, 20.0))
+        self.assertTrue(fin["interrupted"])
+        self.assertEqual(fin["elapsed_s"], 5.0)
+        self.assertEqual(events, [("begin", "final_pass"), ("end", "final_pass"),
+                                  ("skip", "experiments_final", "deadline passed"),
+                                  ("begin", "finalise"), ("abort", "finalise")])
+
+    def test_control_a_handoff_without_a_skip_lists_no_skipped_phase(self):
+        handoff = run_handoff.RunHandoff("r11-4b", host="shop.test")
+        handoff.phase_event("begin", "worklist")
+        handoff.phase_event("skip", "experiments_final", "deadline passed")
+        phases = handoff.snapshot()["phases"]
+        self.assertEqual(phases["skipped"], [{"phase": "experiments_final", "reason": "deadline passed"}])
+        self.assertEqual([p["phase"] for p in phases["not_run"]], ["finalise"])
+        self.assertNotIn("experiments_final", phases["not_applicable"])
+        plain = run_handoff.RunHandoff("r11-4b-off", host="shop.test")
+        plain.phase_event("begin", "worklist")
+        phases = plain.snapshot()["phases"]
+        self.assertEqual(phases["skipped"], [])
+        self.assertIn({"phase": "experiments_final", "conditional": True}, phases["not_run"])
+
+
 class ManifestTests(unittest.TestCase):
     def test_manifest_keeps_phase_timings_and_the_sqlmap_report_beside_them(self):
         report = {"endpoint_family_seconds": 600.0, "seconds_by_family": {},
@@ -278,12 +318,16 @@ class FinalPassCallerTests(unittest.TestCase):
         store._DB_PATH, cache._cache = self._orig
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def _investigate(self, engagement=None, *, first_sweep_seconds=10.0, start=1000.0):
+    def _investigate(self, engagement=None, *, first_sweep_seconds=10.0, start=1000.0,
+                     later_sweep_seconds=0.0, experiments_final=None, handoff=False):
         cfg = _config()
         cfg["engagement"].update(engagement or {})
         orch = Orchestrator(cfg)
         orch.allowed_hosts = ["shop.test"]
         rc = RunContext.create(allowed_hosts=["shop.test"], max_requests=100, config=cfg)
+        self.rc = rc
+        if handoff:
+            run_handoff.attach(rc, host="shop.test", base_url=BASE, output_dir=self._tmp)
         clock = _Clock(start)
         sweeps = []
 
@@ -301,6 +345,7 @@ class FinalPassCallerTests(unittest.TestCase):
                 targeting.finish(targeting.start("GET", "https://shop.test/rest/search?q=1"))
                 kwargs["summary_out"].update({"skipped_by_reason": {"budget_exhausted": 1}})
                 return [out]
+            clock.now += later_sweep_seconds
             completed = kwargs.get("completed") or {}
             outs = [dict(completed[k], resumed=True) for k in completed]
             out = _outcome("found", path="/b", findings=1)
@@ -319,6 +364,11 @@ class FinalPassCallerTests(unittest.TestCase):
                    patch("harness.orchestrator_chain.time", new=SimpleNamespace(monotonic=clock, time=time.time)),
                    patch("harness.browser_driver.default_driver", return_value=None),
                    patch.object(retry_rounds, "_breaker_retry_after", return_value=0.0)]
+        if experiments_final is not None:
+            async def spy(_self, *args, deadline=None, **kwargs):
+                experiments_final.append({"deadline": deadline, "now": clock.now})
+                return {"runs": 0, "stopped_by": "no ready experiment"}
+            patches.append(patch.object(ChainMixin, "_final_experiment_pass", spy))
 
         async def go():
             try:
@@ -371,6 +421,14 @@ class FinalPassCallerTests(unittest.TestCase):
         self.assertEqual(list(instr["sqlmap_targeting"]["seconds_by_family"]),
                          [sqlmap_targeting.endpoint_family("GET", "https://shop.test/rest/search?q=1")])
 
+    def test_the_engagement_leaves_its_instrumentation_on_the_run(self):
+        # R11-4b: the server's cancelled-job result reads it from there.
+        result, _, _ = self._investigate({"investigation_seconds": 900})
+        instr = self.rc.instrumentation
+        self.assertIsInstance(instr, instrumentation.RunInstrumentation)
+        self.assertEqual([r["phase"] for r in instr.phases.timings()],
+                         [r["phase"] for r in result["instrumentation"]["phase_timings"]])
+
     def test_a_phase_ending_at_half_its_slice_gives_the_next_one_the_rest(self):
         result, _, _ = self._investigate({
             "investigation_seconds": 1000, "phase_slices": {"worklist": 1, "chain_rounds": 1}},
@@ -418,6 +476,64 @@ class FinalPassCallerTests(unittest.TestCase):
             result, _, _ = self._investigate({"investigation_seconds": 900})
         self.assertIn("sqlmap_targeting", result["instrumentation"])
         self.assertIsNone(result["instrumentation"]["sqlmap_targeting"])
+
+    # ---------------------------------------------------------- experiments_final
+    # R11-4b: the final experiment pass is bounded by the coverage deadline AND the
+    # investigation deadline less the finalise reserve; past that bound the phase
+    # is recorded as skipped, with why (phase_timings and the handoff).
+    def test_experiments_final_is_bounded_by_the_deadline_less_the_finalise_reserve(self):
+        # No coverage_drive_seconds: before R11-4b it got no deadline at all.
+        seen = []
+        result, _, start = self._investigate({"investigation_seconds": 900},
+                                             experiments_final=seen)
+        self.assertEqual(seen, [{"deadline": start + 900 - 60, "now": start + 10}])
+        record = self._timing(result, "experiments_final")
+        self.assertEqual(record["budget_s"], 900 - 10 - 60)
+        self.assertNotIn("skipped", record)
+
+    def test_experiments_final_never_runs_past_the_run_deadline_on_a_long_drive_deadline(self):
+        # The coverage deadline (2010 s) lies past the investigation deadline (900 s).
+        seen = []
+        result, _, start = self._investigate(
+            {"investigation_seconds": 900, "coverage_drive_seconds": 2000}, experiments_final=seen)
+        self.assertEqual(seen[0]["deadline"], start + 900 - 60)
+        self.assertEqual(self._timing(result, "experiments_final")["budget_s"], 830.0)
+
+    def test_control_experiments_final_runs_within_the_drive_deadline_when_time_remains(self):
+        seen = []
+        result, _, start = self._investigate(
+            {"investigation_seconds": 900, "coverage_drive_seconds": 100}, experiments_final=seen)
+        self.assertEqual(seen, [{"deadline": start + 10 + 100, "now": start + 10}])
+        record = self._timing(result, "experiments_final")
+        self.assertEqual((record["budget_s"], record.get("skipped")), (100.0, None))
+
+    def test_experiments_final_is_skipped_once_only_the_finalise_reserve_is_left(self):
+        seen = []
+        result, _, start = self._investigate({"investigation_seconds": 900},
+                                             first_sweep_seconds=870.0, experiments_final=seen,
+                                             handoff=True)
+        record = self._timing(result, "experiments_final")
+        self.assertIn("investigation deadline less the finalise reserve (60 s)", record["skipped"])
+        self.assertEqual((record["elapsed_s"], record["budget_s"]), (0.0, None))
+        # The pass is told the bound that passed, so it sends nothing and defers.
+        self.assertEqual(seen, [{"deadline": start + 840, "now": start + 870}])
+        self.assertEqual(result["experiment_final_pass"]["skipped"], record["skipped"])
+        phases = self.rc.handoff.snapshot()["phases"]
+        self.assertEqual(phases["skipped"], [{"phase": "experiments_final",
+                                              "reason": record["skipped"]}])
+        self.assertNotIn("experiments_final", phases["begun"])
+        self.assertNotIn("experiments_final", phases["not_applicable"])
+        self.assertIn("finalise", phases["begun"])
+
+    def test_experiments_final_is_skipped_once_the_final_pass_ran_past_the_drive_deadline(self):
+        seen = []
+        result, _, start = self._investigate(
+            {"investigation_seconds": 900, "coverage_drive_seconds": 100,
+             "final_pass": {"enabled": True, "reserve_seconds": 60}},
+            later_sweep_seconds=200.0, experiments_final=seen)
+        self.assertEqual(seen, [{"deadline": start + 110, "now": start + 210}])
+        self.assertEqual(self._timing(result, "experiments_final")["skipped"],
+                         "the coverage stage's deadline has passed")
 
     def test_control_on_without_a_deadline_runs_no_pass(self):
         result, sweeps, _ = self._investigate({"final_pass": {"enabled": True}})

@@ -561,7 +561,10 @@ engagement:
   # replays the per-endpoint check share held (each such check gets its share again).
   # Same legs, gates, write rules and per-leg caps; no step starts past the deadline.
   # r11 ended 51 min early with 176 budget-skipped nodes, 283 legs and 47 replays left.
-  # DEFAULT OFF: it sends active traffic.
+  # DEFAULT OFF: it sends active traffic. reserve_seconds, on or off, also bounds the
+  # final experiment pass (experiments_final): it stops at the investigation deadline
+  # less this reserve (and at the coverage deadline), and is recorded as skipped once
+  # that bound has passed (R11-4b).
   final_pass:
     enabled: false
     reserve_seconds: 60
