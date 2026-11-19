@@ -9,10 +9,10 @@ entered RunContext) against an owned loopback app, with a matched negative.
   reset      a reset-answer POST with no throttle versus one that throttles, plus
              the safety gates (another account, a rejected capture).
 
-Policy under test: every positive is a labelled LEAD (not_confirmed, with
-manual_verification) by default, and confirms only with its config key on:
-validators.challenge_echo.confirm, validators.auth_sequence.confirm_lookup,
-validators.rate_limit.confirm_reset_answer.
+Policy under test (owner decision 2026-11-19): every positive confirms by
+default, and is a labelled LEAD (not_confirmed, with manual_verification) when
+its config key is set false: validators.challenge_echo.confirm,
+validators.auth_sequence.confirm_lookup, validators.rate_limit.confirm_reset_answer.
 """
 import asyncio
 import itertools
@@ -178,9 +178,9 @@ class ChallengeEchoTests(_Base):
             captured += model.pair(app.origin, accepted=accepted)
         return app, model, captured
 
-    def test_echoing_challenge_is_a_lead_by_default(self):
+    def test_echoing_challenge_is_a_lead_with_the_key_off(self):
         app, _m, captured = self._captures(echo=True)
-        report = self.dispatch(self.orch("challenge_echo"), captured[-2], "challenge_echo",
+        report = self.dispatch(self.orch("challenge_echo", confirm=False), captured[-2], "challenge_echo",
                                captured=captured)
         self.assertLead(report)
         self.assertIn("confirm is off", report.summary)
@@ -190,9 +190,12 @@ class ChallengeEchoTests(_Base):
         self.assertTrue(report.manual_verification)
         self.assertEqual(app.received, [], "the passive verdict sent a request")
 
-    def test_echoing_challenge_confirms_with_the_key_on(self):
+    def test_echoing_challenge_confirms_by_default(self):
         _app, _m, captured = self._captures(echo=True)
-        report = self.dispatch(self.orch("challenge_echo", confirm=True), captured[-2],
+        orch = self.orch("challenge_echo")
+        self.assertTrue(orch.validator_registry.validators["challenge_echo"].confirm)
+        self.assertFalse(orch.validator_registry.validators["challenge_echo"].active_submit)
+        report = self.dispatch(orch, captured[-2],
                                "challenge_echo", captured=captured)
         self.assertEqual(report.status, "confirmed", report.summary)
         self.assertTrue(report.confirmed)
@@ -232,7 +235,8 @@ class ChallengeEchoTests(_Base):
 
     def test_active_submit_finds_the_echoed_answer(self):
         app, _m, captured = self._captures(echo=True, pairs=1, accepted=False)
-        report = self.dispatch(self.orch("challenge_echo", active_submit=True), captured[0],
+        report = self.dispatch(self.orch("challenge_echo", active_submit=True, confirm=False),
+                               captured[0],
                                "challenge_echo", captured=captured)
         self.assertLead(report)
         self.assertIn("'solution' passes the challenge", report.summary)
@@ -281,9 +285,9 @@ class LookupEnumerationTests(_Base):
     def _lookup(self, app):
         return _ex(app.origin + "/rest/account/question?email=someone@example.test")
 
-    def test_discriminating_lookup_is_a_redacted_lead_by_default(self):
+    def test_discriminating_lookup_is_a_redacted_lead_with_the_key_off(self):
         app = _lookup_app(self, True)
-        report = self.dispatch(self.orch("auth_sequence"), self._lookup(app),
+        report = self.dispatch(self.orch("auth_sequence", confirm_lookup=False), self._lookup(app),
                                "username_enumeration", identities=[_ANN])
         self.assertLead(report)
         self.assertIn("confirm_lookup is off", report.summary)
@@ -295,9 +299,9 @@ class LookupEnumerationTests(_Base):
         self.assertIn(_ANN, sent)
         self.assertTrue(any(e.startswith("nouser_") for e in sent), sent)
 
-    def test_discriminating_lookup_confirms_with_the_key_on(self):
+    def test_discriminating_lookup_confirms_by_default(self):
         app = _lookup_app(self, True)
-        report = self.dispatch(self.orch("auth_sequence", confirm_lookup=True),
+        report = self.dispatch(self.orch("auth_sequence"),
                                self._lookup(app), "username_enumeration", identities=[_ANN])
         self.assertEqual(report.status, "confirmed", report.summary)
         self.assertNotIn(_ANN, report.summary + report.evidence)
@@ -315,7 +319,7 @@ class LookupEnumerationTests(_Base):
         from harness.models import Finding
         from harness.run_context import RunContext
         app = _lookup_app(self, True)
-        orch = self.orch("auth_sequence")          # confirm_lookup left at its default
+        orch = self.orch("auth_sequence", confirm_lookup=False)   # the new paths' key off
         self.assertFalse(orch.validator_registry.validators["auth_sequence"].confirm_lookup)
         exchange = self._lookup(app)
         finding = Finding(vulnerability_class="username_enumeration", confidence=0.6,
@@ -409,9 +413,9 @@ class ResetAnswerRateLimitTests(_Base):
                                identities=[_ANN])
         return app, report
 
-    def test_unthrottled_wrong_answers_are_a_lead_by_default(self):
+    def test_unthrottled_wrong_answers_are_a_lead_with_the_key_off(self):
         model = _Reset()
-        app, report = self._run(model)
+        app, report = self._run(model, confirm_reset_answer=False)
         self.assertLead(report)
         self.assertIn("confirm_reset_answer is off", report.summary)
         self.assertNotIn(_ANN, report.summary + report.evidence)
@@ -423,8 +427,8 @@ class ResetAnswerRateLimitTests(_Base):
                          {(_ANN, "pw-ann-123", "pw-ann-123")})
         self.assertEqual(model.changed, [], "a wrong answer changed state")
 
-    def test_unthrottled_wrong_answers_confirm_with_the_key_on(self):
-        _app, report = self._run(_Reset(), confirm_reset_answer=True)
+    def test_unthrottled_wrong_answers_confirm_by_default(self):
+        _app, report = self._run(_Reset())
         self.assertEqual(report.status, "confirmed", report.summary)
         self.assertIn("No limit on reset-answer guessing", report.summary)
 

@@ -28,6 +28,7 @@ from .open_redirect_validator import OpenRedirectValidator
 from .sequence_validator import SequenceValidator
 from .auth_sequence_validator import AuthSequenceValidator
 from .challenge_echo_validator import ChallengeEchoValidator
+from .password_change_validator import PasswordChangeSessionValidator
 from .stored_xss_validator import StoredXssValidator
 from .verb_tamper_validator import VerbTamperValidator
 from .csrf_validator import CsrfValidator
@@ -266,16 +267,22 @@ class ValidatorRegistry:
         if auth_cfg.get("enabled", True):
             self.validators["auth_sequence"] = AuthSequenceValidator(
                 allowed_hosts=_allowed, timeout=float(auth_cfg.get("timeout", 10.0)),
-                confirm_lookup=bool(auth_cfg.get("confirm_lookup", False)))
+                confirm_lookup=bool(auth_cfg.get("confirm_lookup", True)))
         # R11-8 (c): a challenge response that carries its own answer. Passive over
         # captured pairs; the active submit and confirmation are both opt-in.
         ce_cfg = cfg.get("challenge_echo", {})
         if ce_cfg.get("enabled", True):
             self.validators["challenge_echo"] = ChallengeEchoValidator(
                 allowed_hosts=_allowed, timeout=float(ce_cfg.get("timeout", 10.0)),
-                confirm=bool(ce_cfg.get("confirm", False)),
+                confirm=bool(ce_cfg.get("confirm", True)),
                 active_submit=bool(ce_cfg.get("active_submit", False)),
                 max_submissions=int(ce_cfg.get("max_submissions", 4)))
+        # R11-8 (b): a run-owned identity's token across its own password change.
+        # A write: allow_mutating_replay and mutating_ceiling_by_check >= 2.
+        pc_cfg = cfg.get("password_change_session", {})
+        if pc_cfg.get("enabled", True):
+            self.validators["password_change_session"] = PasswordChangeSessionValidator(
+                allowed_hosts=_allowed, timeout=float(pc_cfg.get("timeout", 10.0)))
         # Stored/second-order XSS leg -- plant via a write, confirm on an
         # independent HTML render. Active; mutating plant needs allow_mutating_replay.
         sxss_cfg = cfg.get("stored_xss", {})
@@ -327,7 +334,7 @@ class ValidatorRegistry:
             self.validators["rate_limit"] = RateLimitValidator(
                 allowed_hosts=_allowed, timeout=float(rl_cfg.get("timeout", 10.0)),
                 min_attempts=int(rl_cfg.get("min_attempts", 12)),
-                confirm_reset_answer=bool(rl_cfg.get("confirm_reset_answer", False)))
+                confirm_reset_answer=bool(rl_cfg.get("confirm_reset_answer", True)))
         # Predictable reset-token -- samples reset tokens and confirms only the
         # unambiguous predictability cases (sequential/timestamp/below-floor/
         # derived). Active; the reset trigger is a mutating POST (allow_mutating_replay).
@@ -594,6 +601,28 @@ class ValidatorRegistry:
                 and {family, getattr(validator, "name", "")} & POLLING_EXCLUDED_VALIDATORS):
             return decision("unsupported", "protocol_inapplicable",
                             "a long-polling transport request carries framing, not application input")
+        if check.id == "WSTG-SESS-07":
+            # R11-8 (b): decodes the session JWTs the run already holds; sends nothing,
+            # so it needs no mutating-replay permission, and no JWT means no case.
+            from .auth_sequence_validator import _session_jwts
+            if not _session_jwts(exchange, run_context):
+                return decision("needs_prerequisite", "missing_credentials",
+                                "no session JWT in the capture or the run's identities")
+            return decision("ready", "ready", "decode-only token expiry check") | {
+                "mechanism_id": "auth.token_expiry"}
+        if check.id == "AV-PWCHANGE-01":
+            from .password_change_validator import change_shape
+            if change_shape(exchange) is None:
+                return decision("unsupported", "unsupported_boundary",
+                                "needs a captured change-password request")
+            gate = getattr(run_context, "gate", None)
+            if gate is None or not gate.config.allow_mutating_replay or \
+                    gate.mutating_headroom(None, "password_change_session")[2] < 2:
+                return decision("policy_denied", "mutating_policy_denied",
+                                "the change and its restore need allow_mutating_replay and "
+                                "mutating_ceiling_by_check.password_change_session >= 2")
+            return decision("ready", "ready", "password change with restore") | {
+                "mechanism_id": "auth.password_change_session"}
         method = (exchange.method or "GET").upper()
         path = urlsplit(exchange.url).path.lower()
         if check.id in {"WSTG-ATHN-07", "WSTG-SESS-03", "WSTG-IDNT-04", "WSTG-ATHN-11", "WSTG-SESS-06"}:

@@ -267,6 +267,11 @@ class ManagedSession:
     auth_failures: int = 0           # 401s seen on sends that carried this session's credentials
     _probe: "HealthProbe | None" = field(default=None, repr=False)
     _refresh_fn: object = field(default=None, repr=False)
+    # R11-8 (b): the operator-declared login of this identity (its credentials,
+    # kept in memory only and never logged) and the base URL it resolves against.
+    # Only an identity the run owns has one; legs that log in act only on it.
+    login: dict | None = field(default=None, repr=False)
+    login_base: str = field(default="", repr=False)
     _refreshes: int = field(default=0, repr=False)
     _checked_at: "float | None" = field(default=None, repr=False)   # _clock() of the last probe
     _expiry_reported: bool = field(default=False, repr=False)
@@ -371,6 +376,14 @@ class SessionManager:
         if session is None:
             raise ValueError(f"unknown session reference: {session_id}")
         session._refresh_fn = fn
+
+    def set_login(self, session_id: str, login: dict, base_url: str) -> None:
+        """Keep this identity's declared login (role.login) for legs that must log
+        in as a run-owned identity (R11-8 b). In memory only; never logged."""
+        session = self._by_id.get(session_id)
+        if session is None:
+            raise ValueError(f"unknown session reference: {session_id}")
+        session.login, session.login_base = dict(login or {}), str(base_url or "")
 
     def replace_headers(self, session_id: str, headers: dict) -> ManagedSession:
         """Install new credentials for a session: bumps `generation`, marks it

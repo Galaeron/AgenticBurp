@@ -291,6 +291,9 @@ _LEG_CONFIRMATIONS = {
     "client_trust", "websocket", "oauth",
     # R11-7: multi-step flows; needs an explicit mutating_ceiling_by_check.business_flow.
     "business_flow",
+    # R11-8 (b): a write with its restore; readiness needs allow_mutating_replay and
+    # mutating_ceiling_by_check.password_change_session >= 2 (capability_for_check).
+    "password_change_session",
 }
 # Catalog confirmation kinds that name a registered validator but are NOT drive legs,
 # each with the reason. Driving one would write a cell verdict its probe does not

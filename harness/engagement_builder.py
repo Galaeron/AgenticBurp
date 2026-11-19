@@ -66,6 +66,7 @@ def register_role_sessions(run_context, base_url: str, roles) -> list[str] | Non
             from harness.session_freshness import login_refresher
             run_context.sessions.set_refresh(
                 session_id, login_refresher(run_context, role.login, base_url))
+            run_context.sessions.set_login(session_id, role.login, base_url)
         session_refs.append(session_id)
     return session_refs
 

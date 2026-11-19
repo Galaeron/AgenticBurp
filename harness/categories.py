@@ -44,6 +44,11 @@ CANONICAL_CATEGORIES: tuple[str, ...] = (
     # no canonical home, so every wording was its own class. No specialist agent or
     # validator owns them yet; they exist for issue grouping and the coverage ledger.
     "insecure_transport", "missing_headers", "bfla",
+    # R11-8 (b): a session token that never expires (WSTG-SESS-07), its own class so
+    # the proof never stands for the logout check (session_timeout).
+    "session_expiry",
+    # R11-8 (b): a token issued before a password change still works after it.
+    "session_after_password_change",
 )
 
 # Deliberately generous but not promiscuous: each entry is a phrase an
@@ -197,6 +202,21 @@ _SYNONYMS: dict[str, str] = {
     "session_timeout": "session_timeout", "session timeout": "session_timeout",
     "logout invalidation": "session_timeout", "logout_invalidation": "session_timeout",
     "session not invalidated": "session_timeout",
+    "session_expiry": "session_expiry", "session expiry": "session_expiry",
+    "token never expires": "session_expiry", "session never expires": "session_expiry",
+    "jwt never expires": "session_expiry", "jwt without exp": "session_expiry",
+    "jwt without expiration": "session_expiry", "jwt no exp": "session_expiry",
+    "jwt without exp claim": "session_expiry", "jwt without an exp claim": "session_expiry",
+    "missing exp claim": "session_expiry", "no exp claim": "session_expiry",
+    "token without expiry": "session_expiry", "non-expiring token": "session_expiry",
+    "never-expiring token": "session_expiry", "no token expiration": "session_expiry",
+    "missing token expiration": "session_expiry",
+    "session_after_password_change": "session_after_password_change", "session after password change": "session_after_password_change",
+    "token survives password change": "session_after_password_change", "session survives password change": "session_after_password_change",
+    "session not revoked on password change": "session_after_password_change",
+    "sessions not invalidated on password change": "session_after_password_change",
+    "session not invalidated after password change": "session_after_password_change",
+    "token valid after password change": "session_after_password_change",
     "behavioral anomaly": "anomaly", "suspicious behavior": "anomaly",
 }
 
