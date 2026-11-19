@@ -584,6 +584,18 @@ _CLIENT_VALUE_FIELD = re.compile(
     r"price|amount|total|cost|discount|quantity|qty|subtotal|fee|balance")
 _CLIENT_VALUE_PATH = ("cart", "checkout", "basket", "order", "payment", "purchase")
 
+def _flow_shape(kind: str):
+    """A predicate: the endpoint's captured write has the business-flow shape `kind`."""
+    def predicate(endpoint: dict) -> tuple[bool, str]:
+        from harness.validators.business_flow_validator import endpoint_flow_kind
+        got = endpoint_flow_kind(endpoint)
+        if got == kind:
+            return True, f"captured write has the {kind} flow shape"
+        return False, f"no captured write with the {kind} flow shape"
+    predicate.__name__ = f"_flow_shape_{kind}"
+    return predicate
+
+
 def _has_client_value_field(endpoint: dict) -> tuple[bool, str]:
     if not _accepts_body(endpoint)[0]:
         return False, "no body-bearing write to tamper"
@@ -1361,6 +1373,46 @@ CHECK_CATALOG: tuple[Check, ...] = (
           specific_classes=(
               "create_validation", "weak_create_validation", "duplicate_registration",
               "empty_required_fields", "missing_required_field_validation",
+          )),
+    # R11-7 business flows (business_flow_validator): replay the run's own captured
+    # flow on a run-owned identity, read the resulting state back, restore what can be.
+    Check("WSTG-BUSL-10", "Payment functionality (settlement tamper, payment skip)",
+          Phase.ENDPOINT, "payment_tamper", _flow_shape("payment_tamper"), "business_flow",
+          "Replay the captured cart steps and settlement untampered, then with a client-chosen "
+          "amount, quantity or delivery value (or the payment dropped); confirm only when the "
+          "read-back order total or balance shows less was charged than the control.",
+          "Business logic vulnerabilities",
+          specific_classes=(
+              "payment_tamper", "payment tamper", "payment_tampering", "payment tampering",
+              "checkout_tamper", "checkout tampering", "settlement_tamper", "payment_bypass",
+              "payment bypass", "payment_skip", "order_total_tamper", "wallet_payment_skip",
+          )),
+    Check("AV-BUSL-COUPON-01", "Coupon or voucher misuse (forged, expired, another user's code)",
+          Phase.ENDPOINT, "coupon_misuse", _flow_shape("coupon_misuse"), "business_flow",
+          "Apply a forged code, an expired code and another run identity's code to the captured "
+          "coupon write; confirm when the basket or order read-back shows the discount, then "
+          "clear the code again.",
+          "Business logic vulnerabilities",
+          external_refs=(
+              ExternalRef("WSTG", "WSTG-BUSL-10",
+                          "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/10-Business_Logic_Testing/10-Test-Payment-Functionality",
+                          "Test Payment Functionality"),
+          ),
+          specific_classes=(
+              "coupon_misuse", "coupon misuse", "coupon_forgery", "coupon forgery",
+              "coupon_reuse", "expired_coupon", "voucher_misuse", "promo_code_abuse",
+              "discount_code_abuse", "cross_user_coupon",
+          )),
+    Check("WSTG-BUSL-06", "Circumvention of work flows (2FA disable without step-up)",
+          Phase.ENDPOINT, "mfa_disable_stepup", _flow_shape("mfa_disable_stepup"), "business_flow",
+          "Replay the captured 2FA-disable request with its password or TOTP field dropped or "
+          "wrong; confirm when the status read-back shows 2FA off, then re-enable it from the "
+          "run's captured enable request or name it as left disabled.",
+          "Authentication vulnerabilities",
+          specific_classes=(
+              "mfa_disable_stepup", "mfa disable stepup", "2fa_disable", "2fa disable",
+              "mfa_disable", "two_factor_disable", "mfa_step_up_bypass",
+              "2fa_disable_without_password",
           )),
 )
 

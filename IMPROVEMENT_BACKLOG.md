@@ -5358,7 +5358,7 @@ Non-negotiables apply:
   - A write endpoint seen only through its GET gets a mass-assignment leg.
   - Negative controls: a foreign token stays unregistered; a read-only field is never sent.
 
-### [ ] R11-7 — Multi-step business flows (checkout, coupons, wallet, 2FA)  [OWNER APPROVED 2026-11-19]
+### [x] R11-7 — Multi-step business flows (checkout, coupons, wallet, 2FA)  [OWNER APPROVED 2026-11-19]
 - **Owner decision (2026-11-19):** checks may drive multi-step writes on run-owned accounts,
   restoring where possible and naming what is left; behind the existing write gates.
 - **Domain:** Workflow misuse · **Mode:** design LOOP after the owner decides; live OWNER/LIVE.
@@ -5371,6 +5371,56 @@ Non-negotiables apply:
 - **Note:** this is HU-4's scope with live evidence. The flows create orders and move wallet
   balance, so the owner must first decide which state-creating steps a run may take and how
   it restores them. Track it under HU-4; this entry holds the evidence.
+- **DONE offline (2026-11-19):** `harness/validators/business_flow_validator.py`, one leg
+  (`business_flow`) with three kinds. Each starts from the run's own captured flow and is
+  judged only on a read-back. See `docs/WRITE_CHECKS.md`.
+  - `d8a168c7` checkout/payment tamper, `WSTG-BUSL-10`:
+    - It replays the cart steps and the settlement as an untampered control, then with a
+      client-chosen amount, a negative quantity or a fake delivery id. It confirms when
+      the order total or balance read-back shows less was charged.
+    - Payment skip (covers wallet and deluxe membership): it drops or forges the payment
+      field. It confirms when a standing is granted with no debit; a new order alone is a
+      lead.
+  - `56daf874` coupon misuse, `AV-BUSL-COUPON-01`: forged, expired and another identity's
+    code. It confirms on the read-back discount and clears a body code again.
+  - `bbd62f63` 2FA disable without step-up, `WSTG-BUSL-06`: the step-up field is dropped,
+    then wrong, and the status read-back decides. It re-enables 2FA from the identity's
+    captured enable request, otherwise the finding names "2FA LEFT DISABLED".
+  - Gates: `active_enabled`, `allow_mutating_replay` and an explicit
+    `mutating_ceiling_by_check.business_flow`. The defaults send nothing. It sends only
+    through `RunContext.executor()` as a registered identity and never sends DELETE.
+    Placed orders are named LEFT IN PLACE.
+  - Tests: `harness/test_business_flows.py` (16): a positive and a negative per flow
+    through the real dispatch, the defaults, a missing ceiling, foreign credentials, the
+    unrestorable 2FA residue, and no DELETE.
+  - Left over: R11-7b (live trial) and R11-7c (gaps).
+
+### [ ] R11-7b — Live trial of the business_flow leg  [OWNER/LIVE]
+- **Mode:** LIVE on a fresh container. Use `config.local.yaml` with `active_enabled`,
+  `allow_mutating_replay` and `mutating_ceiling_by_check.business_flow: 8`.
+- **Aim:** confirm on a live target that the leg reaches the r11/Strix shapes:
+  checkout (#21), wallet and deluxe (#22, #26), coupons (#23, #24, #30) and 2FA disable (#29).
+- **Check the captured flow:** does it hold the read-backs the leg needs (an order
+  history, a basket, a 2FA status GET)? If not, declare them in
+  `validators.business_flow.read_backs` / `mfa_status_reads`.
+- **Expect residue:** orders stay; a coupon carried in the path stays applied; 2FA
+  usually stays disabled, because re-enabling needs a fresh TOTP. All of it is named
+  in the change log.
+
+### [ ] R11-7c — business_flow gaps not covered by R11-7
+- **Mode:** LOOP (offline).
+- **Not covered:**
+  - **Race at settlement (#25):** concurrent settlements against one basket or balance.
+    `race_condition`/`toctou` do not drive the settlement flow.
+  - **Coupon at the settlement step:** a code carried by the settlement body goes
+    through the control-vs-tamper comparison. It has no loopback test yet.
+  - **2FA restore:** it cannot mint the fresh TOTP a setup replay usually needs. A
+    restore that uses the run's TOTP secret, when one is declared, is open.
+  - **Variants and flow discovery:**
+    - at most two tampered variants per finding;
+    - the cart steps are the identity's three latest cart-path writes before the first
+      capture of the settlement;
+    - a flow whose basket is filled by a non-cart-shaped path is missed.
 
 ### [ ] R11-8 — Detection gaps behind Strix findings r11 sent requests for but never reported
 - **Domain:** Detection · **Effort:** M per sub-item · **Mode:** LOOP (offline); (b) and (c)

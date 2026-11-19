@@ -2736,7 +2736,7 @@ class ChainMixin:
                              "race_condition", "security_headers", "error_handling",
                              "content_exposure", "listing_exposure", "filter_bypass",
                              "metrics_exposure", "sensitive_file", "well_known",
-                             "client_trust", "websocket", "oauth"):
+                             "client_trust", "websocket", "oauth", "business_flow"):
                     registered = self.validator_registry.validators.get(name)
                     if registered is not None:
                         _val_by_conf[name] = self.validator_registry.bind_run_context(

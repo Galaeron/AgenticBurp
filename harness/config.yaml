@@ -998,6 +998,16 @@ validators:
   write_integrity:
     enabled: true
     restore_routes: []
+  # R11-7 multi-step business flows (checkout tamper, coupon misuse, 2FA disable
+  # without step-up) on run-owned identities. Sends nothing unless active_enabled,
+  # allow_mutating_replay AND mutating_ceiling_by_check.business_flow are all set
+  # (a flow is several writes; 8 pays for a 3-step cart + settlement control and
+  # one tamper). read_backs: extra "GET /path" reads of the settled state;
+  # coupons: {expired: [...], by_identity: {name: code}}; mfa_status_reads: [...].
+  business_flow:
+    enabled: true
+    read_backs: []
+    mfa_status_reads: []
 
 # Autonomous scope-discovery MVP (harness/scope_discovery.py). Off by
 # default -- the harness has never, until this option exists, decided on

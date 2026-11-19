@@ -398,6 +398,11 @@ _GATE_ROUTED_EXCEPTIONS = {
     # every send; it preflights each write with gate.authorize and is self-gated
     # on allow_mutating_replay.
     "write_integrity_validator.py",
+    # business_flow (R11-7) replays the run's captured cart/settlement/coupon/2FA
+    # writes only through the run executor (the SafetyGate authorizes every send),
+    # needs allow_mutating_replay plus an explicit per-check ceiling, and its one
+    # send helper refuses DELETE.
+    "business_flow_validator.py",
 }
 
 
@@ -625,6 +630,14 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
         self.assertIn("gate.authorize(", write)
         self.assertIn("allow_mutating_replay", write)
         self.assertNotIn("httpx", write, "write_integrity_validator.py must not hold a raw client")
+
+        flows = (here / "validators" / "business_flow_validator.py").read_text()
+        self.assertIn("executor().execute(", flows,
+                      "business_flow_validator.py writes but not through the run executor")
+        self.assertIn("allow_mutating_replay", flows)
+        self.assertIn("mutating_ceiling_by_check", flows)
+        self.assertIn('if method == "DELETE":', flows, "business_flow must refuse DELETE")
+        self.assertNotIn("httpx", flows, "business_flow_validator.py must not hold a raw client")
 
         for name in ("ssrf_validator.py", "xxe_validator.py",
                      "command_injection_validator.py", "ssti_validator.py",

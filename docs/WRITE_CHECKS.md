@@ -52,7 +52,8 @@ write. It is active and inert by default: it runs only when
   observed. Only when that login fails before the create, succeeds after it, and
   refuses a wrong password does the result say "stored despite HTTP <status>"; an
   account that already logs in before the create is inconclusive, never claimed.
-- Discount-code reuse and expiry are not attempted (they need a declared spent code).
+- Discount-code reuse and expiry are not attempted here; the `business_flow` leg below
+  covers forged, expired and another identity's codes.
 - `sequence` hands a mass-assignment finding on a collection create
   (`POST` to a listing) to this leg, because it could never delete what it made.
 - `verb_tamper`'s override POSTs use the same restore routes. An override the
@@ -86,3 +87,71 @@ confirmed and controlled, the refusals, a restore failure, and the registry,
 confirmation and chain callers); `harness/test_oracle_gaps_write_integrity.py`
 (parameter pollution against a split parser, PUT/PATCH authorship, the opt-in and
 its login read-back, each with a negative control).
+
+# Multi-step business flows (`business_flow`, R11-7)
+
+`harness/validators/business_flow_validator.py` replays the run's own captured
+flow on a run-owned identity, reads the resulting state back, and restores what it
+can. It never uses knowledge of the target app: the settlement, the cart writes the
+same identity made before it, the coupon or 2FA-disable write, and the captured GETs
+that read the state back all come from `experiment_context["captured"]`.
+
+| Row | Class | What it confirms |
+|---|---|---|
+| `WSTG-BUSL-10` | `payment_tamper` | The captured cart steps and settlement are replayed untampered (the control), then with a client-chosen amount (set to 1 or 0.01), a negative quantity or a nonexistent delivery id. Confirmed when the read-back (a new order's total, a balance delta) shows less was charged than the control, or a negative total. With no amount field, the payment field is dropped, then forged: confirmed only when a read-back shows a granted standing (tier, membership) and no balance debit. A new order alone is a lead (`supported`). |
+| `AV-BUSL-COUPON-01` | `coupon_misuse` | A forged code (same shape, random), an expired code (declared, or a captured write answered 4xx with "expir") and another run identity's code (captured or declared) are applied to the captured coupon write. Confirmed when the basket or order read-back shows a discount, or a lower total, that it did not show before. Another identity's code seen only in the capture confirms nothing, since codes may be shared; it is a lead. A coupon carried by the settlement itself goes through the settlement comparison above. |
+| `WSTG-BUSL-06` | `mfa_disable_stepup` | The captured 2FA-disable request is replayed with its password or TOTP field dropped, then wrong. Confirmed when the status read-back shows 2FA off. It needs a status read that shows 2FA enabled first; otherwise it writes nothing. |
+
+## How it is gated
+
+- It sends nothing unless `validators.active_enabled`, `validators.allow_mutating_replay`
+  and an explicit `validators.mutating_ceiling_by_check.business_flow` are all set.
+  The committed `config.yaml` sets none of them. The ceiling must pay for the whole
+  plan (a control flow plus one tampered flow) before the first write.
+- Only a run-owned identity acts: the capture's credentials must match a session the
+  run registered. Ephemeral or foreign credentials skip the check. Every send goes
+  through `RunContext.executor()` as that session.
+- It never sends DELETE. One flow runs at a time per identity.
+
+## Restoring
+
+- **Orders and grants.** A placed order, including the untampered control, cannot be
+  undone without DELETE. It is named `LEFT IN PLACE` in the summary and recorded in
+  the change log as a failed restore. So is a standing that a payment skip granted.
+- **Coupons.** A code in the body is cleared by resending the write with the code
+  emptied, or with the code the basket held before, and the clearing is verified on
+  the read-back. A code in the path cannot be cleared without DELETE, so it is named.
+- **2FA.** It is re-enabled by replaying the identity's own captured enable or setup
+  request and verified on the status read. If the run has no such request, or the
+  replay needs a fresh one-time code, the summary says `2FA LEFT DISABLED on <identity>`
+  and the change log records it.
+
+## Options (`validators.business_flow`)
+
+- `read_backs`: extra `GET /path` reads of the settled state.
+- `coupons`: `{expired: [...], by_identity: {<name>: <code>}}`. A declared code
+  belonging to another identity may confirm.
+- `mfa_status_reads`: extra 2FA status reads.
+
+Trial settings, in `config.local.yaml` only:
+
+```yaml
+validators:
+  active_enabled: true
+  allow_mutating_replay: true
+  mutating_ceiling_by_check:
+    business_flow: 8          # a 3-step cart + settlement: control + one tamper
+```
+
+Use a fresh target container: placed orders stay.
+
+Tests: `harness/test_business_flows.py` (loopback shop). It covers:
+
+- a positive and a matched negative for each flow, through the real dispatch;
+- payment skip;
+- the defaults sending nothing;
+- no ceiling, or foreign credentials, sending nothing;
+- an unrestorable 2FA disable named in the summary and in the change log;
+- the capability gate;
+- no DELETE, ever.
+
