@@ -5,6 +5,10 @@ entered RunContext) against an owned loopback app, with a matched negative.
   expiry   a session JWT with no exp claim confirms as its own class
            (session_expiry, WSTG-SESS-07); decode only, nothing is sent. Negative:
            a JWT with an exp claim.
+  burst    min_attempts wrong-password logins for a run-owned identity, then its
+           real login still succeeds with no throttle: no lockout or rate limit on
+           failed logins (rate_limit). Negatives: a login that locks the account
+           (named as left locked) and one that throttles with 429.
 """
 import asyncio
 import json
@@ -160,6 +164,108 @@ class TokenExpiryTests(_LegBase):
         self.assertEqual(decision["status"], "ready", decision)
         self.assertEqual(decision["finding_class"], "session_expiry")
         self.assertEqual(decision["mechanism_id"], "auth.token_expiry")
+
+
+
+# ------------------------------------------------------- failed-login burst
+_PW = "pw-ann-123"
+_LOGIN = {"method": "POST", "path": "/rest/user/login",
+          "body": {"email": _ANN, "password": _PW},
+          "token_pointer": "/authentication/token"}
+
+
+class _LoginApp:
+    """A login that accepts _ANN/_PW; `lock_after` failures lock the account
+    silently (every later login is refused); `throttle_after` failures draw 429."""
+
+    def __init__(self, *, lock_after=0, throttle_after=0):
+        self.failures, self.lock_after, self.throttle_after = 0, lock_after, throttle_after
+
+    def handle(self, method, path, query, body):
+        if path != "/rest/user/login":
+            return 404, {}
+        doc = json.loads(body or "{}")
+        if self.lock_after and self.failures >= self.lock_after:
+            return 401, {"error": "Invalid email or password."}
+        if doc.get("email") == _ANN and doc.get("password") == _PW:
+            return 200, {"authentication": {"token": _jwt(3, _ANN), "bid": 1}}
+        self.failures += 1
+        if self.throttle_after and self.failures > self.throttle_after:
+            return 429, {"error": "Too many requests"}
+        return 401, {"error": "Invalid email or password."}
+
+
+class FailedLoginBurstTests(_LegBase):
+    def _run(self, model, *, login=_LOGIN, gate=None, **cfg):
+        app = self.app(model.handle)
+        cfg.setdefault("min_attempts", 4)
+        exchange = _ex(app.origin + "/rest/user/login", "POST",
+                       json.dumps({"email": _ANN, "password": _PW}), 200,
+                       {"authentication": {"token": _jwt(3, _ANN)}})
+
+        def setup(run):
+            if login is not None:
+                run.sessions.set_login("s0", login, app.origin)
+
+        report = self.run_finding(self.orch("rate_limit", **cfg), exchange,
+                                  _finding("no lockout"), identities=[_ANN], gate=gate,
+                                  setup=setup)
+        return app, report
+
+    def _bodies(self, app):
+        return [json.loads(r["body"]) for r in app.received]
+
+    def assertRedacted(self, report):
+        for text in (report.summary, report.evidence):
+            self.assertNotIn(_ANN, text)
+            self.assertNotIn(_PW, text)
+
+    def test_no_lockout_confirms(self):
+        app, report = self._run(_LoginApp())
+        self.assertEqual(report.status, "confirmed", report.summary)
+        self.assertEqual(report.finding_class, "rate_limit")
+        self.assertIn("No lockout or rate limit on failed logins", report.summary)
+        self.assertIn("eval-user-1", report.summary)
+        self.assertRedacted(report)
+        bodies = self._bodies(app)
+        self.assertEqual(len(bodies), 5)
+        self.assertEqual(len({b["password"] for b in bodies[:4]}), 4)
+        self.assertNotIn(_PW, {b["password"] for b in bodies[:4]})
+        self.assertEqual(bodies[4]["password"], _PW)
+        self.assertEqual({b["email"] for b in bodies}, {_ANN})
+
+    def test_lockout_is_a_negative_naming_the_account_left_locked(self):
+        _app, report = self._run(_LoginApp(lock_after=3))
+        self.assertEqual(report.status, "not_confirmed", report.summary)
+        self.assertFalse(report.confirmed)
+        self.assertIn("left locked", report.summary)
+        self.assertIn("eval-user-1", report.summary)
+        self.assertRedacted(report)
+
+    def test_throttle_is_a_negative(self):
+        app, report = self._run(_LoginApp(throttle_after=2))
+        self.assertEqual(report.status, "not_confirmed", report.summary)
+        self.assertIn("are limited", report.summary)
+        self.assertNotIn("left locked", report.summary)
+        self.assertEqual(len(app.received), 4)   # 3 wrong (the third throttled) + the real one
+
+    def test_fewer_allowed_than_min_attempts_is_a_lead(self):
+        _app, report = self._run(_LoginApp(), min_attempts=8)
+        self.assertEqual(report.status, "not_confirmed", report.summary)
+        self.assertIn("Lead, not confirmed", report.summary)
+
+    def test_default_burst_ceiling_sends_nothing(self):
+        app, report = self._run(_LoginApp(), gate={"max_burst_size": 1})
+        self.assertEqual(report.status, "skipped", report.summary)
+        self.assertEqual(app.received, [])
+
+    def test_identity_without_a_declared_login_gets_no_wrong_password(self):
+        app, _report = self._run(_LoginApp(), login=None)
+        self.assertNotIn(True, [b["password"] != _PW for b in self._bodies(app)])
+
+    def test_login_at_another_path_gets_no_wrong_password(self):
+        app, _report = self._run(_LoginApp(), login=dict(_LOGIN, path="/other/login"))
+        self.assertNotIn(True, [b.get("password") != _PW for b in self._bodies(app)])
 
 
 if __name__ == "__main__":
