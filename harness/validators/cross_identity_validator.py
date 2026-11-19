@@ -279,6 +279,9 @@ def _source_identity(idents: list, source_sig: tuple) -> dict | None:
 from contextvars import ContextVar
 _ownership_method = ContextVar("ownership_method", default="GET")
 _WRITE_METHODS = frozenset({"PUT", "PATCH", "DELETE"})
+# The write leg's skips, before any write, that the R11-5 update check can still run.
+_UPDATE_FALLBACK_SKIPS = ("No restorable field in the captured write",
+                          "Owner baseline did not return a restorable JSON object")
 
 # A value a read MASKS rather than returns ("****", bullet runs, "[REDACTED]"). Sending
 # it back in a full-object write would overwrite the real value with the mask, so
@@ -870,19 +873,49 @@ class CrossIdentityValidator(Validator):
         owner_id = fact.owner_principal_id if fact else ""
         owner = next((i for i in idents if _principal_for(i).id == owner_id), None) if owner_id else source
         if owner is None or not owner.get("session_ref"):
-            return self._skip(fc, "No registered owner/baseline session is available for restoration")
+            return await self._unauthorized_update(
+                finding, exchange, "No registered owner/baseline session is available for restoration")
         others = _distinct_other_principals(idents, _auth_signature(owner["headers"]))
         others = [i for i in others if not _PRIVILEGED_ROLE.search(i.get("role", ""))
                   and not _principal_for(i).provisional
                   and self._ownership_decision(_principal_for(i), exchange.url) != AuthzDecision.AUTHORIZED]
         if not others:
-            return self._skip(fc, "No distinct non-privileged principal available to test the write")
+            return await self._unauthorized_update(
+                finding, exchange, "No distinct non-privileged principal available to test the write")
         # Held from the baseline read through restore verification, so a second
         # write case on the same object never reads this case's marker as its
         # original (and restores the target to it).
         async with _object_lock(exchange.url):
-            return await self._write_locked(finding, exchange, case_ref, owner, others[0],
-                                            AuthzDecision, TypedRequest, is_identity_credential_header)
+            result = await self._write_locked(finding, exchange, case_ref, owner, others[0],
+                                              AuthzDecision, TypedRequest, is_identity_credential_header)
+        if result.status == "skipped" and result.summary.startswith(_UPDATE_FALLBACK_SKIPS):
+            # Nothing was written: the owner read or the captured body gave this leg
+            # nothing to change. The update check reads the object as owner/admin and
+            # picks its field from that read (R11-5).
+            return await self._unauthorized_update(finding, exchange, result.summary)
+        return result
+
+    async def _unauthorized_update(self, finding, exchange, why: str) -> ValidationResult:
+        """R11-5: where this write leg cannot run (no owner session, no second
+        principal, no restorable field in the captured body, no owner object), a
+        PUT/PATCH goes to write_integrity's unauthorized_update -- an anonymous
+        write (then the capture's own session), read back as the owner or an admin,
+        written back and verified. Its skip keeps this leg's reason first."""
+        fc = finding.vulnerability_class
+        if (exchange.method or "").upper() not in ("PUT", "PATCH"):
+            return self._skip(fc, why)
+        wi_cfg = (((getattr(self.run_context, "config", None) or {}).get("validators") or {})
+                  .get("write_integrity") or {})
+        if wi_cfg.get("enabled", True) is False:
+            return self._skip(fc, why + " (validators.write_integrity is disabled, so no update check ran)")
+        from .write_integrity_validator import WriteIntegrityValidator
+        leg = WriteIntegrityValidator(allowed_hosts=sorted(self.allowed_hosts),
+                                      run_context=self.run_context, allow_writes=self.allow_writes)
+        leg.ownership = self.ownership
+        got = await leg.unauthorized_update(finding, exchange)
+        if got.status == "skipped":
+            got.summary = f"{why}; {got.summary}"
+        return got
 
     async def _write_locked(self, finding, exchange, case_ref, owner, other,
                             AuthzDecision, TypedRequest, is_identity_credential_header):

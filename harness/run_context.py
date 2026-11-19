@@ -1403,6 +1403,10 @@ class RunContext:
     # once discovery is built or restored. The XSS legs read it to load the page
     # route that issued an API call (routes_for_api). None: no route is known.
     client_routes: object = field(default=None, repr=False, compare=False)
+    # R11-5: the engagement's declared protected_paths (EngagementState.protected_paths,
+    # docs/PROTECTED_ROUTES.md patterns), set with the run's ownership. The write
+    # checks match them alongside config authz.protected_paths. Empty: none declared.
+    protected_paths: list = field(default_factory=list, repr=False, compare=False)
     # HU-5: the run's target change log (run_handoff.ChangeLog; every non-read send
     # that ended 2xx, in memory) and its handoff (run_handoff.RunHandoff, attached
     # by the server per job; None: no handoff is kept). Bookkeeping only.

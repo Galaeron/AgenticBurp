@@ -74,8 +74,12 @@ FORGED_AUTHORSHIP = "forged_authorship"
 BUSINESS_RULE_TAMPER = "business_rule_tamper"
 MASS_ASSIGNMENT_CREATE = "mass_assignment_create"
 CREATE_VALIDATION = "create_validation"
+# R11-5: an update of one object sent by a principal who should not be able to
+# make it (anonymous, or the capture's own non-owner session), read back as the
+# object's owner or an admin, and written back.
+UNAUTHORIZED_UPDATE = "unauthorized_update"
 KINDS = (CROSS_IDENTITY_WRITE, FORGED_AUTHORSHIP, BUSINESS_RULE_TAMPER,
-         MASS_ASSIGNMENT_CREATE, CREATE_VALIDATION)
+         MASS_ASSIGNMENT_CREATE, CREATE_VALIDATION, UNAUTHORIZED_UPDATE)
 
 _KIND_ALIASES = {
     CROSS_IDENTITY_WRITE: {"cross_identity_write", "cross_identity_create", "cross_user_write",
@@ -89,6 +93,8 @@ _KIND_ALIASES = {
                              "registration_mass_assignment"},
     CREATE_VALIDATION: {"create_validation", "weak_create_validation", "duplicate_registration",
                         "empty_required_fields", "missing_required_field_validation"},
+    UNAUTHORIZED_UPDATE: {"unauthorized_update", "unauthorized_write", "unauthenticated_write",
+                          "missing_write_authorization", "write_authorization_bypass"},
 }
 FINDING_CLASSES = {a for aliases in _KIND_ALIASES.values() for a in aliases} | {
     "write_integrity", "business_logic", "business logic", "mass_assignment", "mass assignment"}
@@ -472,6 +478,8 @@ class WriteIntegrityValidator(Validator):
         run = self.run_context
         if kind is None:
             return self._skip(fc, "write_integrity: no write-integrity class in this finding")
+        if kind == UNAUTHORIZED_UPDATE:
+            return await self.unauthorized_update(finding, exchange)
         if run is None:
             return self._skip(fc, "write_integrity needs a run transport and registered sessions; "
                                   "nothing was written")
@@ -1688,3 +1696,307 @@ class WriteIntegrityValidator(Validator):
                             f"bound: the read-back stores {key}={stored!r}, not {forged!r}." + undone,
                             evidence=evidence, control_outcome="control_held" if _ok2xx(attack) else ""
                             ).with_artifacts(**artifacts)
+
+    # -- unauthorized update: write as someone else, read back as owner/admin (R11-5) --
+
+    def _object_ref(self, url: str) -> str:
+        from harness import principals
+        return principals.object_reference(url, run_id=getattr(self.run_context, "run_id", "") or "")
+
+    def _owner_fact(self, url: str, method: str):
+        """The ownership fact for the object at `url` (the write's verb first, then
+        GET), and whether it is an operator declaration; (None, False) when none."""
+        if self.ownership is None:
+            return None, False
+        ref = self._object_ref(url)
+        for verb in dict.fromkeys((method, "GET")):
+            fact = self.ownership.lookup(ref, verb)
+            if fact is not None:
+                return fact, bool(self.ownership.has_declaration(ref, verb))
+        return None, False
+
+    def _update_reader(self, url: str, method: str, idents: list) -> tuple[dict | None, str]:
+        """Who reads the object back and writes it back: its owner (an ownership
+        fact naming a registered identity), else a registered admin.
+        (identity, "owner"|"admin"), or (None, why there is none)."""
+        fact, _ = self._owner_fact(url, method)
+        owner_id = getattr(fact, "owner_principal_id", "") or ""
+        if owner_id:
+            owner = next((i for i in idents if _pid(i) == owner_id and i.get("session_ref")), None)
+            if owner is not None:
+                return owner, "owner"
+        admin = next((i for i in idents if _PRIVILEGED_ROLE.search(i.get("role") or "")
+                      and i.get("session_ref")), None)
+        if admin is not None:
+            return admin, "admin"
+        return None, (f"its owner {owner_id!r} has no registered session and no admin session is "
+                      f"registered" if owner_id else
+                      "no owner is known for it and no admin session is registered")
+
+    def _declared_boundary(self, writer, url: str, method: str) -> str:
+        """Why a change `writer` (None: anonymous) made to the object at `url`
+        crosses a boundary the operator declared, or "": an anonymous write to a
+        route on authz.protected_paths or the engagement's protected_paths, or an authz.owners declaration that does not
+        entitle the writer. Self-observed ownership is not a declaration."""
+        if writer is None:
+            try:
+                from harness import protected_routes
+                hit = protected_routes.ProtectedRoutes.for_target(
+                    getattr(self.run_context, "config", None) or {}, url,
+                    engagement_paths=getattr(self.run_context, "protected_paths", None) or None,
+                ).match(method, url)
+            except Exception:
+                log.debug("write_integrity: protected routes failed", exc_info=True)
+                hit = None
+            if hit is not None:
+                return f"an anonymous {method} to a route declared protected ({hit.describe()})"
+        fact, declared = self._owner_fact(url, method)
+        if fact is None or not declared:
+            return ""
+        from harness import principals
+        principal = principals.Principal.anonymous() if writer is None else _principal_for(writer)
+        ref = self._object_ref(url)
+        decision = next((self.ownership.authorization(principal, ref, verb)
+                         for verb in dict.fromkeys((method, "GET"))
+                         if self.ownership.has_declaration(ref, verb)), None)
+        if decision != principals.AuthzDecision.UNAUTHORIZED:
+            return ""
+        owner = getattr(fact, "owner_principal_id", "") or "another principal"
+        return (f"authz.owners declares the object to {owner!r}, which does not entitle "
+                f"{principal.id!r} ({fact.provenance})")
+
+    async def unauthorized_update(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
+        """R11-5. Snapshot one object as its owner (or an admin), change one
+        restorable scalar field of it as anonymous -- and, when anonymous is
+        refused, as the capture's own non-owner session -- read it back as the
+        reader, and write the snapshot back as the reader (as the writer if the
+        reader cannot), verified equal.
+
+        The field and the body come from the reader's snapshot, never from the
+        captured body alone: a capture whose body the crawler guessed ({name,
+        value}) still gets a write of a field the object really has. A changed
+        object is confirmed only against a declared boundary (_declared_boundary);
+        otherwise it is a labelled LEAD. A 2xx that leaves the object unchanged is
+        not_confirmed. Nothing is sent unless validators.active_enabled and
+        allow_mutating_replay are on and the per-case ceiling pays for the write
+        and the write-back (a second writer only when it also pays for that)."""
+        from harness.security import is_identity_credential_header
+        fc, run, url = finding.vulnerability_class, self.run_context, exchange.url
+        method = (exchange.method or "").upper()
+        tag = "write_integrity unauthorized_update"
+        if run is None:
+            return self._skip(fc, f"{tag} needs a run transport and registered sessions; nothing was written")
+        if (not self.allow_writes or not run.gate.config.active_enabled
+                or not run.gate.config.allow_mutating_replay):
+            return self._skip(fc, f"{tag} runs only with validators.active_enabled and "
+                                  f"validators.allow_mutating_replay on; nothing was written")
+        if not run.scope.in_scope(url):
+            return self._skip(fc, f"{tag}: target is out of scope; nothing was written")
+        if method not in ("PUT", "PATCH") or not _ends_with_id(url):
+            return self._skip(fc, f"{tag} needs a PUT/PATCH of one object (a path ending in its id); "
+                                  f"got {method} {urlsplit(url).path}; nothing was written")
+        idents = _run_identities(run)
+        signature = _auth_signature(exchange.request_headers)
+        actor = _source_identity(idents, signature)
+        if signature and actor is None:
+            return self._skip(fc, f"{tag}: the capture's credentials belong to no registered session; "
+                                  f"nothing was written")
+        headers = {k: v for k, v in (exchange.request_headers or {}).items()
+                   if not is_identity_credential_header(k)
+                   and k.lower() not in {"host", "content-length", "if-match", "if-none-match"}}
+        headers["Content-Type"] = "application/json"
+        case_ref = finding.finding_id or finding.case_id or "write-integrity-" + secrets.token_hex(8)
+        captured = _json_object(exchange.request_body) or {}
+        case = _Case(finding, exchange, UNAUTHORIZED_UPDATE, case_ref, None, idents, headers, captured)
+        reader, reader_kind = self._update_reader(url, method, idents)
+        if reader is None:
+            return self._skip(fc, f"{tag}: nobody can read {urlsplit(url).path} back: {reader_kind}; "
+                                  f"nothing was written")
+        # Writers: anonymous first; then the capture's own session, only when it is
+        # a registered, non-privileged identity other than the reader.
+        writers = [None]
+        if (actor is not None and not _PRIVILEGED_ROLE.search(actor.get("role") or "")
+                and _pid(actor) != _pid(reader)):
+            writers.append(actor)
+        headroom, _, ceiling = run.gate.mutating_headroom(case_ref, self.name)
+        if headroom < 2 or (run.budget.remaining is not None and run.budget.remaining < 6):
+            return self._skip(fc, f"{tag}: the write and its write-back need 2 mutating sends "
+                                  f"(validators.mutating_ceiling_by_check.write_integrity >= 2; ceiling "
+                                  f"is {ceiling}); nothing was written")
+        if headroom < 3:
+            writers = writers[:1]
+        async with _object_lock(url):
+            return await self._unauthorized_update_locked(case, reader, reader_kind, writers, captured)
+
+    async def _unauthorized_update_locked(self, case: _Case, reader: dict, reader_kind: str,
+                                          writers: list, captured: dict) -> ValidationResult:
+        from .cross_identity_validator import _choose_write_field, _mutation_for
+        fc, run, url = case.finding.vulnerability_class, self.run_context, case.exchange.url
+        method = (case.exchange.method or "").upper()
+        tag = "write_integrity unauthorized_update"
+        path = urlsplit(url).path
+        snapshot = await self._send(case, "GET", url, ident=reader)
+        original = _object_of(snapshot)
+        if original is None:
+            return self._skip(fc, f"{tag}: the {reader_kind}'s read of {path} returned no object (HTTP "
+                                  f"{getattr(snapshot, 'status', None)}) to snapshot; nothing was written")
+        # A captured key the object really has, else any field of the snapshot.
+        field, source = _choose_write_field(captured, original), "captured"
+        if field is None:
+            field, source = _choose_write_field(original, original), "snapshot"
+        if field is None:
+            return self._skip(fc, f"{tag}: the object has no string, number or boolean field outside the "
+                                  f"fixed denylist (identifiers, owner/user references, roles, "
+                                  f"credentials) to change and restore; nothing was written")
+        if _masked_paths(original if method == "PUT" else {field: original[field]}):
+            return self._skip(fc, f"{tag}: the object's read is not safely round-trippable (masked "
+                                  f"value); nothing was written")
+        before = original[field]
+        marker = _mutation_for(before)
+        if marker is None or _same_value(marker, before):
+            return self._skip(fc, f"{tag}: {field!r} has no distinct value of its type to write; "
+                                  f"nothing was written")
+        attack_body = {**original, field: marker} if method == "PUT" else {field: marker}
+        restore_body = original if method == "PUT" else {field: before}
+        for body in (attack_body, restore_body):
+            decision = run.gate.authorize(validator_name=self.name, method=method, url=url,
+                                          body=json.dumps(body))
+            if not decision.allowed:
+                return self._skip(fc, f"{tag}: write/restore preflight refused: " + decision.reason)
+
+        def changed(outcome):
+            """True: the object differs from the snapshot; False: it reads back
+            unchanged; None: the read says nothing."""
+            obj = _object_of(outcome)
+            if obj is None:
+                return None
+            return not (_stable(obj) == _stable(original)
+                        and not (isinstance(marker, str) and marker in json.dumps(obj)))
+
+        def may_have_changed() -> bool:
+            return any(changed(r) is not False for _, a, r in attempts
+                       if getattr(a, "executed", False) and not _refused(a))
+
+        attempts = []          # (writer, write outcome, read-back outcome)
+        undo = check = None
+        restorer = ""
+        failure, cancelled = "", False
+
+        async def restore():
+            nonlocal undo, check, restorer
+            if not may_have_changed():
+                return
+            from harness import run_handoff
+            for who in [reader] + [w for w, a, _ in attempts if _ok2xx(a)]:
+                if run.gate.mutating_headroom(case.case_ref, self.name)[0] < 1:
+                    return
+                with run_handoff.restore_scope(f"{case.case_ref}:write_integrity_restore"):
+                    undo = await self._send(case, method, url, restore_body, ident=who, cleanup=True)
+                check = await self._send(case, "GET", url, ident=reader, cleanup=True)
+                restorer = "anonymous" if who is None else _pid(who)
+                if changed(check) is False:
+                    return
+
+        try:
+            for writer in writers:
+                attack = await self._send(case, method, url, attack_body, ident=writer)
+                read = await self._send(case, "GET", url, ident=reader)
+                attempts.append((writer, attack, read))
+                if not _refused(attack) or changed(read):
+                    break   # only a refused write earns the next writer a try
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as exc:
+            failure = f"probe raised {type(exc).__name__}: {exc}"
+        finally:
+            if any(getattr(a, "executed", False) for _, a, _ in attempts):
+                task = asyncio.ensure_future(restore())
+                try:
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        await task
+                except Exception as exc:
+                    failure += f"; restore raised {type(exc).__name__}: {exc}"
+        restore_sent = undo is not None
+        restore_ok = changed(check) is False if restore_sent else not may_have_changed()
+        detail = (f"write_integrity restore {'verified' if restore_ok else 'NOT verified'} "
+                  f"(restore HTTP {getattr(undo, 'status', None)} as {restorer or 'nobody'}) on {url}")
+        try:
+            from harness import run_handoff
+            ids = [getattr(a, "artifact_id", "") for _, a, _ in attempts]
+            run_handoff.mark_restore(run, [i for i in ids if i], ok=restore_ok, detail=detail)
+        except Exception:
+            log.debug("write_integrity: mark_restore failed", exc_info=True)
+
+        def state(read) -> str:
+            return {True: "changed", False: "unchanged"}.get(changed(read), "unread")
+
+        tried = "; ".join(f"{'anonymous' if w is None else _pid(w)} -> HTTP {getattr(a, 'status', None)}, "
+                          f"{state(r)}" for w, a, r in attempts)
+        evidence = (f"kind={UNAUTHORIZED_UPDATE}; target={method} {url}; reader={_pid(reader)} "
+                    f"({reader_kind}); field={field} (from the {source} body); writes=[{tried}]; "
+                    f"restore={'sent' if restore_sent else 'not_needed'}; "
+                    f"restore_status={getattr(undo, 'status', None)}; restored_by={restorer or '-'}; "
+                    f"restore_succeeded={str(restore_ok).lower()}")
+        if not restore_ok:
+            message = (f"RESTORE FAILED: write_integrity could not write {field}={before!r} back on {url} "
+                       f"and verify it -- restore it manually. " + evidence
+                       + (" " + failure if failure else ""))
+            log.error(message)
+            if cancelled:
+                raise asyncio.CancelledError(message)
+            return self._result("error", fc, message, evidence=evidence)
+        if cancelled:
+            raise asyncio.CancelledError
+        undone = " The snapshot was written back and verified." if restore_sent else ""
+        if failure or not attempts:
+            return self._result("error", fc, f"{tag} probe incomplete." + undone + " " + failure,
+                                evidence=evidence)
+        hit = next(((w, a, r) for w, a, r in attempts if changed(r)), None)
+        last = attempts[-1][1]
+        artifacts = dict(baseline=snapshot, attack=hit[1] if hit else last,
+                         controls=[r for _, _, r in attempts if r is not None] + ([check] if check else []))
+        if hit is None:
+            unsent = [a for _, a, _ in attempts if not getattr(a, "executed", False)]
+            if unsent:
+                return self._result("blocked", fc,
+                                    f"{tag}: a write was not sent ({getattr(unsent[0], 'outcome', '') or 'not sent'}); "
+                                    f"a refused send is not evidence the control held." + undone,
+                                    evidence=evidence)
+            if all(_refused(a) for _, a, _ in attempts):
+                statuses = ", ".join(str(getattr(a, "status", None)) for _, a, _ in attempts)
+                return self._result("not_confirmed", fc,
+                                    f"Every writer was refused (HTTP {statuses}) and the {reader_kind}'s "
+                                    f"read-back of {path} is unchanged." + undone, evidence=evidence,
+                                    control_outcome="control_held").with_artifacts(**artifacts)
+            if any(changed(r) is None for _, _, r in attempts):
+                return self._result("inconclusive", fc,
+                                    f"The {reader_kind}'s read-back of {path} returned no object, so the "
+                                    f"write's effect is unknown." + undone,
+                                    evidence=evidence).with_artifacts(**artifacts)
+            return self._result("not_confirmed", fc,
+                                f"The write returned HTTP {getattr(last, 'status', None)} but the "
+                                f"{reader_kind}'s read-back of {path} is unchanged ({field} still "
+                                f"{before!r})." + undone, evidence=evidence).with_artifacts(**artifacts)
+        writer, attack, _ = hit
+        who = "anonymous" if writer is None else repr(_pid(writer))
+        boundary = self._declared_boundary(writer, url, method)
+        if boundary:
+            result = self._result(
+                "confirmed", fc,
+                f"Unauthorized update: {who} changed {field} of {path} (HTTP {attack.status}) and the "
+                f"{reader_kind}'s read-back shows it; {boundary}." + undone,
+                evidence=evidence + f"; boundary={boundary}", confirmed=True, confidence=0.9)
+            # R11-1: name what this proves; an anonymous write is also missing authentication.
+            result.mechanism_classes = (("broken_access_control", "missing_authentication")
+                                        if writer is None else ("broken_access_control",))
+            return result.with_artifacts(**artifacts)
+        return self._result(
+            "supported", fc,
+            f"LEAD: {who} changed {field} of {path} (HTTP {attack.status}) and the {reader_kind}'s "
+            f"read-back shows it, but the route is not on authz.protected_paths and authz.owners "
+            f"declares no owner it violates, so whether {who} may modify it is an owner decision. "
+            f"Declare the route or its owner to confirm." + undone,
+            evidence=evidence + "; boundary=undeclared", confidence=0.4).with_artifacts(**artifacts)

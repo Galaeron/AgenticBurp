@@ -1462,6 +1462,9 @@ class ChainMixin:
                 identity_headers.set_identity(host, r.principal_id(), dict(r.headers), r.role)
         ownership = self._configure_ownership(base_url, engagement_owners=getattr(state, "owners", None),
                                               run_context=run_context, install=False)
+        if run_context is not None:
+            # R11-5: the engagement's protected routes, for the write checks.
+            run_context.protected_paths = list(getattr(state, "protected_paths", None) or [])
         if (ownership is None and run_context is not None
                 and self._experiments_config().get("enabled", False)):
             # Ticket G: share ONE ledger between the experiment cycle and the

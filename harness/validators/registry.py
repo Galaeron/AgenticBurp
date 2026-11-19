@@ -667,14 +667,16 @@ class ValidatorRegistry:
             if method == "DELETE" and str(self._xid_cfg.get("delete_restore_method", "")).upper() != "PUT":
                 return decision("needs_prerequisite", "missing_restore_contract", "DELETE requires an explicit PUT recreation contract")
         if family == "write_integrity":
-            from .write_integrity_validator import (BUSINESS_RULE_TAMPER, FORGED_AUTHORSHIP, kind_for,
+            from .write_integrity_validator import (BUSINESS_RULE_TAMPER, FORGED_AUTHORSHIP,
+                                                    UNAUTHORIZED_UPDATE, kind_for,
                                                     _is_create, _json_object)
             kind = kind_for(finding_class, exchange)
             if method not in {"POST", "PUT", "PATCH"} or kind is None:
                 return decision("unsupported", "unsupported_method", "write checks need a captured JSON create or update")
             if _json_object(exchange.request_body) is None:
                 return decision("needs_prerequisite", "missing_json_body", "a captured JSON object body is required")
-            if not _is_create(exchange) and kind not in (BUSINESS_RULE_TAMPER, FORGED_AUTHORSHIP):
+            if not _is_create(exchange) and kind not in (BUSINESS_RULE_TAMPER, FORGED_AUTHORSHIP,
+                                                         UNAUTHORIZED_UPDATE):
                 return decision("unsupported", "unsupported_method", "this write check needs a POST create to a collection")
             if run_context is None or not run_context.gate.config.allow_mutating_replay:
                 return decision("policy_denied", "mutating_policy_denied", "write checks require explicit mutating replay permission")
