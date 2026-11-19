@@ -2867,6 +2867,16 @@ class ChainMixin:
                     res = await _cached_validate(
                         validator, leg_finding, ex,
                         case_ref=leg_case.case_id if leg_case is not None else "")
+                    source = (node.get("capture") or {}).get("substituted_from")
+                    if source and res is not None:
+                        # R11-10: the cell, the proof and the finding all say whose
+                        # capture this was; it is never this identity's own request.
+                        import dataclasses as _dc
+                        said = (f"substituted_from:{source}: replayed from {source}'s capture "
+                                f"with {identity}'s credentials substituted")
+                        res = _dc.replace(res, summary=f"{said}; {res.summary or ''}".rstrip("; "),
+                                          limitation=(f"{said}; {res.limitation}"
+                                                      if res.limitation else ""))
                     # T05/R26: bind a case-bound structured proof to this driven leg
                     # (concrete parameter case when the driver fanned out to one),
                     # so a coverage-driven confirmation carries a stable case id to
@@ -2879,6 +2889,8 @@ class ChainMixin:
                     # `state` (=> worklist, summary, report, persistence, chain
                     # linking), not merely recorded as a matrix cell.
                     cf = coverage_confirmation_finding(res, check, ex.url, identity)
+                    if cf is not None and source:
+                        cf.update(replayed_from_identity=source, credential_substitution=True)
                     if cf is not None:
                         if res.confirmed and case_id:
                             cf["proof_id"] = proof_id
@@ -2908,10 +2920,12 @@ class ChainMixin:
 
                 # E5b: whether each (endpoint, identity) has a request to replay,
                 # worked out ONCE here rather than per check. Only requests that were
-                # observed as that identity count; nothing is built for an identity
-                # that was never probed or captured on the endpoint.
+                # observed as that identity count here. An identity with none is
+                # either credited to a peer (caller-independent check) or, for an
+                # identity-bound check, replays another identity's capture with its
+                # own credentials (R11-10 substitution, _substituted_variants below).
                 from harness.engagement import (capture_identity_key, identity_variants,
-                                                replayable_variants)
+                                                replayable_variants, substituted_variant)
                 _identity_role = {_pid(r): r.role for r in roles}
                 _replayable = {
                     (ep_key, identity): replayable_variants(ep, capture_identity_key(headers))
@@ -2937,6 +2951,53 @@ class ChainMixin:
                 _endpoint_check_capped: dict = {}
                 _PER_IDENTITY_SHARE = frozenset({"cross_identity", "idor_read"})
 
+                def _capture_peer(ep_key, identity, check):
+                    """R11-10: for a check whose verdict does not depend on the caller,
+                    another identity that holds a replayable capture of the endpoint
+                    runs it for every identity; nothing is sent as this one. None for
+                    an identity-bound check: that cell stays missing_principal."""
+                    if not getattr(check, "caller_independent", False):
+                        return None
+                    return next((other for other in sorted(_role_headers)
+                                 if other != identity and _replayable.get((ep_key, other))),
+                                None)
+
+                def _covered_elsewhere(peer):
+                    return {"status": "needs_prerequisite", "reason_code": "covered_by_identity",
+                            "covered_by": peer, "finding_class": None,
+                            "reason": f"{peer} holds the capture and runs this caller-independent check"}
+
+                # R11-10 (owner decision 2026-11-19): an identity-bound check whose
+                # identity holds no capture of the endpoint replays ANOTHER
+                # identity's capture with only this identity's credentials (none for
+                # anonymous): a capture carries no headers, and _seed_exchange
+                # attaches the replaying identity's own. The send takes the same
+                # path, gate, mutating rules and ceilings as an own-capture replay.
+                # A passive leg judges a captured response, which would be the
+                # source's, so it is never substituted.
+                _substitution = bool(getattr(self, "coverage_identity_substitution", False))
+                _substituted: dict = {}
+
+                def _substituted_variants(ep_key, identity, check):
+                    if (not _substitution or getattr(check, "caller_independent", False)
+                            or check.confirmation in coverage_tracker._PASSIVE_LEG_CONFIRMATIONS
+                            or identity not in _role_headers):
+                        return []
+                    if (ep_key, identity) not in _substituted:
+                        target_key = capture_identity_key(_role_headers[identity])
+                        found = []
+                        for source in sorted(_role_headers):
+                            if source == identity:
+                                continue
+                            found = [v for v in (substituted_variant(
+                                         v, target_key, source, _role_headers[source])
+                                         for v in _replayable.get((ep_key, source)) or [])
+                                     if v is not None]
+                            if found:
+                                break
+                        _substituted[(ep_key, identity)] = found
+                    return _substituted[(ep_key, identity)]
+
                 def _captured_readiness(identity, method, path, check):
                     if check.id == "WSTG-CRYP-01":
                         return _capability_decision(check, HttpExchange(url=base_url, method="GET"))
@@ -2949,6 +3010,11 @@ class ChainMixin:
                         variants = _replayable.get((ep_key, identity))
                         if variants is None:
                             variants = replayable_variants(ep, capture_identity_key(_role_headers.get(identity, {})))
+                        if not variants:
+                            peer = _capture_peer(ep_key, identity, check)
+                            if peer is not None:
+                                return _covered_elsewhere(peer)
+                            variants = _substituted_variants(ep_key, identity, check)
                         if not variants:
                             role = _identity_role.get(identity, identity)
                             block = _prerequisite_blocks.setdefault((ep_key, identity), {
@@ -2992,6 +3058,15 @@ class ChainMixin:
                     if variants is None:
                         variants = replayable_variants(
                             ep, capture_identity_key(_role_headers.get(identity, {})))
+                    if not variants:
+                        peer = _capture_peer(ep_key, identity, check)
+                        if peer is not None:
+                            # R11-10: nothing is sent as this identity; the tracker
+                            # credits the cell to the peer's verdict.
+                            return _VR(check.confirmation, "inconclusive", check.vulnerability_class,
+                                       summary=f"covered_by_identity:{peer}: {peer} holds the "
+                                               "capture and runs this caller-independent check")
+                        variants = _substituted_variants(ep_key, identity, check)
                     if not variants:
                         # The cell's reason stays "missing_principal"; the pair is
                         # reported once, with how many checks it blocked.
@@ -3593,7 +3668,8 @@ class ChainMixin:
             "withheld_operations": coverage.get("withheld_operations", []),
             "discovery_bounds": list(getattr(rc, "discovery_bounds", None) or []),
             # E5b: each (endpoint, identity) the coverage drive could not replay
-            # because no request was observed as that identity, once, with the
+            # because no request was observed as that identity (and, R11-10, none
+            # could be substituted from another identity's capture), once, with the
             # number of checks it blocked and what to supply.
             "prerequisite_blocks": sorted(_prerequisite_blocks.values(),
                                           key=lambda b: (b["endpoint"], b["identity"])),

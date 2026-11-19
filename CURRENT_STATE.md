@@ -131,7 +131,11 @@
     old token survives;
   - R11-8(c): challenge echo, recovery-lookup enumeration and reset-answer guessing confirm
     by default (challenge_echo `active_submit` stays off);
-  - an anonymous read counts as an exposure caller.
+  - an anonymous read counts as an exposure caller;
+  - R11-10: credential substitution is allowed. An identity-bound coverage cell whose
+    identity has no capture of the endpoint may replay another identity's capture with
+    only its own credentials (none for anonymous). Passive mode sends nothing. Default on
+    (`engagement.coverage_identity_substitution`), inside the coverage drive only.
   Writes and bursts stay behind the existing gates (`active_enabled`,
   `allow_mutating_replay`, the per-check ceilings, `max_burst_size`), all off by default.
 

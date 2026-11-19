@@ -37,7 +37,9 @@ def captured_nodes(node, base_url, roles, include_probes=False):
 
     Access-matrix probe variants (E5b) are replay templates for the coverage
     drive; the worklist investigates full captures, so they are left out unless
-    `include_probes`."""
+    `include_probes`. A variant the coverage drive substituted from another
+    identity's capture (R11-10, engagement.substituted_variant) carries the
+    replaying identity's key, so it is yielded under that identity."""
     from harness.engagement import ACCESS_MATRIX_SOURCE, capture_identity_key
     from harness.scope_lock import parse_scope_url
     variants = [v for v in node.get("capture_variants") or []
@@ -695,8 +697,8 @@ async def investigate_worklist(
         reach = node.get("reachable_roles", []) or []
         # probe from the lowest-trust identity that can reach it (strongest proof).
         probe_role = min(reach, key=_trust) if reach else (roles[0].role if roles else "anonymous")
-        # E5b: a capture variant carries the identity that made it; replay it as that
-        # identity. Otherwise (WL-02), within the probe role, probe as a principal whose
+        # E5b: a capture variant carries the identity that made it (or, R11-10, the
+        # identity it was substituted for); replay it as that identity. Otherwise (WL-02), within the probe role, probe as a principal whose
         # OWN cell reached the node, so a same-role principal that was denied is never used.
         probe_session = node.get("probe_session")
         if probe_session is None:

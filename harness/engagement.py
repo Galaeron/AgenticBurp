@@ -270,7 +270,9 @@ def identity_variants(ep, identity_key: str) -> list:
     """The variants a check can replay AS this identity: its full captures, plus
     its access-matrix probe unless a full capture already holds the same request
     (the full one also carries the response). Empty when the identity was never
-    observed on this endpoint. Only observed requests count; nothing is built."""
+    observed on this endpoint. Only observed requests count; nothing is built.
+    (R11-10's credential substitution, `substituted_variant`, is separate: the
+    coverage drive asks for it only when this is empty.)"""
     mine = [v for v in (getattr(ep, "capture_variants", None) or [])
             if v.get("identity_key") == identity_key]
     shapes = lambda v: json.dumps(v.get("template"), sort_keys=True)   # noqa: E731
@@ -287,6 +289,60 @@ def replayable_variants(ep, identity_key: str) -> list:
     from harness.replay_dedupe import distinct_replays
     return distinct_replays(identity_variants(ep, identity_key),
                             endpoint_variants=getattr(ep, "capture_variants", None) or [])
+
+
+
+# R11-10 (owner decision 2026-11-19): credential substitution. A query or body
+# field whose name says it carries a credential; a capture holding one is not
+# replayed under another identity (it would send the source identity's secret).
+_CREDENTIAL_FIELD = re.compile(
+    r"(?i)(?:csrf|xsrf|token|session|sessid|jwt|bearer|password|passwd|secret|"
+    r"api[_-]?key|access[_-]?key|authorization|(?<![a-z0-9])auth(?![a-z])|(?<![a-z0-9])sid(?![a-z]))"
+    r"[\w.-]*[\"']?\s*[:=]")
+_SECRET_MIN_LEN = 6
+
+
+def _source_secrets(headers) -> list:
+    """The credential values the source identity sends: each non-public header
+    value, each cookie value and a bearer/basic token without its scheme."""
+    found = []
+    for name, value in (headers or {}).items():
+        if is_public_request_header(name) or not value:
+            continue
+        value = str(value)
+        found.append(value)
+        if (name or "").lower() == "cookie":
+            found += [part.split("=", 1)[1] for part in value.split(";") if "=" in part]
+        elif " " in value:
+            found.append(value.split(" ", 1)[1])
+    return [v.strip() for v in found if len(v.strip()) >= _SECRET_MIN_LEN]
+
+
+def substituted_variant(variant: dict, identity_key: str, source: str,
+                        source_headers=None) -> dict | None:
+    """Another identity's capture, to replay AS the identity `identity_key` names.
+
+    Captures hold no request headers, and the replay attaches only the replaying
+    identity's own credentials (worklist_investigator._seed_exchange), so the
+    source identity's Authorization, cookies and session headers never travel. Its
+    response is dropped too: it was the source identity's, and a verdict must not
+    read it as this identity's. `substituted_from` names the source so every
+    verdict built on it says so. None when the captured URL, query or body
+    carries a credential (a field named like one, or one of the source's own
+    credential values): replaying it would send the source's secret."""
+    template = dict(variant.get("template") or {})
+    text = " ".join(str(template.get(k) or "") for k in ("query", "body")) + " " + str(
+        variant.get("url") or "")
+    if _CREDENTIAL_FIELD.search(text) or any(
+            secret in text for secret in _source_secrets(source_headers)):
+        return None
+    moved = {k: v for k, v in variant.items()
+             if k not in ("capture_id", "response_body_sha256", "response_body_len")}
+    moved.update(template=template, identity_key=identity_key, response_status=None,
+                 response_headers={}, response_body="", substituted_from=source,
+                 substituted_capture_id=variant.get("capture_id") or "")
+    moved["capture_id"] = _variant_digest(moved)
+    return moved
 
 
 _RESULT_BODY_HEAD = 200
@@ -628,7 +684,9 @@ class SurfaceEndpoint:
         # the link survives ingestion into state and the report projection.)
         for k in ("evidence", "summary", "url", "confirmation_method",
                   "validator", "identity", "basis", "proof_id", "case_id",
-                  "confirmed_by_leg", "header_fingerprint"):
+                  "confirmed_by_leg", "header_fingerprint",
+                  # R11-10: a verdict on another identity's capture says so.
+                  "replayed_from_identity", "credential_substitution"):
             if f.get(k):
                 slim[k] = f[k]
 

@@ -5622,7 +5622,7 @@ Non-negotiables apply:
     >= 2` (the write plus its restore) and `allow_mutating_replay`. Both stay off by default,
     so r12 sends nothing new until the owner sets them.
 
-### [ ] R11-10 — Stop counting an identity's missing capture as a coverage gap for identity-independent checks
+### [x] R11-10 — Stop counting an identity's missing capture as a coverage gap for identity-independent checks
 - **Domain:** Coverage accounting · **Effort:** M · **Mode:** LOOP (offline), with an owner
   decision on the identity-bound half. Filed by R11-9.
 - **Evidence (VERIFIED, r11 `result.json` coverage checkpoint, read-only):**
@@ -5667,3 +5667,95 @@ Non-negotiables apply:
     owner approves replaying with substituted credentials.
   - The r11 checkpoint replayed through the new accounting leaves at most the 197
     identity-bound cells.
+- **Offline half (VERIFIED offline, 2026-11-19, branch `claude/r11-10-coverage-credit-611952`):**
+  - The split is in the catalog: `Check.caller_independent` (default False), set on the
+    rows named in `coverage_model._CALLER_INDEPENDENT_CHECKS`.
+  - `CoverageTracker.credit_caller_independent` runs in every `report()`. A cell of an
+    identity with no capture, on a caller-independent check, is credited to the identity
+    that holds the capture, with terminal reason `covered_by_identity` (that cell is
+    conclusive), `open_on_identity` (no verdict yet: the gap is counted once, on that
+    cell) or `not_applicable_on_identity` (that capture was judged protocol-inapplicable).
+    The row carries `covered_by`, and the detail is `<reason>:<id>: ...`. The cell stays
+    INCONCLUSIVE and is never executed. It is left out of `not_tested` and
+    `cases_not_tested` and counted under `credited_by_identity`.
+  - `orchestrator_chain` (`_captured_readiness`, `_run_leg_core`): such a cell returns
+    reason code `covered_by_identity` and no longer adds to `prerequisite_blocks`.
+    No request is sent and no credentials are substituted.
+  - Tests: `harness/test_r11_10_identity_credit.py` (12, one at caller level).
+  - Replay of the r11 checkpoint (read-only, `.test-work/r11-10/replay_r11_checkpoint.py`
+    in the worktree): 543 -> **232** `missing_principal`. 311 cells are credited
+    (103 covered, 193 open on the other identity, 15 not applicable there). None of them
+    is executed or listed in `not_tested`.
+  - **Gap against the "at most 197" criterion:** 232 = the 197 owner-listed cells + 35
+    cells on five rows kept identity-bound under "when unsure, identity-bound":
+    `WSTG-INJT-20` (11) and `AV-MASSASSIGN-02` (9) (an admin may set a privileged
+    field; the write leg needs a non-privileged principal), `WSTG-BUSL-05` (10) (race
+    limits are often per account), `WSTG-CLNT-10` (3) (WebSocket hijacking rides the
+    session) and `WSTG-INJT-03` (2) (verb tampering is an access-control bypass).
+    **Owner:** confirm or move any of these into `_CALLER_INDEPENDENT_CHECKS`
+    (one id each).
+- **Owner decision (2026-11-19):** credential substitution is allowed for the
+  identity-bound cells. It is default on behind one switch, like the R11-8(c) confirm
+  defaults.
+- **Identity-bound half (VERIFIED offline, 2026-11-19, same branch):**
+  - Switch `engagement.coverage_identity_substitution` (default `true`). It is read by
+    `EngagementPolicy` and is in `config_schema._PASSIVE_FORCE_OFF_KNOBS`. It takes
+    effect only inside `coverage_drive_legs`, which is off by default and is forced off
+    in passive mode too.
+  - `engagement.substituted_variant`: another identity's capture, re-keyed to the target
+    identity.
+    - It keeps `substituted_from` and `substituted_capture_id`.
+    - It drops the source's response (status, headers, body), so no verdict reads the
+      source identity's response as the target's.
+    - It returns None when the URL, query or body carries a credential: a field named like
+      one (csrf, xsrf, token, session, sid, jwt, password, secret, api key, auth...), or
+      one of the source identity's own header or cookie values.
+    - Captures hold no request headers. `_seed_exchange` attaches only the replaying
+      identity's own credentials (none for anonymous), so the source's credentials are
+      never mixed in.
+  - `orchestrator_chain` (`_substituted_variants`, used by `_captured_readiness` and
+    `_run_leg_core`): an identity-bound, non-passive check with no own capture uses the
+    first other identity (sorted) whose replayable captures substitute.
+    - The send then takes the same `_run_captured_leg` path, safety gate, mutating rules,
+      per-check ceilings and write-restore rules as an own-capture replay.
+    - Passive legs (`content_exposure`, `security_headers`, `error_handling`) judge the
+      captured response, so they are never substituted. Those cells stay
+      `missing_principal`.
+    - A cell with no substitutable capture also stays `missing_principal`.
+  - Provenance:
+    - The result summary and the proof limitation (and so the cell detail and the proof's
+      `observed_result`) start with `substituted_from:<source>: replayed from <source>'s
+      capture with <identity>'s credentials substituted`.
+    - The finding carries `replayed_from_identity` and `credential_substitution: true`
+      (kept by `EndpointNode.add_finding`).
+  - E5b comments updated in `engagement.py`, `engagement_builder.py`,
+    `orchestrator_chain.py` and `worklist_investigator.py`.
+  - Tests: `harness/test_r11_10_identity_credit.py`, 21 in total. The 9 new ones cover:
+    - a substituted read sends only the target's credential and no source response;
+    - an anonymous target sends no credentials;
+    - a substituted write is refused by the gate without `allow_mutating_replay`;
+    - with the switch off the cell stays `missing_principal`;
+    - provenance on the cell and the finding;
+    - credential-bearing captures are refused;
+    - the passive force-off.
+  - `test_identity_probe_variants`: its two "stays missing_principal" tests now pass
+    `substitution=False`, because they pin down the switch-off behaviour.
+  - r11 checkpoint recount (read-only, `.test-work/r11-10/substitution_count.py`, counts
+    only): of the 232 cells still `missing_principal` after the credit, **207** have
+    another identity's capture of the endpoint and become drivable: 172 of the 197
+    owner-listed and all 35 on the five conservative rows. **25** stay
+    `missing_principal`. They are all `AV-EXPOSURE-01` (`content_exposure`, a passive
+    leg). No cell lacks another identity's capture. The checkpoint holds no capture
+    bodies, so 207 is an upper bound: the credential-in-body filter may refuse some.
+  - **Not verified live.** The drive's sends under substitution have only run against
+    loopback fixtures.
+- Result: the offline credit and credential substitution are both implemented and verified
+  offline. In the r11 replay, 543 cells end `missing_principal` today. After the credit,
+  232 still do, and with substitution at most 25 (passive exposure) stay.
+- **Not done (note):** `worklist_investigator.captured_nodes` still marks a variant whose
+  identity key matches no role as `missing_principal`. That is a different case (the
+  capture exists but has no role) and is left as it is.
+- **Optional item, not done (note):** drop crawler-filled paths. In r11, 4 of the 15
+  endpoints were such paths. Worth doing as its own item, because it changes the matrix
+  denominator, not just the accounting. Only drop a `null`, `file` or `-1` segment that
+  no capture took from a response, and test it against the R11-9 template fixture.

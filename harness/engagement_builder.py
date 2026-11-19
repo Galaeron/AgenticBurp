@@ -368,7 +368,8 @@ async def build_engagement(
         await _add_form_templates(state, result, base_url, form_config, run_context, scope)
     # E5b: every probe the crawl sent is a replayable request AS the identity that
     # sent it, so a check on an identity whose body (or 401) was not kept as a
-    # capture still has its own request to replay.
+    # capture still has its own request to replay. (An identity the crawl never
+    # ran has none; R11-10's substitution in the coverage drive covers it.)
     for probe in getattr(result, "identity_probes", None) or []:
         state.record_identity_probe(probe["url"], probe["method"], probe)
     for r in roles:

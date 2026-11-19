@@ -243,6 +243,22 @@ _CASE_STATUS = {"confirmed": CellStatus.CONFIRMED, "not_confirmed": CellStatus.N
 _LEG_EXECUTED = frozenset({CellStatus.CONFIRMED, CellStatus.NOT_DETECTED,
                            CellStatus.CONTROLLED_NEGATIVE, CellStatus.ERROR})
 
+# R11-10: the readiness codes (and restored cell-reason prefixes) that mean the
+# cell's identity holds no capture of the endpoint.
+_NO_CAPTURE_CODES = ("missing_principal", "covered_by_identity")
+_CONCLUSIVE = frozenset({CellStatus.CONFIRMED, CellStatus.DETECTED, CellStatus.NOT_DETECTED,
+                         CellStatus.CONTROLLED_NEGATIVE})
+# Which other identity a credited cell names: a conclusive (executed first) verdict,
+# then one still open, then a not-applicable one.
+_PEER_ORDER = (CellStatus.CONFIRMED, CellStatus.DETECTED, CellStatus.NOT_DETECTED,
+               CellStatus.CONTROLLED_NEGATIVE)
+
+
+def _peer_rank(cell) -> tuple:
+    if cell.status in _PEER_ORDER:
+        return (0, _PEER_ORDER.index(cell.status), not cell.executed)
+    return (2 if cell.status == CellStatus.NOT_APPLICABLE else 1, 0, not cell.executed)
+
 # Trust ordering mirrors worklist_investigator: the driver probes from the
 # lowest-trust identity that can reach a node, so a finding is attributed there.
 _TRUST = {"anonymous": 0, "user": 1, "agent": 2, "service": 2, "manager": 3, "admin": 4}
@@ -412,6 +428,10 @@ class CoverageTracker:
         self.queued = set()
         self.reused = set()
         self.readiness: dict[tuple, dict] = {}
+        # R11-10: cell key -> {"identity", "outcome", "peer_status"} for a cell of an
+        # identity with no capture of the endpoint, on a caller-independent check that
+        # another identity holds a capture for (credit_caller_independent).
+        self.credited: dict[tuple, dict] = {}
         self.endpoints = {}
         self.identity_roles: dict[str, str] = {}
         self.driveable = None  # None means no driver supplied; an empty set means none available.
@@ -1226,6 +1246,91 @@ class CoverageTracker:
             n += 1
         return n
 
+    # --- R11-10: identity-independent checks are not one gap per identity ---
+
+    def _lacks_capture(self, key, cell) -> bool:
+        """The cell's identity holds no capture of the endpoint: the drive's readiness
+        said so (missing_principal, or covered_by_identity from the orchestrator), or
+        a restored cell kept that reason."""
+        if key in self.credited or (cell.reason or "").startswith(_NO_CAPTURE_CODES):
+            return True
+        return self.readiness.get(key, {}).get("reason_code") in _NO_CAPTURE_CODES
+
+    def credit_caller_independent(self) -> int:
+        """For a check whose verdict does not depend on the caller
+        (`Check.caller_independent`), the cell of an identity with no capture of the
+        endpoint is credited to another identity's cell for the same endpoint and
+        check, instead of standing as a missing-principal gap. Nothing is sent and
+        the cell gains no execution: it stays INCONCLUSIVE for its own identity, and
+        the report lists it under `credited_by_identity`, apart from the gaps.
+        - `covered_by_identity`: the other identity's cell has a conclusive verdict;
+        - `open_on_identity`: it has none yet; the gap is counted once, on that cell;
+        - `not_applicable_on_identity`: the check does not apply to its capture.
+        Identity-bound checks keep `missing_principal`. Idempotent; returns how
+        many cells are credited."""
+        previous, self.credited = self.credited, {}
+        cells = self.matrix.cells()
+        by_pair: dict[tuple, list] = {}
+        for key in cells:
+            by_pair.setdefault((key[1], key[2]), []).append(key)
+        for (ep_key, check_id), keys in by_pair.items():
+            check = CHECKS_BY_ID.get(check_id)
+            if check is None or not check.caller_independent or len(keys) < 2:
+                continue
+            lacking, peers = [], []
+            for key in keys:
+                cell = cells[key]
+                no_capture = (key in previous or self._lacks_capture(key, cell))
+                if no_capture and not cell.executed and cell.status not in _CONCLUSIVE:
+                    lacking.append(key)
+                elif not no_capture and (cell.status != CellStatus.NOT_APPLICABLE
+                                         or (cell.reason or "").startswith("protocol_inapplicable")):
+                    # A not-applicable peer counts only when its capture was judged
+                    # (readiness: protocol_inapplicable). A shape or origin-scoped
+                    # not-applicable cell says nothing about holding a capture.
+                    peers.append(key)
+            if not lacking or not peers:
+                continue
+            peer = min(peers, key=lambda k: (_peer_rank(cells[k]), k[0]))
+            peer_cell = cells[peer]
+            outcome = ("covered_by_identity" if peer_cell.status in _CONCLUSIVE else
+                       "not_applicable_on_identity" if peer_cell.status == CellStatus.NOT_APPLICABLE
+                       else "open_on_identity")
+            reason = (f"{outcome}:{peer[0]}: {peer[0]}'s cell for this check on the same "
+                      f"endpoint is {peer_cell.status.value}; this identity holds no capture "
+                      "of the endpoint and the check does not depend on the caller")
+            for key in lacking:
+                self.credited[key] = {"identity": peer[0], "outcome": outcome,
+                                      "peer_status": peer_cell.status.value}
+                for case, child in self.matrix.cases_for_cell(*key):
+                    if not child.executed and child.status not in _CONCLUSIVE:
+                        self.matrix.record_case(*key, case, status=CellStatus.INCONCLUSIVE,
+                                                reason=reason, executed=False)
+                self.matrix.record(*key, status=CellStatus.INCONCLUSIVE, reason=reason[:180],
+                                   executed=False)
+        return len(self.credited)
+
+    def credited_summary(self) -> dict:
+        """Counts of the credited cells: by outcome, by check, by the cell's own identity
+        and by the identity whose cell stands for it."""
+        by_outcome: dict[str, int] = {}
+        by_check: dict[str, int] = {}
+        by_identity: dict[str, int] = {}
+        by_covering: dict[str, int] = {}
+        for (ident, _ep, cid), entry in self.credited.items():
+            by_outcome[entry["outcome"]] = by_outcome.get(entry["outcome"], 0) + 1
+            by_check[cid] = by_check.get(cid, 0) + 1
+            by_identity[ident] = by_identity.get(ident, 0) + 1
+            by_covering[entry["identity"]] = by_covering.get(entry["identity"], 0) + 1
+        return {"cells": len(self.credited), "by_outcome": dict(sorted(by_outcome.items())),
+                "by_check": dict(sorted(by_check.items())),
+                "by_cell_identity": dict(sorted(by_identity.items())),
+                "by_covering_identity": dict(sorted(by_covering.items())),
+                "note": ("cells of an identity with no capture of the endpoint, on a check "
+                         "whose verdict does not depend on the caller: counted on the "
+                         "identity that holds the capture, neither as a gap nor as a send "
+                         "of this identity")}
+
     def restore_checkpoint(self, checkpoint, context_key=""):
         self.context_key = context_key
         payload = [self.endpoints, sorted(self.matrix.cells()), context_key]
@@ -1270,8 +1375,12 @@ class CoverageTracker:
             ready = disposition.get("status", "ready") == "ready"
             if disposition.get("status") in {"unsupported", "disabled"}:
                 capability = False
+            credit = self.credited.get(key)
             if conclusive:
                 reason = "conclusive"
+            elif credit is not None:
+                # R11-10: not this identity's gap and not its send (see credit_caller_independent).
+                reason = credit["outcome"]
             elif disposition and not ready:
                 code = disposition.get("reason_code", "prerequisite_unmet")
                 reason = ("validator_unavailable" if disposition.get("status") == "disabled" else
@@ -1320,7 +1429,8 @@ class CoverageTracker:
                          "fresh_sends": sum(a.get("sent") or 0 for a in cell.attempts),
                          "referenced": bool(cell.referenced_attempts),
                          "conclusive": bool(conclusive), "resumed": key in self.reused,
-                         "terminal_reason": reason, "detail": cell.reason})
+                         "terminal_reason": reason, "detail": cell.reason,
+                         **({"covered_by": credit["identity"]} if credit is not None else {})})
         ledger = {"counts": {stage: sum(bool(row[stage]) for row in rows) for stage in
                              ("discovered", "captured", "shape_applicable", "implemented", "eligible",
                               "queued", "attempted", "sent", "fresh_sent", "referenced", "conclusive",
@@ -1341,8 +1451,12 @@ class CoverageTracker:
         return ledger
 
     def report(self, *, compact: bool = True) -> dict:
+        self.credit_caller_independent()
         s = self.matrix.summary()
-        s["not_tested"] = self.matrix.not_tested()
+        # R11-10: a credited cell is listed under credited_by_identity, not as a gap.
+        s["not_tested"] = [row for row in self.matrix.not_tested()
+                           if (row["identity"], row["endpoint"], row["check"]) not in self.credited]
+        s["credited_by_identity"] = self.credited_summary()
         if compact:
             # E11: a not-applicable cell is not a gap, so it is counted per check and
             # reason instead of listed row by row (the full matrix is in the checkpoint).
@@ -1357,7 +1471,9 @@ class CoverageTracker:
             s["not_tested_not_applicable"] = aggregated
         # T05: the case-granular "not tested + why" (pending/budget-skipped/blocked
         # child cases). Empty when no case layer was populated -- fully additive.
-        s["cases_not_tested"] = self.matrix.cases_not_tested()
+        s["cases_not_tested"] = [row for row in self.matrix.cases_not_tested()
+                                 if (row["identity"], row["endpoint"], row["check"])
+                                 not in self.credited]
         # R01/R07: the auditable executed-vs-inferred breakdown, additive
         # alongside the matrix's own (coarser) summary -- coverage_summary.py's
         # real production consumer, reached by every live investigate_engagement
