@@ -86,11 +86,10 @@
    needs an owner decision, WG-5 needs a mail sink (IMPROVEMENT_BACKLOG.md WG-*). WG-2 item 5
    is done: client_trust, websocket and oauth are drive legs; crypto, recon, cache poisoning
    and subdomain_takeover stay undriven (reasons in `UNDRIVEN_ROW_CONFIRMATIONS`).
-2. r11 post-mortem items, IMPROVEMENT_BACKLOG.md R11-1 to R11-8:
-   - wrong-class confirmations (R11-1, first) and class-name grouping;
-   - sqlmap on transport routes, likely also r10's socket.io leftover;
-   - phase budgets that left 51 min unused, and writes with no verdict;
-   - identity mapping, business flows (owner), and detection gaps found against Strix.
+2. r11 post-mortem items, IMPROVEMENT_BACKLOG.md R11-1 to R11-9. R11-1 to R11-6, R11-8(a)
+   and R11-8(c) are merged on local branch `integrate/r11-fixes-20261119` (off main, not
+   pushed). Open: R11-7 business flows, R11-8(b), R11-9 (the crawler's guessed body serves
+   as the endpoint template), and the R11-8(c) confirm default (owner decisions below).
    r11 did not cover an oauth flow (none in scope). The solved count needs the scorer.
    Not rechecked in r11: r10's cross_identity repeats across findings.
 3. Owner review of `8040dbf5` (policy reads a decoded NUL both ways, on main).
@@ -124,6 +123,17 @@
   pin on; external tools via the counting proxy.
 - Ticket 8 authorization (2026-10-22): full local Juice Shop on port 3002 only.
 - One proof per vulnerability (2026-10-28), not one per route.
+- r11 backlog (2026-11-19):
+  - R11-7: business-flow checks may drive multi-step writes (checkout, coupons, wallet,
+    2FA) on run-owned accounts, restoring where possible and naming what is left;
+  - R11-8(b): a session JWT with no `exp` may confirm; a failed-login burst on a run-owned
+    account may confirm "no lockout"; a password change plus restore may test whether the
+    old token survives;
+  - R11-8(c): challenge echo, recovery-lookup enumeration and reset-answer guessing confirm
+    by default (challenge_echo `active_submit` stays off);
+  - an anonymous read counts as an exposure caller.
+  Writes and bursts stay behind the existing gates (`active_enabled`,
+  `allow_mutating_replay`, the per-check ceilings, `max_burst_size`), all off by default.
 
 ## Working rules
 - Follow AGENTS.md. Never read answer keys, blind labels or blind-target code.

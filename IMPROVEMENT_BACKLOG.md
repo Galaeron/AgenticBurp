@@ -5358,7 +5358,9 @@ Non-negotiables apply:
   - A write endpoint seen only through its GET gets a mass-assignment leg.
   - Negative controls: a foreign token stays unregistered; a read-only field is never sent.
 
-### [ ] R11-7 — Multi-step business flows (checkout, coupons, wallet, 2FA)  [NEEDS OWNER DECISION — write scope]
+### [ ] R11-7 — Multi-step business flows (checkout, coupons, wallet, 2FA)  [OWNER APPROVED 2026-11-19]
+- **Owner decision (2026-11-19):** checks may drive multi-step writes on run-owned accounts,
+  restoring where possible and naming what is left; behind the existing write gates.
 - **Domain:** Workflow misuse · **Mode:** design LOOP after the owner decides; live OWNER/LIVE.
 - **Evidence (SUPPORTED):** r11 never sent checkout, coupon, 2FA-disable or deluxe-membership
   flows to completion, while Strix confirmed 8 findings there:
@@ -5392,9 +5394,13 @@ Non-negotiables apply:
   - auth_sequence (SESS-06) recorded "Logout invalidation lead": the bearer JWT has no `exp`
     claim.
   - Owner question: may a missing `exp` on a session JWT confirm as a finding of its own?
+    **Owner decision (2026-11-19): yes** to all three: a missing `exp` confirms, a
+    failed-login burst on a run-owned account may confirm "no lockout", and a password
+    change plus restore may test whether the old token survives.
   - A token that survives a password change has no leg. It would need a password change and
     a restore, so it is a write.
-- **(c) No leg exists (Strix #27, #15).** (DONE 8723e21b, leads until owner sign-off)
+- **(c) No leg exists (Strix #27, #15).** (DONE 8723e21b, leads until owner sign-off.
+  Owner decision 2026-11-19: confirm by default; challenge_echo `active_submit` stays off.)
   - A challenge endpoint that returns its own answer: 4,581 captcha requests in r11, never
     flagged. Generic oracle: a value from one response that a later request must echo to
     pass the challenge.
@@ -5449,7 +5455,8 @@ Non-negotiables apply:
     r11's 31 "not a registered session" skips were captures with no credentials at all
     (`/api/Challenges`, `/rest/memories`, `/api/Feedbacks`). R11-6 now skips these with
     their own reason ("carries no credentials"). Counting them would change confirmation
-    policy.
+    policy. **Owner decision (2026-11-19): yes**, an anonymous read counts as an exposure
+    caller.
   - **The 560 `missing_principal` cells** look like coverage gaps, not identity mapping.
     In r11, captures already matched the role headers exactly (for example eval-user-1 and
     eval-user-2), so no token mapping was needed for them. The cells come from the coverage
