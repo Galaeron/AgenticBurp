@@ -5407,20 +5407,39 @@ Non-negotiables apply:
   usually stays disabled, because re-enabling needs a fresh TOTP. All of it is named
   in the change log.
 
-### [ ] R11-7c — business_flow gaps not covered by R11-7
-- **Mode:** LOOP (offline).
-- **Not covered:**
-  - **Race at settlement (#25):** concurrent settlements against one basket or balance.
-    `race_condition`/`toctou` do not drive the settlement flow.
-  - **Coupon at the settlement step:** a code carried by the settlement body goes
-    through the control-vs-tamper comparison. It has no loopback test yet.
-  - **2FA restore:** it cannot mint the fresh TOTP a setup replay usually needs. A
-    restore that uses the run's TOTP secret, when one is declared, is open.
-  - **Variants and flow discovery:**
-    - at most two tampered variants per finding;
-    - the cart steps are the identity's three latest cart-path writes before the first
-      capture of the settlement;
-    - a flow whose basket is filled by a non-cart-shaped path is missed.
+### [x] R11-7c — business_flow gaps not covered by R11-7
+- **Mode:** LOOP (offline). **DONE offline (2026-11-19)**, branch
+  `claude/r11-7c-business-flow-gaps-bb7387`. Detail in `docs/WRITE_CHECKS.md`.
+- **Done:**
+  - **Coupon at the settlement step:** loopback test with a positive (forged code
+    settles for less than the code-emptied control) and a negative (checked codes).
+    It exposed two faults, both fixed. A refused tampered settlement left its cart
+    items in the basket, and they were not named. And every later variant was
+    dropped. Now the next settlement-step variant settles the basket the refused
+    flow left (no refill), and the leftover items are named `LEFT IN PLACE`.
+  - **Race at settlement (#25):** `validators.business_flow.settlement_race`, off by
+    default. After an unconfirmed payment_tamper check, it fills the basket once and
+    settles twice in sequence (the control), then refills and sends N concurrent
+    settlements. N comes from `authorize_burst`, so `max_burst_size` caps it. It
+    confirms only when the read-back shows more entries, or more balance spent, than
+    the control allowed. Placed orders are named `LEFT IN PLACE`.
+  - **2FA restore:** an identity's `role.login.totp_secret` lets the re-enable put a
+    freshly computed RFC 6238 code in the captured enable request's code field.
+    Without a secret, or with a wrong one, it is named `2FA LEFT DISABLED` as before.
+    The secret and the codes are never logged or reported.
+  - **Variants and flow discovery:** variants are spread over the value families,
+    `max_variants` (default 2, hard cap 4). A cart step is a cart-shaped write, or a
+    write the captured read-backs show adding an entry that carries its values. An
+    unrelated write is not replayed.
+  - Tests: `harness/test_business_flows.py`, 16 to 30.
+- **Left open:**
+  - a race on one balance or a one-time grant with no cart step (the sequential
+    control would consume it);
+  - the race has no catalog row of its own (it reports under WSTG-BUSL-10);
+  - a 2FA setup that needs a fresh server-issued value, not only a code;
+  - a basket filled by a multipart write, or one with no captured read-back after it;
+  - still at most three cart steps;
+  - live trial of all of the above (R11-7b).
 
 ### [ ] R11-8 — Detection gaps behind Strix findings r11 sent requests for but never reported
 - **Domain:** Detection · **Effort:** M per sub-item · **Mode:** LOOP (offline); (b) and (c)

@@ -1008,6 +1008,14 @@ validators:
     enabled: true
     read_backs: []
     mfa_status_reads: []
+    # R11-7c: tampered variants per payment_tamper finding (hard cap 4; the
+    # mutating ceiling bounds them again).
+    max_variants: 2
+    # R11-7c: concurrent settlements of one filled basket after an unconfirmed
+    # payment_tamper check. Off by default; also needs validators.max_burst_size >= 2
+    # and a business_flow ceiling that pays for 2 * cart steps + 2 + race_copies.
+    settlement_race: false
+    race_copies: 2
 
 # Autonomous scope-discovery MVP (harness/scope_discovery.py). Off by
 # default -- the harness has never, until this option exists, decided on

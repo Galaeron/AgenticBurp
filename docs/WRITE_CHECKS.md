@@ -113,6 +113,45 @@ that read the state back all come from `experiment_context["captured"]`.
   through `RunContext.executor()` as that session.
 - It never sends DELETE. One flow runs at a time per identity.
 
+## Cart steps and variants (R11-7c)
+
+- The cart steps are the actor's captured POST/PUT/PATCH writes before the first
+  capture of the settlement, at most three (the latest). A write counts when its
+  path is cart-shaped, or when the run's own captured read-backs show its effect: a
+  read before and after it gains an entry carrying one of the write's (name, value)
+  pairs, or a read only after it holds an entry carrying two. Auth, 2FA, coupon and
+  settlement writes are never cart steps. An unrelated write is not replayed.
+- Tampered variants take one per value family first (amount, quantity, delivery),
+  then the rest, at most `max_variants` (default 2, hard cap 4); the ceiling bounds
+  them again before each flow.
+- A refused tampered settlement leaves its flow's cart items in the basket. The next
+  settlement-step variant settles that basket without a refill, so it is never fuller
+  than the control's. A cart-step variant stops there. Items a refused flow left are
+  named `LEFT IN PLACE`.
+
+## Settlement race (R11-7c, off by default)
+
+`validators.business_flow.settlement_race: true` adds a race after a
+`payment_tamper` check that did not confirm. It runs only on a flow with cart steps:
+
+1. Fill the basket once and settle twice in sequence: the control shows how many
+   entries, and how much balance, one filled basket allows.
+2. Fill it once more and send `race_copies` (default 2, hard cap 5) concurrent
+   settlements. The safety gate's `authorize_burst` sets the count, so
+   `validators.max_burst_size` caps it; below 2 nothing is raced.
+3. Confirmed only on the read-back: a read that gained exactly one entry in the
+   control gains two or more, or a balance moves by more than the one sequential
+   settlement moved it. Status codes decide nothing.
+
+It needs a ceiling for `2 x cart steps + 2 + race_copies` writes on top of the
+tamper flows (16 covers one cart step). It is skipped, and the reason named, when
+the second sequential settlement also settles (the basket is not consumed), or when
+no read-back shows one settlement.
+
+Left open: a race on one balance or a one-time grant with no cart step (the
+sequential control would consume it). There is no own catalog row; the race reports
+under `WSTG-BUSL-10`.
+
 ## Restoring
 
 - **Orders and grants.** A placed order, including the untampered control, cannot be
@@ -122,9 +161,14 @@ that read the state back all come from `experiment_context["captured"]`.
   emptied, or with the code the basket held before, and the clearing is verified on
   the read-back. A code in the path cannot be cleared without DELETE, so it is named.
 - **2FA.** It is re-enabled by replaying the identity's own captured enable or setup
-  request and verified on the status read. If the run has no such request, or the
-  replay needs a fresh one-time code, the summary says `2FA LEFT DISABLED on <identity>`
-  and the change log records it.
+  request and verified on the status read. If the identity declares a TOTP secret
+  (`role.login.totp_secret`), a 6-8 digit code field in that request gets a freshly
+  computed RFC 6238 code. The secret and the codes are never logged or reported. If
+  the run has no such request, has no secret, or the replay still fails, the summary
+  says `2FA LEFT DISABLED on <identity>` and the change log records it. A setup that
+  needs a fresh server-issued value (not only a code) stays disabled.
+- **Race.** Orders the race's sequential control and concurrent copies placed are
+  named `LEFT IN PLACE`, as are cart items a refused race left in the basket.
 
 ## Options (`validators.business_flow`)
 
@@ -132,6 +176,8 @@ that read the state back all come from `experiment_context["captured"]`.
 - `coupons`: `{expired: [...], by_identity: {<name>: <code>}}`. A declared code
   belonging to another identity may confirm.
 - `mfa_status_reads`: extra 2FA status reads.
+- `max_variants`: tampered variants per payment_tamper finding (default 2, hard cap 4).
+- `settlement_race` (default false) and `race_copies` (default 2, hard cap 5).
 
 Trial settings, in `config.local.yaml` only:
 
@@ -153,5 +199,11 @@ Tests: `harness/test_business_flows.py` (loopback shop). It covers:
 - no ceiling, or foreign credentials, sending nothing;
 - an unrestorable 2FA disable named in the summary and in the change log;
 - the capability gate;
-- no DELETE, ever.
+- no DELETE, ever;
+- R11-7c: a coupon carried by the settlement body (forged code confirms; checked codes
+  hold, and the leftover basket is named); the settlement race (a racy shop confirms,
+  a serialized one holds, switch off, burst ceiling 1 and a short ceiling send no race);
+  a basket filled through a non-cart path found by its read-back, and an untraced write
+  not replayed; variant spread and caps; 2FA re-enabled with a declared TOTP secret,
+  and named left disabled with none or a wrong one, with the secret never printed.
 
