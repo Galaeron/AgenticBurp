@@ -23,6 +23,11 @@ oracle, dispatched by the finding's class:
                              pre-logout cookie still reaches the page -- the
                              server never invalidated it. The operator's
                              captured session is never sent to the logout.
+  - session_expiry         -- token expiry (WSTG-SESS-07, R11-8 b): the session
+                             bearer JWT (the captured login's token, the
+                             request's or a run identity's credential) has no
+                             exp claim, so it never expires. Decode only: it
+                             sends nothing and redacts every token value.
 
 Credentials/usernames come from the captured request itself (a login/register
 body), so no tester input is needed. All sends route through the safety gate and,
@@ -161,6 +166,55 @@ def _session_cookies(set_cookie_headers) -> dict:
             n, _, v = first.partition("=")
             if _SESSION_COOKIE_RE.search(n):
                 out[n.strip()] = v.strip()
+    return out
+
+
+def _is_expiry_class(low: str) -> bool:
+    """A session_expiry claim (WSTG-SESS-07): a token that never expires."""
+    from harness.categories import canonicalize
+    return (canonicalize(low) == "session_expiry" or "session_expiry" in low
+            or "session expiry" in low or "exp claim" in low
+            or ("never expire" in low and any(w in low for w in ("token", "session", "jwt"))))
+
+
+def _session_jwts(exchange, ctx) -> list[tuple[str, list[str], bool]]:
+    """(where, claim names, never_expires) for each distinct session JWT the run
+    already holds: the captured login response's token, the captured request's
+    identity credential headers, then the run identities' credential headers.
+    `where` names the place, never the value."""
+    from types import SimpleNamespace
+    from harness.security import is_identity_credential_header
+    from .jwt_forge_validator import _JWT_RE, _decode
+    candidates: list[tuple[str, str]] = []
+    status = exchange.response_status or 0
+    if 200 <= status < 300 and exchange.response_body:
+        resp = SimpleNamespace(text=exchange.response_body,
+                               headers=httpx.Headers(exchange.response_headers or {}))
+        minted = _login_token(resp)
+        if minted is not None:
+            candidates.append((f"the captured response's {minted[0]}", minted[1]))
+    for name, value in (exchange.request_headers or {}).items():
+        if is_identity_credential_header(name):
+            for match in _JWT_RE.finditer(value or ""):
+                candidates.append((f"the captured request's {name} header", match.group(1)))
+    sessions = getattr(ctx, "sessions", None)
+    for session in (sessions.identities() if sessions is not None else []):
+        for name, value in (session.headers or {}).items():
+            if is_identity_credential_header(name):
+                for match in _JWT_RE.finditer(value or ""):
+                    label = session.name or session.principal_id or session.session_id
+                    candidates.append((f"run identity {label!r}'s {name} header",
+                                       match.group(1)))
+    out, seen = [], set()
+    for where, token in candidates:
+        decoded = _decode(token)
+        if decoded is None or token in seen:
+            continue
+        seen.add(token)
+        _lifetime, never = _token_lifetime(token)
+        payload = decoded[1]
+        claims = sorted(str(k) for k in payload)[:12] if isinstance(payload, dict) else []
+        out.append((where, claims, never))
     return out
 
 
@@ -498,6 +552,8 @@ class AuthSequenceValidator(Validator):
         "broken_authentication", "broken authentication", "authentication",
         "session_timeout", "session timeout", "logout_invalidation", "logout invalidation",
         "session not invalidated",
+        "session_expiry", "session expiry", "token never expires", "missing exp claim",
+        "no exp claim", "jwt without exp",
     }
     active = True
 
@@ -521,6 +577,9 @@ class AuthSequenceValidator(Validator):
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         if not super().applies(finding, exchange):
             return False
+        if self._which_checks(finding.vulnerability_class, exchange) == ["expiry"]:
+            # Any exchange: the check decodes what the capture and the run hold.
+            return True
         if self._which_checks(finding.vulnerability_class, exchange) == ["logout"]:
             # Any exchange: validate() mints its own throwaway login from a
             # captured login, or reports why it cannot without sending anything.
@@ -563,6 +622,8 @@ class AuthSequenceValidator(Validator):
         per run carried a confirmed username-enumeration result that was
         evidence for a completely different claim)."""
         low = (vc or "").strip().lower()
+        if _is_expiry_class(low):
+            return ["expiry"]
         if "fixation" in low:
             return ["fixation"]
         if "weak" in low or "password polic" in low:
@@ -597,9 +658,12 @@ class AuthSequenceValidator(Validator):
         host = urlsplit(exchange.url).hostname or ""
         if self.allowed_hosts and not scope_lock.host_in_scope(exchange.url, self.allowed_hosts):
             return self._skip(f"host {host!r} out of scope")
+        checks = self._which_checks(finding.vulnerability_class, exchange)
+        if checks == ["expiry"]:
+            # Decode only: no send, so no mutating-replay permission is needed.
+            return self._check_token_expiry(exchange)
         if not get_default_gate().config.allow_mutating_replay:
             return self._skip("auth-mechanism probes send POSTs; need validators.allow_mutating_replay")
-        checks = self._which_checks(finding.vulnerability_class, exchange)
         if not checks:
             return self._skip(
                 "no auth_sequence check applies to this finding's class",
@@ -795,6 +859,44 @@ class AuthSequenceValidator(Validator):
         from harness.missing_auth_probe import _AUTH_HEADERS
         return {k: v for k, v in self._headers(exchange).items()
                 if k.lower() not in _AUTH_HEADERS and k.lower() != "content-type"}
+
+    # --- token expiry (session_expiry, WSTG-SESS-07) ---------------------------
+    def _check_token_expiry(self, exchange) -> ValidationResult:
+        """R11-8 (b), owner decision 2026-11-19: a session bearer JWT with no exp
+        claim confirms as its own finding. The JWTs read are the session tokens
+        the run already holds: the captured login response's token, the captured
+        request's credential headers, and the run identities' credential headers.
+        Nothing is sent. Evidence names where each token was found and its claim
+        names, never a token or claim value."""
+        fc = "session_expiry"
+        found = _session_jwts(exchange, self.run_context)
+        if not found:
+            return ValidationResult(
+                self.name, "skipped", fc,
+                summary="Token expiry not tested: the capture and the run's identities hold no "
+                        "session JWT (an opaque token's lifetime is not visible). Nothing was "
+                        "sent.")
+        lasting = [(where, claims) for where, claims, never in found if never]
+        rows = "; ".join(f"{where}: claims {', '.join(claims) or '(none)'}"
+                         for where, claims, _never in found[:4])
+        if lasting:
+            where, _claims = lasting[0]
+            return ValidationResult(
+                self.name, "confirmed", fc, confidence=0.85, confirmed=True,
+                summary=f"Session token never expires: {where} is a JWT with no exp claim.",
+                evidence=f"Decoded {len(found)} session JWT(s) the run holds ({rows}). "
+                         f"{len(lasting)} of them carry no exp claim, so the server issues a "
+                         f"session token that stays valid until its signing key changes. "
+                         f"Decoded only; nothing was sent. Token values redacted.",
+                raw_output=json.dumps({"check": "token_expiry",
+                                       "tokens": [{"where": w, "claims": c, "exp": not n}
+                                                  for w, c, n in found]}),
+                mechanism_classes=(fc,))
+        return ValidationResult(
+            self.name, "not_confirmed", fc, confidence=0.0, confirmed=False,
+            summary=f"Session token expires: every session JWT the run holds ({len(found)}) "
+                    f"carries an exp claim.",
+            evidence=f"Decoded {rows}. Decoded only; nothing was sent. Token values redacted.")
 
     # --- logout invalidation (session_timeout, WSTG-SESS-06) ------------------
     async def _check_logout_invalidation(self, exchange) -> ValidationResult:
@@ -1011,7 +1113,8 @@ class AuthSequenceValidator(Validator):
                 f"guessed, so nothing was sent to one. Token lifetime: {lifetime}. To confirm, "
                 f"capture the app's logout request (or name its revocation endpoint) and re-run: "
                 f"this leg logs a fresh token out through it and replays {path}. Token value "
-                f"redacted.",
+                f"redacted." + (" A token with no exp claim is also its own finding "
+                                "(session_expiry, WSTG-SESS-07)." if never_expires else ""),
                 confidence=0.5 if never_expires else 0.4)
         lo_method, lo_url, lo_body, lo_where = routes[0]
         lo_path = urlsplit(lo_url).path

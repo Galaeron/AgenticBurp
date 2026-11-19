@@ -956,11 +956,19 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "Test if session tokens are regenerated after login"),
     # WG-3: auth_sequence's logout leg (session_timeout class) mints a fresh throwaway
     # login from a captured login and never logs the operator out, so the row is
-    # scoped to auth endpoints like SESS-03. Idle/absolute timeout (SESS-07) has no leg.
+    # scoped to auth endpoints like SESS-03. Idle/absolute timeout waits have no leg; SESS-07
+    # below checks only that the session token expires at all.
     Check("WSTG-SESS-06", "Logout functionality", Phase.ENDPOINT,
           "session_timeout", _has_auth_endpoint, "auth_sequence",
           "Test whether logout invalidates the session server-side (the pre-logout "
           "cookie must stop reaching authenticated pages)"),
+    # R11-8 (b): a session JWT with no exp claim never expires. auth_sequence's expiry
+    # check decodes the tokens the run holds (the login's token, the identities'
+    # credentials) and sends nothing. Its own class, so the logout row is not proved by it.
+    Check("WSTG-SESS-07", "Session timeout (token expiry)", Phase.ENDPOINT,
+          "session_expiry", _has_auth_endpoint, "auth_sequence",
+          "Decode the session bearer JWT (the login's token, the run identities' "
+          "credentials) and check that it carries an exp claim; nothing is sent"),
     # The file_upload leg uploads only a BENIGN disallowed-extension (.html) file and
     # checks it is stored and served back: BUSL-08 (unexpected file types). In
     # scheme-1 data (pre-WG-1, unmarked) "WSTG-BUSL-08" meant the TOCTOU row and still

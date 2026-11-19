@@ -144,6 +144,13 @@ CONFIRMABLE_CLASS_MARKERS = frozenset({
     "logout invalidation",
     "logout_invalidation",
     "session not invalidated",
+    # R11-8 (b): a session JWT with no exp claim (WSTG-SESS-07), auth_sequence's
+    # decode-only expiry check. Provisional: fixture-verified only.
+    "session_expiry",
+    "session expiry",
+    "token never expires",
+    "missing exp claim",
+    "no exp claim",
 
     # CSRF family (csrf_validator)
     "csrf",

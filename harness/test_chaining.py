@@ -200,6 +200,8 @@ class TestChainRuleCoverageIsDocumented(unittest.TestCase):
         "toctou",
         # Finding dedup (2026-11-03): host-wide hygiene classes, no chain rule.
         "insecure_transport", "missing_headers",
+        # R11-8 (b): a never-expiring session token is standalone hardening, no rule.
+        "session_expiry",
     })
 
     def test_categories_with_no_chain_rule_are_the_known_documented_set(self):

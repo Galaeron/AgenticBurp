@@ -88,6 +88,7 @@ _REMEDIATION_HINTS: dict[str, str] = {
     "deserialization": "Avoid deserializing untrusted data with a format that carries type information (Java serialization, pickle, etc.); use a data-only format (JSON) instead, or a strict allowlist deserializer.",
     "session_fixation": "Issue a new session identifier immediately after successful authentication; never continue using a pre-login session ID.",
     "session_timeout": "Invalidate the session server-side on logout (not just client-side cookie clearing), and enforce an absolute/idle session timeout.",
+    "session_expiry": "Give every session token an expiry: set an exp claim on issued JWTs (with a short lifetime and a refresh flow), and reject tokens without one server-side.",
     "reset_token": "Generate password-reset/session tokens from a cryptographically secure RNG with at least 128 bits of entropy; never derive them from a timestamp, user id, email, or a sequential counter, and expire them after a short single use.",
     "dom_xss": "Never pass client-side sources (location.hash/.search, document.referrer, postMessage data) into a dangerous sink (innerHTML, document.write, eval, jQuery .html()); use textContent or a sanitizer (e.g. DOMPurify) and treat all URL/DOM input as untrusted in client JS.",
     "toctou": "Make the authorization check and the state change atomic: perform the privilege/ownership check inside the same transaction (or under a row/advisory lock) that commits the write, so two interleaved requests cannot both pass the check before either commits.",

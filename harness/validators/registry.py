@@ -581,6 +581,11 @@ class ValidatorRegistry:
                 and {family, getattr(validator, "name", "")} & POLLING_EXCLUDED_VALIDATORS):
             return decision("unsupported", "protocol_inapplicable",
                             "a long-polling transport request carries framing, not application input")
+        if check.id == "WSTG-SESS-07":
+            # R11-8 (b): decodes the session JWTs the run already holds; sends nothing,
+            # so it needs no mutating-replay permission.
+            return decision("ready", "ready", "decode-only token expiry check") | {
+                "mechanism_id": "auth.token_expiry"}
         method = (exchange.method or "GET").upper()
         path = urlsplit(exchange.url).path.lower()
         if check.id in {"WSTG-ATHN-07", "WSTG-SESS-03", "WSTG-IDNT-04", "WSTG-ATHN-11", "WSTG-SESS-06"}:
