@@ -558,7 +558,7 @@ class AuthSequenceValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 confirm_lookup: bool = False):
+                 confirm_lookup: bool = True):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         # R11-8 (c): a GET lookup reached by the NEW recovery-lookup paths (the
@@ -1454,7 +1454,7 @@ class AuthSequenceValidator(Validator):
             return ValidationResult(
                 self.name, "not_confirmed", fc, confidence=0.5, confirmed=False,
                 summary=(f"Lead, not confirmed (validators.auth_sequence.confirm_lookup is off, "
-                         f"owner sign-off pending): account enumeration through the lookup "
+                         f"set false in config): account enumeration through the lookup "
                          f"{where}: an existing account and a non-existent one answer "
                          f"differently ({differ})."),
                 evidence=(f"{how} and a random non-existent one: {differ}. The identifiers "

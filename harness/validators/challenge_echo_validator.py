@@ -31,10 +31,10 @@ value (the control, which must be rejected), then once per candidate field with
 that field's fresh value. Every submission is a write the leg cannot undo, so it
 also needs validators.allow_mutating_replay and stays inside `max_submissions`.
 
-Policy (owner sign-off pending): a positive is a labelled LEAD
-(not_confirmed, manual_verification set). Only with
-validators.challenge_echo.confirm: true does it confirm, and then only on two
-passive pairs or an active positive with its rejected control.
+Policy (owner decision 2026-11-19): validators.challenge_echo.confirm is on by
+default, so a positive confirms, and then only on two passive pairs or an active
+positive with its rejected control. With the key set false a positive is a
+labelled LEAD (not_confirmed, manual_verification set).
 """
 from __future__ import annotations
 
@@ -147,7 +147,7 @@ class ChallengeEchoValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 confirm: bool = False, active_submit: bool = False, max_submissions: int = 4):
+                 confirm: bool = True, active_submit: bool = False, max_submissions: int = 4):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self.confirm = bool(confirm)
@@ -169,7 +169,7 @@ class ChallengeEchoValidator(Validator):
         if self.confirm and strong:
             return self._result("confirmed", "Challenge answer disclosed: " + summary,
                                 evidence=evidence, confidence=0.8, confirmed=True)
-        why = ("validators.challenge_echo.confirm is off (owner sign-off pending)"
+        why = ("validators.challenge_echo.confirm is off (set false in config)"
                if strong else "one pair only: a second pair with another value would show "
                               "the value tracks the challenge")
         return self._result("not_confirmed", f"Lead, not confirmed ({why}): " + summary,

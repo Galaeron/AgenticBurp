@@ -267,14 +267,14 @@ class ValidatorRegistry:
         if auth_cfg.get("enabled", True):
             self.validators["auth_sequence"] = AuthSequenceValidator(
                 allowed_hosts=_allowed, timeout=float(auth_cfg.get("timeout", 10.0)),
-                confirm_lookup=bool(auth_cfg.get("confirm_lookup", False)))
+                confirm_lookup=bool(auth_cfg.get("confirm_lookup", True)))
         # R11-8 (c): a challenge response that carries its own answer. Passive over
         # captured pairs; the active submit and confirmation are both opt-in.
         ce_cfg = cfg.get("challenge_echo", {})
         if ce_cfg.get("enabled", True):
             self.validators["challenge_echo"] = ChallengeEchoValidator(
                 allowed_hosts=_allowed, timeout=float(ce_cfg.get("timeout", 10.0)),
-                confirm=bool(ce_cfg.get("confirm", False)),
+                confirm=bool(ce_cfg.get("confirm", True)),
                 active_submit=bool(ce_cfg.get("active_submit", False)),
                 max_submissions=int(ce_cfg.get("max_submissions", 4)))
         # R11-8 (b): a run-owned identity's token across its own password change.
@@ -334,7 +334,7 @@ class ValidatorRegistry:
             self.validators["rate_limit"] = RateLimitValidator(
                 allowed_hosts=_allowed, timeout=float(rl_cfg.get("timeout", 10.0)),
                 min_attempts=int(rl_cfg.get("min_attempts", 12)),
-                confirm_reset_answer=bool(rl_cfg.get("confirm_reset_answer", False)))
+                confirm_reset_answer=bool(rl_cfg.get("confirm_reset_answer", True)))
         # Predictable reset-token -- samples reset tokens and confirms only the
         # unambiguous predictability cases (sequential/timestamp/below-floor/
         # derived). Active; the reset trigger is a mutating POST (allow_mutating_replay).

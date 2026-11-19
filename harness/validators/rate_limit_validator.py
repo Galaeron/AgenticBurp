@@ -30,8 +30,9 @@ different, and every other field exactly as captured. It sends only when:
     already the account's password: even an answer the server wrongly accepts
     changes nothing;
   - each wrong answer is rejected. An accepted one stops the burst at once.
-All wrong answers rejected, every attempt answered, none throttled: a LEAD by
-default; a confirmation only with validators.rate_limit.confirm_reset_answer.
+All wrong answers rejected, every attempt answered, none throttled: a
+confirmation (validators.rate_limit.confirm_reset_answer, on by default since the
+owner decision of 2026-11-19); with the key set false, a LEAD.
 
 Failed-login mode (R11-8 b, owner decision 2026-11-19). When the captured
 exchange is the declared login of a run-owned identity (validators/owned_login),
@@ -112,7 +113,7 @@ class RateLimitValidator(Validator):
     active = True
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, timeout: float = 10.0,
-                 min_attempts: int = 5, run_context=None, confirm_reset_answer: bool = False):
+                 min_attempts: int = 5, run_context=None, confirm_reset_answer: bool = True):
         self.allowed_hosts = allowed_hosts or []
         self.timeout = timeout
         self.min_attempts = max(2, int(min_attempts))
@@ -445,7 +446,7 @@ class RateLimitValidator(Validator):
                 summary=f"No limit on reset-answer guessing at {where}: {completed} wrong answers "
                         f"in a row were each rejected with no throttle or lockout.",
                 evidence=evidence)
-        why = ("validators.rate_limit.confirm_reset_answer is off (owner sign-off pending)"
+        why = ("validators.rate_limit.confirm_reset_answer is off (set false in config)"
                if not self.confirm_reset_answer else
                f"only {completed} of min_attempts {self.min_attempts} attempts were allowed")
         return ValidationResult(
