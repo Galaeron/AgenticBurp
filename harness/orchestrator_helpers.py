@@ -296,6 +296,15 @@ def _has_settable_body(exchange: HttpExchange) -> bool:
     return False
 
 
+def _read_body_mass_assignment(exchange: HttpExchange) -> bool:
+    """R11-6: a PUT/PATCH of one object with NO captured body (seen only through its
+    route or GET). The sequence leg builds its body from the object's own read, so
+    it gets a mass-assignment leg too (a guessed body already passes
+    `_has_settable_body` and is routed to the same read-built path)."""
+    from harness.validators.sequence_validator import needs_read_body
+    return not _has_settable_body(exchange) and needs_read_body(exchange)
+
+
 def _nosql_login_candidate(exchange: HttpExchange) -> bool:
     """A captured form login whose credential fields can carry Mongo operators."""
     if (exchange.method or "GET").upper() != "POST":
@@ -608,6 +617,8 @@ def shape_precondition_legs(node: dict, exchange: HttpExchange, roles, base_url:
         legs.append(("client_trust", exchange))
     if _has_2fa_step_shape(exchange):
         legs.append(("2fa_bypass", exchange))
+    if _read_body_mass_assignment(exchange):
+        legs.append(("mass_assignment", exchange))
     return legs
 
 

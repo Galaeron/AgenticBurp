@@ -5341,7 +5341,7 @@ Non-negotiables apply:
   - the restore is verified.
   - Negative control: a 200 that changes nothing gives `not_confirmed`.
 
-### [ ] R11-6 — Map captured principals to identities and build mass-assignment bodies
+### [x] R11-6 — Map captured principals to identities and build mass-assignment bodies
 - **Domain:** Identity / coverage · **Effort:** M · **Mode:** LOOP (offline).
 - **Evidence (SUPPORTED, r11 terminal reasons):**
   - 560 cells ended `missing_principal` and 453 `unreachable_identity`.
@@ -5416,3 +5416,45 @@ Non-negotiables apply:
 - DELETE legs (Strix #8, #9) are held by owner policy.
 - `/support/logs` (Strix #20) is linked nowhere (crawl check). It is a wordlist question,
   not a missing leg.
+
+### [ ] R11-9 — Stop the crawler's guessed body from serving as the endpoint template
+- **Domain:** Coverage / precision · **Effort:** M · **Mode:** LOOP (offline). Filed by R11-6 (c).
+- **Evidence (VERIFIED, code):**
+  - When the role crawler has no schema or form for a write, it sends
+    `role_crawl._GENERIC_JSON_BODY` (`{"name": "probe", "value": "probe"}`). The engagement
+    then records that exchange as the endpoint template, and every injection leg
+    (sqli, ssti, command injection, xss, nosql) mutates the guessed keys as if they were
+    real parameters.
+  - `models.body_is_placeholder` and `request_body_is_placeholder` already mark the guess,
+    but only prompts and, since R11-6, the mass-assignment legs consult them.
+  - R11-6 builds an update's body from the object's own GET
+    (`validators/read_body.body_from_read`), but only inside the sequence leg. The template
+    other legs receive is unchanged.
+- **Recommendation:**
+  - When an item's GET has been observed and the write's only body is the guess, record a
+    read-built body as the template (settable fields only, `read_body.settable_fields`),
+    marked as read-built, not captured.
+  - Have each injection leg skip, or deprioritise, a template whose body is still a
+    placeholder, instead of injecting into `name` and `value`.
+  - This changes the template every leg consumes, so it is larger than R11-6's
+    mass-assignment-only change.
+- **Acceptance criteria:**
+  - An update seen through its GET and a guessed write gets a read-built template, and its
+    injection legs mutate the read's settable fields.
+  - Negative control: a real captured body is never replaced.
+  - Negative control: a guessed body is never offered to an injection leg as known
+    parameters.
+- **Open points found by R11-6 (not in its scope):**
+  - **Owner decision:** whether an anonymous read may count as an exposure caller. Most of
+    r11's 31 "not a registered session" skips were captures with no credentials at all
+    (`/api/Challenges`, `/rest/memories`, `/api/Feedbacks`). R11-6 now skips these with
+    their own reason ("carries no credentials"). Counting them would change confirmation
+    policy.
+  - **The 560 `missing_principal` cells** look like coverage gaps, not identity mapping.
+    In r11, captures already matched the role headers exactly (for example eval-user-1 and
+    eval-user-2), so no token mapping was needed for them. The cells come from the coverage
+    drive's `replayable_variants` and `identity_variants` (`orchestrator_chain.py`), so look
+    there.
+  - The read-built mass-assignment leg needs `validators.mutating_ceiling_by_check.sequence
+    >= 2` (the write plus its restore) and `allow_mutating_replay`. Both stay off by default,
+    so r12 sends nothing new until the owner sets them.
