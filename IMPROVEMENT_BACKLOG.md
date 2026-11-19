@@ -5423,7 +5423,7 @@ Non-negotiables apply:
 - `/support/logs` (Strix #20) is linked nowhere (crawl check). It is a wordlist question,
   not a missing leg.
 
-### [ ] R11-9 — Stop the crawler's guessed body from serving as the endpoint template
+### [x] R11-9 — Stop the crawler's guessed body from serving as the endpoint template
 - **Domain:** Coverage / precision · **Effort:** M · **Mode:** LOOP (offline). Filed by R11-6 (c).
 - **Evidence (VERIFIED, code):**
   - When the role crawler has no schema or form for a write, it sends
@@ -5450,18 +5450,82 @@ Non-negotiables apply:
   - Negative control: a real captured body is never replaced.
   - Negative control: a guessed body is never offered to an injection leg as known
     parameters.
+- **Result (VERIFIED offline, DONE 84e696f1):**
+  - `EngagementState.record_template` gives a PUT/PATCH of one object that was sent only
+    with the guess a template built from the object's observed 2xx GET
+    (`body_from_read`, settable fields only), marked `body_source="read"` and
+    `read_from="GET <path>"`. A captured body is never replaced, and one captured later
+    takes over (template richness now ranks captured > read-built > guess).
+    `captured_nodes` replays a guessed variant of the same object with the read-built body.
+  - `injection_targets.guessed_body` (moved from nosql) gates every leg: `param_targets`
+    drops a guess's keys (command injection, ssti, nosql, path traversal, ssrf, open
+    redirect, and the `_has_injectable_param` shape routing). sqlmap tests only the query,
+    or is not launched ("not a negative result"). stored_xss does not apply. Coverage
+    derives no body cases from a guess.
+  - Tests: `harness/test_r11_9_read_built_template.py` (10).
+  - Injection legs on a read-built write body are still mutating replays: the safety
+    gate's write settings (off by default) decide whether they send.
 - **Open points found by R11-6 (not in its scope):**
   - **Owner decision:** whether an anonymous read may count as an exposure caller. Most of
     r11's 31 "not a registered session" skips were captures with no credentials at all
     (`/api/Challenges`, `/rest/memories`, `/api/Feedbacks`). R11-6 now skips these with
     their own reason ("carries no credentials"). Counting them would change confirmation
     policy. **Owner decision (2026-11-19): yes**, an anonymous read counts as an exposure
-    caller.
+    caller. **DONE e978b876:** a credential-less GET is replayed twice as the anonymous
+    caller; an unmasked credential secret on an account object confirms excessive data
+    exposure only (no idor/BOLA class, no missing-auth claim). Tests:
+    `harness/test_r11_9_anonymous_exposure.py` (4).
   - **The 560 `missing_principal` cells** look like coverage gaps, not identity mapping.
     In r11, captures already matched the role headers exactly (for example eval-user-1 and
     eval-user-2), so no token mapping was needed for them. The cells come from the coverage
     drive's `replayable_variants` and `identity_variants` (`orchestrator_chain.py`), so look
-    there.
+    there. **Investigated: not a small fix, filed as R11-10.**
   - The read-built mass-assignment leg needs `validators.mutating_ceiling_by_check.sequence
     >= 2` (the write plus its restore) and `allow_mutating_replay`. Both stay off by default,
     so r12 sends nothing new until the owner sets them.
+
+### [ ] R11-10 — Stop counting an identity's missing capture as a coverage gap for identity-independent checks
+- **Domain:** Coverage accounting · **Effort:** M · **Mode:** LOOP (offline), with an owner
+  decision on the identity-bound half. Filed by R11-9.
+- **Evidence (VERIFIED, r11 `result.json` coverage checkpoint, read-only):**
+  - 543 checkpoint cells (560 in the post-mortem's count) end `missing_principal`, on 15
+    endpoints. 233 are eval-user-2's, 177 anonymous's and 133 eval-user-1's.
+  - On every one of those endpoints, one or two of the three identities hold a capture and
+    the others hold none. Examples: `POST /rest/user/login` and
+    `PUT /rest/order-history/-1/delivery-status` were captured only as anonymous, and
+    `POST /profile`, `POST /dataerasure` and `GET /api/Addresss/null` only as one or both
+    users.
+  - **346 of the 543** are identity-independent checks (injection, error handling, client
+    checks, CONF) that another identity already ran on the same endpoint. They count the
+    same work again as a gap.
+  - **197** are identity-bound checks (WSTG-ATHZ/SESS/ATHN, AV-WRITE-AUTHOR/XID,
+    AV-EXPOSURE). There, the identity never sent the request. This is a real gap.
+  - Several of the 15 endpoints are crawler-filled paths (`/api/Addresss/null`,
+    `/rest/products/file/reviews`, `/rest/track-order/file`, `/socket.io/socket.io`).
+- **Cause (VERIFIED, code):**
+  - The coverage matrix makes one cell per (identity, endpoint, check). For an endpoint
+    with any capture, `_captured_readiness` (`orchestrator_chain.py:2932`, the return at
+    `:2953`) and `_run_leg_core` (`:2976`, the result at `:3001`) look up only
+    `replayable_variants(ep, capture_identity_key(<this identity>))` (`engagement.py:263`
+    via `identity_variants`, `:249`). An identity with no capture of its own is
+    `missing_principal`, whatever the check. `worklist_investigator.captured_nodes:56`
+    yields the same marker when a variant's identity key matches no role.
+  - `coverage_tracker.py:1274-1282` then counts these cells as prerequisite blocks.
+- **Recommendation:**
+  - For a check whose verdict does not depend on the caller, record the cell of an
+    identity with no capture as covered by the identity that ran it, not as
+    `missing_principal`. One option is a terminal `covered_by_identity:<id>` reason.
+    The list of identity-independent checks should come from the check catalog, not from
+    the cell.
+  - For identity-bound checks, keep `missing_principal`. Whether the drive may replay
+    another identity's capture with this identity's credentials changes E5b's "only
+    observed requests" rule. That needs an **owner decision**.
+  - Optional: drop crawler-filled paths (a `null`, `file` or `-1` segment that no capture
+    took from a response) from the matrix.
+- **Acceptance criteria:**
+  - On an endpoint captured only as A, an injection check verdict for A covers B's cell,
+    and B's cell is no longer `missing_principal`.
+  - Negative control: an access-control check for B stays `missing_principal`, unless the
+    owner approves replaying with substituted credentials.
+  - The r11 checkpoint replayed through the new accounting leaves at most the 197
+    identity-bound cells.
