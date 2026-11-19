@@ -5149,3 +5149,270 @@ other clients or an identity provider. Remember-password, security questions, ro
 provisioning and username policy (ATHN-05/08, IDNT-01/03/05) are manual design reviews. Idle and
 absolute session timeout (SESS-07) needs long waits; it can become an opt-in on WG-3 later.
 WebAssembly recon (WASM-01) would be all-new surface.
+
+## r11 post-mortem batch — 2026-11-18 (R11-*)
+
+**Why this batch exists.** r11 was the first 24 h Juice Shop run on main `0fb8cd5a` (PR #30):
+- It reported 377 proof-bound confirmed cases (r10: 138) and 117 unique proof-backed
+  vulnerabilities (r10: 36). By root cause, that is about 16-18 vulnerabilities.
+- Some confirmations prove a different mechanism from the finding's class.
+- Phase budgets dropped work while 51 min of run time went unused.
+- sqlmap sent half the traffic.
+- Compared with a Strix run on the same app (30 findings), r11 found 8, partly found 4,
+  sent requests for 9 without proving them, and never sent 9.
+
+Sources (main checkout): `.test-work/juice-shop-24h-20261117-r11/r11-postmortem.md` and
+`strix-comparison.md`. Run numbers are **SUPPORTED**: they come from that run's store,
+network.jsonl and acceptance-analysis.json. Code references are **VERIFIED** at `0fb8cd5a`.
+
+**Order:** R11-1 → R11-2 → R11-8 (a) → R11-3 → R11-4 → R11-5 → R11-6 → R11-8 (c). R11-7 and
+R11-8 (b) wait for the owner. R11-1 and R11-2 change what a run reports, so they come before
+the next measured run.
+
+Non-negotiables apply:
+- New behaviour ships OFF where it adds traffic.
+- Each item needs a caller-level test and a negative control.
+- `full` must be green before close.
+- Nothing may be specific to Juice Shop.
+
+### [x] R11-1 — A confirmation counts only for the class whose mechanism it proves  ★
+- **Done (2026-11-18, branch `fix/r11-1-confirm-class`):**
+  - `Validator.claims_class` checks the class only. By default it is `applies`. It is
+    overridden where `applies` also routes by shape: well_known (path), api_security
+    (response evidence), open_redirect (redirect params), xxe (XML body), path_traversal
+    (file-shaped exchange) and jwt_forge (JWT present; a bare "token" label counts only
+    when it names no other canonical class).
+  - `ValidationResult.mechanism_classes` lists the classes a result proves.
+    `ValidationResult.observation` marks a result as an observation.
+  - The exposure oracle proves data exposure, and also `idor` when the secret belongs to
+    another account (so the r7 BOLA path still confirms). The .well-known probe returns
+    a `security_txt` or `csaf` observation.
+  - In `_validate_findings`, `proves_finding_class` gates every confirmed result.
+    - On a mismatch, the routed finding is recorded as `skipped` and its own verdict is
+      left open.
+    - The proof is filed once per (validator, class, proof) per run, as a confirmed
+      finding of the proved class, in a report appended to `reports`.
+      `plan_dispatch` keeps that report with the caller's.
+    - An observation never confirms a canonical vulnerability class; `recon` is the
+      one exception.
+  - Tests: `harness/test_r11_confirm_class.py` runs the real dispatch and the plan path
+    against owned loopback services. It covers both acceptance cases, both controls,
+    another account's secret still proving a BOLA, and defect injection with the gate
+    off.
+- **Audit (c), left as is:**
+  - The graph loop `_confirm` (`orchestrator_chain.py`) routes by class substring by
+    construction.
+  - The coverage drive (`_bind_stored`) is already pre-filtered by
+    `bind_confirmation_proof`, which matches on the proof's class.
+  - The class-extension legs keep `applies` as their claim: idor_read and cross_identity
+    (access-control markers), the listing/filter/metrics/sensitive-file matchers, and
+    write_integrity `_kind_of`. They route by class already.
+  - Duck-typed validators without `claims_class` also keep `applies` as their claim.
+  - The agent-fallback route is still bound by `_fallback_result_binds`, the existing
+    guard, and is unchanged.
+- **Follow-ups, fixed in the second commit:**
+  - The iterative review path (`_review_iterative_findings`) now adds the finding filed
+    apart to the held list that `pivot_memory.integrate` persists. The finding is stored
+    with its proof.
+  - jwt_forge `claims_class` declines any canonical class other than jwt and auth, so
+    reset-token findings are no longer claimed. `applies` is unchanged, so the leg still
+    runs. A forgery filed apart is named `jwt` (`Validator.mechanism_class`).
+- **Left for R11-2:** free-text labels that resolve to no canonical class (for example
+  "password reset token") are still claimed through the "token" substring.
+- **Domain:** Confirmation correctness · **Effort:** M · **Mode:** LOOP (offline).
+- **Evidence (VERIFIED):**
+  - `WellKnownValidator.applies` (`harness/validators/exposure_leads.py:1117-1122`) accepts any
+    finding on a `/.well-known/` path, whatever its class.
+  - When security.txt or CSAF metadata is published, that validator returns `confirmed=True`,
+    severity info, "Observation (not a vulnerability)" (`:1177-1180`).
+  - `APISecurityValidator.applies` (`harness/validators/api_security_validator.py:529-532`)
+    accepts any finding whose captured response holds an allowlisted secret field.
+    `validate` then runs `_probe_exposure` for that finding (`:568-569`).
+  - `shape_precondition_legs` (`harness/orchestrator_helpers.py:556-560`) opens sqli,
+    command_injection, ssti and xss legs on every exchange with an injectable parameter.
+    Most wrong-class rows start there.
+- **Evidence (SUPPORTED, r11):**
+  - 26 confirmed records rest on well_known_validator proofs. 21 of them are jwt, sqli,
+    command_injection, ssti, xss or idor findings on `/.well-known/*`.
+  - 16 records on `/rest/2fa/status` of classes other than data exposure (jwt, sqli,
+    command_injection, ssti, xss, idor) rest on api_security's password-digest-in-JWT
+    exposure proof.
+  - Together they are 15 of the 117 unique groups.
+- **Problem:** a published security.txt or a leaked digest is reported as a confirmed SQL
+  injection, XSS or JWT forgery. That breaks the one-proof-per-vulnerability rule and inflates
+  every count.
+- **Recommendation:**
+  - (a) A confirmed result sets `confirmed` only when the validator's mechanism matches the
+    finding's canonical class (`issues.issue_class`). Otherwise, record the result as a
+    finding of the validator's own class; the routed finding keeps its own verdict.
+  - (b) An observation result (severity info, "not a vulnerability") never confirms a
+    vulnerability-class finding.
+  - (c) Audit every `applies` that routes by path or evidence and ignores the class.
+- **Acceptance criteria:** caller-level tests through the real dispatch.
+  - An sqli finding on `/.well-known/security.txt`, with security.txt published, gives no
+    confirmed sqli and one well_known observation.
+  - An xss finding on a route whose response carries a password digest gives one confirmed
+    exposure finding and no confirmed xss.
+  - Negative controls: a genuine data-exposure finding on that route still confirms; a
+    well_known finding still gets its observation.
+
+### [ ] R11-2 — Normalise class names before grouping issues
+- **Domain:** Issue accounting · **Effort:** S · **Mode:** LOOP (offline).
+- **Evidence (VERIFIED):** `issue_class` (`harness/issues.py:584-590`) falls back to the raw
+  lowercased label. `exposed_metrics_endpoint`, `exposed metrics endpoint` and
+  `exposed_public_metrics_endpoint` give three classes. `potential_idor` stays apart from
+  `idor` (other IDOR spellings already map to `idor`).
+- **Evidence (SUPPORTED, r11):** the metrics exposure appears as several unique
+  vulnerabilities, and CSP has 135 raw records.
+- **Recommendation:**
+  - Fold separators and case before lookup.
+  - Map agent label variants of existing capabilities (metrics_exposure, idor leads) in
+    `categories.py` synonyms.
+  - Keep a `potential_`/lead prefix as a lead flag, not a class.
+  - The stored fingerprint keeps `legacy_canonicalize`, so suppressions stay valid.
+- **Acceptance criteria:**
+  - The three metrics spellings on one route group into one issue.
+  - Negative control: two different unknown classes on one route stay two issues.
+  - `test_issue_*`/report tests are unchanged.
+
+### [ ] R11-3 — Keep sqlmap off transport endpoints and cap its time per endpoint
+- **Domain:** Scheduling / cost · **Effort:** M · **Mode:** LOOP (offline); efficacy OWNER/LIVE.
+- **Evidence (SUPPORTED, r11):**
+  - sqlmap sent 52% of target requests (115,137 gate authorisations; r10 51%).
+  - It spent about 2 h (2026-11-17, about 14-16 UTC) on socket.io long-polling, the captcha
+    routes and `/api/Challenges`, with no model calls in that window. This is probably the
+    same pattern as open work's r10 leftover (about 10k/h to socket.io polling); r10's data
+    was not rechecked.
+  - 1,950 sqlmap targets were refused as `ambiguous target path`
+    (`harness/target_request_policy.py:97`, VERIFIED).
+- **Recommendation:**
+  - Recognise a long-polling transport by its response framing (Engine.IO/SockJS frames), not
+    by app name, and skip its transport parameters.
+  - Give sqlmap a per-endpoint-family time share, like the coverage drive's
+    `endpoint_check_time_share` (`harness/orchestrator_chain.py:2985-2997`). Report the
+    replays it holds back.
+- **Acceptance criteria:**
+  - On a fixture with an Engine.IO polling route and a search route, sqlmap is queued for the
+    search route only.
+  - Past its share, sqlmap's next target is reported as held, not silently dropped.
+  - Negative control: a parameter named `t` on a non-transport route still gets sqlmap.
+
+### [ ] R11-4 — Hand unused phase time to skipped work before the job ends
+- **Domain:** Scheduling · **Effort:** M · **Mode:** LOOP (offline).
+- **Evidence (SUPPORTED, r11):**
+  - The job ended 51 min before its soft-cancel deadline.
+  - It left 104 worklist nodes not investigated (plus 176 budget-exhausted skips) and 283
+    coverage-drive legs not attempted.
+  - 47 replays were held by `endpoint_check_time_share`.
+  - Yield was front-loaded: 160 confirmed in hour 22 UTC, about 1/h from 02 to 08 UTC.
+  - The run manifest's `phase_timings` was empty.
+- **Recommendation:**
+  - A phase that finishes under budget passes its remainder on.
+  - With time left before the deadline, run one final pass over budget-skipped worklist nodes,
+    drive legs and held replays, in priority order.
+  - Record each phase's start, end and budget in `phase_timings`.
+- **Acceptance criteria:** a caller-level test with a fake clock.
+  - When phase A ends at half its budget, phase B gets the rest.
+  - Skipped nodes are run before the job finishes when time remains.
+  - `phase_timings` is filled.
+  - Negative control: no extra pass starts after the soft-cancel deadline.
+
+### [ ] R11-5 — Find why thousands of successful writes produced no write verdict
+- **Domain:** Authorization / write checks · **Effort:** M · **Depends on:** HU-1 for intent
+  on non-owned objects · **Mode:** LOOP (offline investigation from the r11 store, then a fix).
+- **Evidence (SUPPORTED, r11, `strix_compare.py`):**
+  - `PUT /api/Products/{n}`: 2,005 sent, 1,985 2xx, 0 confirmed.
+  - `PUT /api/Addresss/{n}`: 936 sent, 0 confirmed.
+  - `POST /api/Users`: 1,723 sent, candidates only.
+  - 13 cross-user write checks were skipped with no restorable field or no owner session.
+  - Strix proved a product tamper and a cross-user address write on the same app.
+  - HU-1 records the same r6 pattern (1,489 regular-user product PUTs returned 200).
+- **Recommendation:**
+  - Trace from the r11 store which leg sent those writes and why none reached a
+    write_integrity read-back verdict (missing owner, catalog object with no declared
+    intent, or a restore rule).
+  - Fix the generic cause: after a successful write, read the object back as its owner or
+    as admin. A changed object on an `authz.protected_paths` or `authz.owners` route
+    confirms; otherwise it is a labelled LEAD.
+  - Restore rules stay as in docs/WRITE_CHECKS.md.
+- **Acceptance criteria:** on a loopback app with one unchecked owner-only PUT and one
+  checked one:
+  - the anonymous write and read-back confirm only the unchecked PUT;
+  - the restore is verified.
+  - Negative control: a 200 that changes nothing gives `not_confirmed`.
+
+### [ ] R11-6 — Map captured principals to identities and build mass-assignment bodies
+- **Domain:** Identity / coverage · **Effort:** M · **Mode:** LOOP (offline).
+- **Evidence (SUPPORTED, r11 terminal reasons):**
+  - 560 cells ended `missing_principal` and 453 `unreachable_identity`.
+  - 31 api_security plans were skipped with "The captured GET's principal is not a
+    registered session" (`api_security_validator.py:682`, VERIFIED).
+  - 38 mass-assignment plans were skipped with no JSON write body to mutate.
+- **Recommendation:**
+  - Register a capture's principal as an identity when its session token is one the run
+    itself issued (sign-in or crawl).
+  - When no captured write body exists, build the mass-assignment body from the endpoint's
+    observed read representation. Settable fields only, under the same restore rules.
+- **Acceptance criteria:**
+  - A capture that carries a run-issued token reaches the api_security leg.
+  - A write endpoint seen only through its GET gets a mass-assignment leg.
+  - Negative controls: a foreign token stays unregistered; a read-only field is never sent.
+
+### [ ] R11-7 — Multi-step business flows (checkout, coupons, wallet, 2FA)  [NEEDS OWNER DECISION — write scope]
+- **Domain:** Workflow misuse · **Mode:** design LOOP after the owner decides; live OWNER/LIVE.
+- **Evidence (SUPPORTED):** r11 never sent checkout, coupon, 2FA-disable or deluxe-membership
+  flows to completion, while Strix confirmed 8 findings there:
+  - fake payment, race and wallet settlement (#21, #25, #26);
+  - coupon forge, expired coupon and cross-user coupon (#23, #24, #30);
+  - 2FA disable (#29);
+  - deluxe membership (#22).
+- **Note:** this is HU-4's scope with live evidence. The flows create orders and move wallet
+  balance, so the owner must first decide which state-creating steps a run may take and how
+  it restores them. Track it under HU-4; this entry holds the evidence.
+
+### [ ] R11-8 — Detection gaps behind Strix findings r11 sent requests for but never reported
+- **Domain:** Detection · **Effort:** M per sub-item · **Mode:** LOOP (offline); (b) and (c)
+  change confirmation policy, so they need OWNER sign-off.
+- **(a) The leg mutated the wrong inputs (Strix #3, NoSQL operator injection on a review
+  PATCH).**
+  - Evidence (SUPPORTED, r11 proofs): the nosql leg ran on `PATCH /rest/products/reviews`
+    and the review POST/PUT 9 times. Every time it put operators in inputs named `name` and
+    `value`, which "behaved like plain strings". It never mutated the request's own `id`
+    field, which is what Strix exploited.
+  - The leg does support JSON-body operators (`harness/validators/nosql_validator.py:9-23`,
+    VERIFIED). Fix: trace where `name`/`value` come from (a form template is suspected)
+    and use the captured body's own fields.
+  - Also, `shape_precondition_legs` opens a nosql leg only for a login candidate
+    (`orchestrator_helpers.py:569-570`, VERIFIED). JSON write bodies get one only when an
+    agent labels them.
+- **(b) The leg saw the evidence but by design only records an observation (Strix #17, #16).**
+  - rate_limit sent rapid POSTs to `/rest/user/login`, saw no throttle, and recorded
+    "OBSERVATION (not confirmed)". A valid-login burst cannot prove there is no lockout on
+    failed logins (`rate_limit_validator.py:16-18`, `:167`, VERIFIED).
+  - auth_sequence (SESS-06) recorded "Logout invalidation lead": the bearer JWT has no `exp`
+    claim.
+  - Owner question: may a missing `exp` on a session JWT confirm as a finding of its own?
+  - A token that survives a password change has no leg. It would need a password change and
+    a restore, so it is a write.
+- **(c) No leg exists (Strix #27, #15).**
+  - A challenge endpoint that returns its own answer: 4,581 captcha requests in r11, never
+    flagged. Generic oracle: a value from one response that a later request must echo to
+    pass the challenge.
+  - Account enumeration through a recovery lookup: an endpoint that returns a security
+    question for known accounts and an error for unknown ones. The username_enumeration leg
+    compares only login and reset responses.
+  - Unlimited guessing of reset answers: rate_limit hit the reset *page* (GET), never the
+    reset POST.
+- **Acceptance criteria (per sub-item):**
+  - A loopback fixture positive and a matched negative through the real dispatch: a JSON
+    `id` operator that widens a match versus one that is cast to a string; a challenge
+    that echoes its answer versus one that doesn't; a lookup that discriminates accounts
+    versus one that doesn't.
+  - Policy changes in (b) ship only after the owner decides.
+
+**Considered, not filed:**
+- Exploitation depth (UNION dumps, hash cracking, takeover chains) goes past proving a
+  vulnerability, and conflicts with passive defaults and one proof per vulnerability.
+- DELETE legs (Strix #8, #9) are held by owner policy.
+- `/support/logs` (Strix #20) is linked nowhere (crawl check). It is a wordlist question,
+  not a missing leg.

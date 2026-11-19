@@ -137,6 +137,11 @@ class PathTraversalValidator(Validator):
             return False
         return bool(_file_shaped(exchange)) or _fileish_segment(exchange.url)
 
+    def claims_class(self, finding: Finding, exchange: HttpExchange | None = None) -> bool:
+        """R11-1: applies() also routes by a file-shaped exchange; a confirmation proves
+        this validator's class only for a finding of that class."""
+        return Validator.applies(self, finding, exchange)
+
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "path_traversal", summary=why)
 

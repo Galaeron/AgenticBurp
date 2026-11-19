@@ -1,7 +1,7 @@
-# Current state — 2026-11-16 (earlier runs and merges: git history of this file)
+# Current state — 2026-11-18 (earlier runs and merges: git history of this file)
 
 ## Branch and base
-- `main` = `port/wstg-ids-2026-11-14` on `integrate/main-2026-11-14` (base `979803d5`).
+- `main` = `0fb8cd5a`: PR #30 merged 2026-11-17 onto `port/wstg-ids-2026-11-14` (`1f632169`, base `979803d5`).
   It holds the r7-r10 chain up to run/r10 `8727c42d` (llama.cpp backend, r9 fixes), the r10
   gap fixes (Ollama retry of a dropped connection, review while the model is idle,
   open-redirect allowlist bypass, JWT key-confusion key reuse, write-path checks, exposure
@@ -16,8 +16,8 @@
   `write_integrity` needs `validators.active_enabled` and `allow_mutating_replay` (both false;
   docs/WRITE_CHECKS.md); route probes, file uploads and discovery recursion are off.
 - SKL-1 race: a generic burst is a lead; only the email race read-back confirms.
-- PR #30 (`fix/oracle-leg-gaps-20261114` off main `1f632169`), merged only after its CI full
-  suite passed. It holds the leg fixes from the oracle run (nosql, file_upload, xxe, race,
+- PR #30 (`fix/oracle-leg-gaps-20261114` off `1f632169`) was merged after its CI full suite
+  passed. It holds the leg fixes from the oracle run (nosql, file_upload, xxe, race,
   auth_sequence, listing logs, idor, api_security, sequence, client_trust, write_integrity;
   docs/WRITE_CHECKS.md) and tests `test_oracle_gaps_*.py`. Four branches were merged into it:
   - write safety (`de2207f8`, `c0e70ac2`): file_upload sends through the run's gate; a
@@ -61,9 +61,12 @@
 - `ollama.api: "openai"` sends model calls to llama-server (OpenAI-compatible) at `base_url`.
 
 ## Live runs (owned Juice Shop on 127.0.0.1:3002 only; sqlmap only from `harness/sqlmap:1.10.9`)
-- r10 (job 9eb242afd5a0, `8727c42d`, gpt-oss-20b, :3004): 23.1 h, 236,966 requests, 138 of
-  1,181 findings confirmed, 912 legs unrun at budget; 13/116 solved; no XSS confirmed.
-  Files (main checkout): `.test-work/juice-shop-24h-20261111-r10/`, `-20h-20261110-r9/`.
+- r11 (job d157da1bd9fd on `0fb8cd5a`, gpt-oss-20b, :3002, 2026-11-17/18):
+  - 23.1 h, 282,316 requests, 5,242 model calls (19.9 M tokens).
+  - 377 of 1,154 findings proof-bound confirmed; 117 unique, about 16-18 by root cause.
+  - r10 (`8727c42d`, :3004) had 138 of 1,181 and 36 unique; 13/116 solved.
+  - Files (main checkout): `.test-work/juice-shop-24h-20261117-r11/` (`r11-postmortem.md`,
+    `strix-comparison.md`), `-20261111-r10/`, `-20h-20261110-r9/`.
 - 2026-11-14, fresh :3002, main checkout `.test-work/`: validator trial (each new leg alone,
   `validator-trial-20261114/`) 13 confirmed, race a lead, restores verified. Oracle run (each
   leg aimed at its endpoint by hand): 6db01d2d 22 of 60 confirmed, 20 of 98 solved (r10: 13);
@@ -83,10 +86,13 @@
    needs an owner decision, WG-5 needs a mail sink (IMPROVEMENT_BACKLOG.md WG-*). WG-2 item 5
    is done: client_trust, websocket and oauth are drive legs; crypto, recon, cache poisoning
    and subdomain_takeover stay undriven (reasons in `UNDRIVEN_ROW_CONFIRMATIONS`).
-2. A full Juice Shop run on the merge (the legs passed alone; JWT captured-key confusion,
-   file_upload, SPA crawl, the WG auth rows and SESS-06 were not exercised). r10
-   leftovers: compare result.json with r9; find the check that sent ~10k/h to
-   socket.io polling at h4-5; cross_identity still repeats across findings.
+2. r11 post-mortem items, IMPROVEMENT_BACKLOG.md R11-1 to R11-8:
+   - wrong-class confirmations (R11-1, first) and class-name grouping;
+   - sqlmap on transport routes, likely also r10's socket.io leftover;
+   - phase budgets that left 51 min unused, and writes with no verdict;
+   - identity mapping, business flows (owner), and detection gaps found against Strix.
+   r11 did not cover an oauth flow (none in scope). The solved count needs the scorer.
+   Not rechecked in r11: r10's cross_identity repeats across findings.
 3. Owner review of `8040dbf5` (policy reads a decoded NUL both ways, on main).
 4. r6 follow-ups (coverage-drive time, end-of-job accounting, passive proofs with artifact
    ids; briefs T1-T6 in `.test-work/r5-r6-detection-analysis-20261109/ANALYSIS.md`) and review
