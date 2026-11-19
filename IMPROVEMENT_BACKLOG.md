@@ -5388,6 +5388,19 @@ Non-negotiables apply:
     (`orchestrator_helpers.py:569-570`, VERIFIED). JSON write bodies get one only when an
     agent labels them.
 - **(b) The leg saw the evidence but by design only records an observation (Strix #17, #16).**
+  (DONE 865a1f2b + 2029f7ef expiry, ddd8aade failed-login burst, 2599eeb9 password change.)
+  - Token expiry: a session JWT with no `exp` (captured login, request or run identity)
+    confirms as `session_expiry` on WSTG-SESS-07, decode only; no JWT, no case.
+  - Failed-login burst: for a run identity with a declared login (`role.login`, now kept by
+    `SessionManager.set_login`), rate_limit sends `min_attempts` wrong passwords under
+    `max_burst_size`, then the real login. Still accepted, no throttle: confirms. Refused:
+    not vulnerable, and the identity is named as left locked. Needs max_burst_size >=
+    min_attempts (12) to confirm; fewer is a lead.
+  - Password change: new leg `password_change_session` (AV-PWCHANGE-01,
+    `session_after_password_change`) changes and restores a run identity's password through
+    the captured change flow. Needs `allow_mutating_replay` and
+    `mutating_ceiling_by_check.password_change_session >= 2`; off by default. A failed
+    restore is named in the verdict.
   - rate_limit sent rapid POSTs to `/rest/user/login`, saw no throttle, and recorded
     "OBSERVATION (not confirmed)". A valid-login burst cannot prove there is no lockout on
     failed logins (`rate_limit_validator.py:16-18`, `:167`, VERIFIED).
@@ -5399,8 +5412,9 @@ Non-negotiables apply:
     change plus restore may test whether the old token survives.
   - A token that survives a password change has no leg. It would need a password change and
     a restore, so it is a write.
-- **(c) No leg exists (Strix #27, #15).** (DONE 8723e21b, leads until owner sign-off.
-  Owner decision 2026-11-19: confirm by default; challenge_echo `active_submit` stays off.)
+- **(c) No leg exists (Strix #27, #15).** (DONE 8723e21b. Owner decision 2026-11-19:
+  confirm by default, flipped in 62099c10 (config, registry fallbacks, constructors);
+  challenge_echo `active_submit` stays off.)
   - A challenge endpoint that returns its own answer: 4,581 captcha requests in r11, never
     flagged. Generic oracle: a value from one response that a later request must echo to
     pass the challenge.
