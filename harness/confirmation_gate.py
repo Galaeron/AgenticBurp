@@ -200,6 +200,9 @@ CONFIRMABLE_CLASS_MARKERS = frozenset({
     "business_rule_tamper", "mass_assignment_create", "create_validation",
     "write integrity", "cross identity write", "forged authorship",
     "business rule tamper", "mass assignment create", "create validation",
+    # Business flows (business_flow_validator -- replayed flow, read back, restored)
+    "payment_tamper", "coupon_misuse", "mfa_disable_stepup",
+    "payment tamper", "coupon misuse", "mfa disable stepup",
 })
 
 # The subset of confirmable classes whose leg is LIVE-VERIFIED -- proven to
@@ -286,6 +289,9 @@ PROVISIONAL_MARKERS = frozenset({
     "business_rule_tamper", "mass_assignment_create", "create_validation",
     "write integrity", "cross identity write", "forged authorship",
     "business rule tamper", "mass assignment create", "create validation",
+    # business flows: fixture-verified only
+    "payment_tamper", "coupon_misuse", "mfa_disable_stepup",
+    "payment tamper", "coupon misuse", "mfa disable stepup",
 })
 
 

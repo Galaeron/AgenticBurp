@@ -236,6 +236,10 @@ _DEDUP_SYNONYMS: dict[str, str] = {
     "create_validation": "business_logic", "create validation": "business_logic",
     "mass_assignment_create": "api_security", "mass assignment create": "api_security",
     "write_integrity": "business_logic", "write integrity": "business_logic",
+    # business_flow_validator's classes (R11-7: multi-step flows on run-owned accounts).
+    "payment_tamper": "business_logic", "payment tamper": "business_logic",
+    "coupon_misuse": "business_logic", "coupon misuse": "business_logic",
+    "mfa_disable_stepup": "business_logic", "mfa disable stepup": "business_logic",
 }
 
 

@@ -354,6 +354,19 @@ class ValidatorRegistry:
             self.validators["write_integrity"] = WriteIntegrityValidator(
                 allowed_hosts=_allowed, restore_routes=wi_cfg.get("restore_routes") or (),
                 allow_writes=parse_validators_flags(cfg)["allow_mutating_replay"])
+        # R11-7 business flows -- checkout tamper, coupon misuse, 2FA disable without
+        # step-up, replayed from the run's own captured flow on run-owned identities.
+        # Sends nothing unless allow_mutating_replay, active_enabled and an explicit
+        # mutating_ceiling_by_check.business_flow entry are all set.
+        bf_cfg = cfg.get("business_flow", {}) or {}
+        if bf_cfg.get("enabled", True):
+            from harness.config_schema import parse_validators_flags
+            from .business_flow_validator import BusinessFlowValidator
+            self.validators["business_flow"] = BusinessFlowValidator(
+                allowed_hosts=_allowed, read_backs=bf_cfg.get("read_backs") or (),
+                coupons=bf_cfg.get("coupons") or {},
+                mfa_status_reads=bf_cfg.get("mfa_status_reads") or (),
+                allow_writes=parse_validators_flags(cfg)["allow_mutating_replay"])
 
         # DOM-based XSS leg -- drives a real browser with the payload in the URL
         # FRAGMENT (never sent to the server), so execution proves a client-side
@@ -715,6 +728,22 @@ class ValidatorRegistry:
                 return decision("policy_denied", "mutating_policy_denied",
                                 "client-trust tampers require explicit mutating replay permission")
             mechanism = "client_trust.tamper"
+        if family == "business_flow":
+            from .business_flow_validator import kind_for
+            if method not in {"POST", "PUT", "PATCH"}:
+                return decision("unsupported", "unsupported_method",
+                                "a business flow replays a captured POST/PUT/PATCH write")
+            if kind_for(finding_class, exchange) is None:
+                return decision("unsupported", "no_flow_shape",
+                                "the capture has no checkout, coupon or 2FA-disable shape for this check")
+            gate = run_context.gate.config if run_context is not None else None
+            if gate is None or not gate.allow_mutating_replay:
+                return decision("policy_denied", "mutating_policy_denied",
+                                "business flows require explicit mutating replay permission")
+            if "business_flow" not in (gate.mutating_ceiling_by_check or {}):
+                return decision("policy_denied", "mutating_ceiling_missing",
+                                "business flows need an explicit mutating_ceiling_by_check.business_flow")
+            mechanism = "business_flow." + kind_for(finding_class, exchange)
         if family == "websocket":
             # Cross-site hijacking rides the cookie a browser attaches on its own;
             # a long-poll capture is not a WebSocket handshake.

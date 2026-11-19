@@ -584,6 +584,18 @@ _CLIENT_VALUE_FIELD = re.compile(
     r"price|amount|total|cost|discount|quantity|qty|subtotal|fee|balance")
 _CLIENT_VALUE_PATH = ("cart", "checkout", "basket", "order", "payment", "purchase")
 
+def _flow_shape(kind: str):
+    """A predicate: the endpoint's captured write has the business-flow shape `kind`."""
+    def predicate(endpoint: dict) -> tuple[bool, str]:
+        from harness.validators.business_flow_validator import endpoint_flow_kind
+        got = endpoint_flow_kind(endpoint)
+        if got == kind:
+            return True, f"captured write has the {kind} flow shape"
+        return False, f"no captured write with the {kind} flow shape"
+    predicate.__name__ = f"_flow_shape_{kind}"
+    return predicate
+
+
 def _has_client_value_field(endpoint: dict) -> tuple[bool, str]:
     if not _accepts_body(endpoint)[0]:
         return False, "no body-bearing write to tamper"
@@ -1361,6 +1373,19 @@ CHECK_CATALOG: tuple[Check, ...] = (
           specific_classes=(
               "create_validation", "weak_create_validation", "duplicate_registration",
               "empty_required_fields", "missing_required_field_validation",
+          )),
+    # R11-7 business flows (business_flow_validator): replay the run's own captured
+    # flow on a run-owned identity, read the resulting state back, restore what can be.
+    Check("WSTG-BUSL-10", "Payment functionality (settlement tamper, payment skip)",
+          Phase.ENDPOINT, "payment_tamper", _flow_shape("payment_tamper"), "business_flow",
+          "Replay the captured cart steps and settlement untampered, then with a client-chosen "
+          "amount, quantity or delivery value (or the payment dropped); confirm only when the "
+          "read-back order total or balance shows less was charged than the control.",
+          "Business logic vulnerabilities",
+          specific_classes=(
+              "payment_tamper", "payment tamper", "payment_tampering", "payment tampering",
+              "checkout_tamper", "checkout tampering", "settlement_tamper", "payment_bypass",
+              "payment bypass", "payment_skip", "order_total_tamper", "wallet_payment_skip",
           )),
 )
 

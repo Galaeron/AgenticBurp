@@ -289,6 +289,8 @@ _LEG_CONFIRMATIONS = {
     # WG-2 item 5. Each keeps its own gate: client_trust tampers are writes (readiness
     # needs active_enabled and allow_mutating_replay); websocket and oauth are active.
     "client_trust", "websocket", "oauth",
+    # R11-7: multi-step flows; needs an explicit mutating_ceiling_by_check.business_flow.
+    "business_flow",
 }
 # Catalog confirmation kinds that name a registered validator but are NOT drive legs,
 # each with the reason. Driving one would write a cell verdict its probe does not
