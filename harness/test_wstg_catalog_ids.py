@@ -12,9 +12,9 @@ Pins:
   - negative controls: an id in neither the current list nor the alias table is
     rejected (never silently aliased), and a current WSTG id with no catalog row
     is not mapped onto a neighbouring row;
-  - the requirement manifest still has one requirement per catalog row (64: 38 from
+  - the requirement manifest still has one requirement per catalog row (65: 38 from
     WG-1, the 11 WG-2 rows, WG-3's SESS-06, WG-2's BUSL-08, the 11 internal
-    rows main added before the port, and R11-7's BUSL-10 and AV-BUSL-COUPON-01).
+    rows main added before the port, and R11-7's BUSL-10, BUSL-06 and AV-BUSL-COUPON-01).
 
 A row added later must be added to the hand-checked tables below (WG-2's rows are in
 ADDED_ROWS; internal AV-* rows are in INTERNAL_ROWS).
@@ -111,6 +111,7 @@ ADDED_ROWS: dict[str, tuple[str, str, str]] = {
     "WSTG-BUSL-08": ("Upload of Unexpected File Types", "file_upload", "file_upload"),
     # R11-7: the business-flow legs (checkout tamper / payment skip, 2FA disable).
     "WSTG-BUSL-10": ("Payment Functionality", "payment_tamper", "business_flow"),
+    "WSTG-BUSL-06": ("Circumvention of Work Flows", "mfa_disable_stepup", "business_flow"),
 }
 
 
@@ -373,7 +374,7 @@ class ManifestCountTests(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp(prefix="cov_wg1_count_"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         rep = cm.reconcile(evidence_dir=tmp, run_id="RUN_EMPTY")
-        self.assertEqual(rep["totals"]["requirements"], 64)
+        self.assertEqual(rep["totals"]["requirements"], 65)
         self.assertEqual({r["check_id"] for r in rep["requirements"]}, set(CHECKS_BY_ID))
         for spec in cm.REQUIREMENT_TESTS:
             self.assertIn(spec.check_id, CHECKS_BY_ID)

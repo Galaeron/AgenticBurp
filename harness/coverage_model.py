@@ -1403,6 +1403,17 @@ CHECK_CATALOG: tuple[Check, ...] = (
               "coupon_reuse", "expired_coupon", "voucher_misuse", "promo_code_abuse",
               "discount_code_abuse", "cross_user_coupon",
           )),
+    Check("WSTG-BUSL-06", "Circumvention of work flows (2FA disable without step-up)",
+          Phase.ENDPOINT, "mfa_disable_stepup", _flow_shape("mfa_disable_stepup"), "business_flow",
+          "Replay the captured 2FA-disable request with its password or TOTP field dropped or "
+          "wrong; confirm when the status read-back shows 2FA off, then re-enable it from the "
+          "run's captured enable request or name it as left disabled.",
+          "Authentication vulnerabilities",
+          specific_classes=(
+              "mfa_disable_stepup", "mfa disable stepup", "2fa_disable", "2fa disable",
+              "mfa_disable", "two_factor_disable", "mfa_step_up_bypass",
+              "2fa_disable_without_password",
+          )),
 )
 
 CHECKS_BY_ID: dict[str, Check] = {c.id: c for c in CHECK_CATALOG}

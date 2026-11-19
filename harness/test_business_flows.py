@@ -319,6 +319,44 @@ class CouponMisuseTests(_Fixture):
         self.assertIsNone(self.user()["coupon"])
 
 
+class MfaDisableTests(_Fixture):
+    def flow(self, *, enable=True):
+        o = self.origin
+        caps = [_cap(o, "GET", "/api/2fa/status", answer={"setup": True}),
+                _cap(o, "POST", "/api/2fa/disable", body={"password": "pw-a"})]
+        if enable:
+            caps.insert(1, _cap(o, "POST", "/api/2fa/setup",
+                                body={"password": "pw-a", "setupToken": "t"}))
+        return caps
+
+    async def test_disable_without_password_confirmed_and_reenabled(self):
+        self.server.modes.add("no_stepup")
+        result, run = await self.dispatch("mfa_disable_stepup", "POST", "/api/2fa/disable",
+                                          {"password": "pw-a"}, captured=self.flow())
+        self.assertEqual(result.status, "confirmed", result.summary)
+        self.assertEqual(result.mechanism_classes, ("mfa_disable_stepup",))
+        self.assertIn("re-enabled", result.summary)
+        self.assertTrue(self.user()["mfa"])
+        self.assertFalse(run.change_log.failed_restores())
+
+    async def test_unrestorable_disable_is_named(self):
+        self.server.modes.add("no_stepup")
+        result, run = await self.dispatch("mfa_disable_stepup", "POST", "/api/2fa/disable",
+                                          {"password": "pw-a"}, captured=self.flow(enable=False))
+        self.assertEqual(result.status, "confirmed", result.summary)
+        self.assertIn("2FA LEFT DISABLED", result.summary)
+        self.assertIn("alice", result.summary)
+        self.assertFalse(self.user()["mfa"])
+        self.assertTrue(run.change_log.failed_restores(), "the residue was not in the change log")
+
+    async def test_step_up_required_holds(self):
+        result, _run = await self.dispatch("mfa_disable_stepup", "POST", "/api/2fa/disable",
+                                           {"password": "pw-a"}, captured=self.flow())
+        self.assertEqual(result.status, "not_confirmed", result.summary)
+        self.assertTrue(self.user()["mfa"])
+        self.assertEqual(len(self.writes()), 2, "dropped and wrong step-up, no re-enable needed")
+
+
 class DefaultsSendNothingTests(_Fixture):
     async def test_committed_config_sends_nothing(self):
         cfg = yaml.safe_load((Path(__file__).parent / "config.yaml").read_text(encoding="utf-8"))
