@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
@@ -698,6 +699,15 @@ class Check:
     # WG-2 (3): the class the coverage driver hands the leg. Empty = vulnerability_class.
     # Lets a shared-class row route to its own sub-check (e.g. auth_sequence's enum leg).
     leg_class: str = ""
+    # R11-10: True when the check's verdict on an endpoint does not depend on who
+    # sends the request (injection, error handling, client policy headers ...). Then
+    # one identity's run of the check on an endpoint stands for every identity's
+    # cell there, and an identity with no capture of that endpoint is not a gap
+    # (CoverageTracker.credit_caller_independent). False (the default) keeps the cell
+    # identity-bound: access control, sessions, authentication, exposure, and any
+    # row where the caller's account or privilege can change the verdict. Set in
+    # one place, `_CALLER_INDEPENDENT_CHECKS` below the catalog.
+    caller_independent: bool = False
 
     def applies(self, endpoint: dict) -> tuple[bool, str]:
         """Deterministic applicability + the rationale for WHY it applies or doesn't.
@@ -1444,6 +1454,35 @@ CHECK_CATALOG: tuple[Check, ...] = (
               "2fa_disable_without_password",
           )),
 )
+
+# R11-10: rows whose verdict does not depend on the caller (Check.caller_independent).
+# Every row NOT named here is identity-bound. Kept out on purpose, though the
+# leg may look caller-blind:
+# - every WSTG-ATHZ / ATHN / SESS row, AV-EXPOSURE-* and AV-WRITE-XID / AUTHOR
+#   (owner's list: the verdict is about who may do it);
+# - WSTG-INJT-20 and AV-MASSASSIGN-02: whether a privileged field may be set
+#   depends on the caller's privilege (an admin may set it);
+# - WSTG-INJT-03 (verb tampering): tests an access-control bypass;
+# - WSTG-CLNT-10 (WebSockets): cross-site hijacking rides the caller's session;
+# - WSTG-BUSL-05, BUSL-06, BUSL-10, AV-BUSL-COUPON-01: limits, step-up and
+#   payment rules are often per account;
+# - manual rows (WSTG-CONF-09, WSTG-BUSL-09): no leg runs them.
+_CALLER_INDEPENDENT_CHECKS = frozenset({
+    # Transport, policy headers and server configuration.
+    "WSTG-CRYP-01", "WSTG-CONF-07", "WSTG-CONF-12", "WSTG-CLNT-07", "WSTG-INFO-02",
+    "WSTG-INFO-05", "WSTG-CONF-06", "WSTG-CONF-14", "WSTG-CLNT-09", "WSTG-CONF-10",
+    "AV-WELLKNOWN-01", "WSTG-ERRH-01", "AV-FILTER-01",
+    # Injection and request handling.
+    "WSTG-INJT-16", "WSTG-INJT-15", "WSTG-INJT-17", "WSTG-CONF-13", "WSTG-INJT-05",
+    "WSTG-INJT-01", "WSTG-INJT-02", "WSTG-CLNT-01", "WSTG-INJT-12", "WSTG-INJT-18",
+    "WSTG-INJT-07", "WSTG-INJT-19", "WSTG-CLNT-04", "WSTG-INJT-05.6", "WSTG-INJT-23",
+    # Input handling that is the same for any caller.
+    "WSTG-IDNT-04", "WSTG-BUSL-08", "WSTG-BUSL-02", "AV-WRITE-BIZ-01",
+    "AV-WRITE-VALID-01",
+})
+CHECK_CATALOG = tuple(
+    dataclasses.replace(c, caller_independent=True) if c.id in _CALLER_INDEPENDENT_CHECKS else c
+    for c in CHECK_CATALOG)
 
 CHECKS_BY_ID: dict[str, Check] = {c.id: c for c in CHECK_CATALOG}
 

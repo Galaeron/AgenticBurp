@@ -2929,6 +2929,22 @@ class ChainMixin:
                 _endpoint_check_capped: dict = {}
                 _PER_IDENTITY_SHARE = frozenset({"cross_identity", "idor_read"})
 
+                def _capture_peer(ep_key, identity, check):
+                    """R11-10: for a check whose verdict does not depend on the caller,
+                    another identity that holds a replayable capture of the endpoint
+                    runs it for every identity; nothing is sent as this one. None for
+                    an identity-bound check: that cell stays missing_principal."""
+                    if not getattr(check, "caller_independent", False):
+                        return None
+                    return next((other for other in sorted(_role_headers)
+                                 if other != identity and _replayable.get((ep_key, other))),
+                                None)
+
+                def _covered_elsewhere(peer):
+                    return {"status": "needs_prerequisite", "reason_code": "covered_by_identity",
+                            "covered_by": peer, "finding_class": None,
+                            "reason": f"{peer} holds the capture and runs this caller-independent check"}
+
                 def _captured_readiness(identity, method, path, check):
                     if check.id == "WSTG-CRYP-01":
                         return _capability_decision(check, HttpExchange(url=base_url, method="GET"))
@@ -2942,6 +2958,9 @@ class ChainMixin:
                         if variants is None:
                             variants = replayable_variants(ep, capture_identity_key(_role_headers.get(identity, {})))
                         if not variants:
+                            peer = _capture_peer(ep_key, identity, check)
+                            if peer is not None:
+                                return _covered_elsewhere(peer)
                             role = _identity_role.get(identity, identity)
                             block = _prerequisite_blocks.setdefault((ep_key, identity), {
                                 "endpoint": ep_key, "identity": identity,
@@ -2985,6 +3004,13 @@ class ChainMixin:
                         variants = replayable_variants(
                             ep, capture_identity_key(_role_headers.get(identity, {})))
                     if not variants:
+                        peer = _capture_peer(ep_key, identity, check)
+                        if peer is not None:
+                            # R11-10: nothing is sent as this identity; the tracker
+                            # credits the cell to the peer's verdict.
+                            return _VR(check.confirmation, "inconclusive", check.vulnerability_class,
+                                       summary=f"covered_by_identity:{peer}: {peer} holds the "
+                                               "capture and runs this caller-independent check")
                         # The cell's reason stays "missing_principal"; the pair is
                         # reported once, with how many checks it blocked.
                         role = _identity_role.get(identity, identity)

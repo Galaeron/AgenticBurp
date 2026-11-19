@@ -5548,7 +5548,7 @@ Non-negotiables apply:
     >= 2` (the write plus its restore) and `allow_mutating_replay`. Both stay off by default,
     so r12 sends nothing new until the owner sets them.
 
-### [ ] R11-10 — Stop counting an identity's missing capture as a coverage gap for identity-independent checks
+### [~] R11-10 — Stop counting an identity's missing capture as a coverage gap for identity-independent checks
 - **Domain:** Coverage accounting · **Effort:** M · **Mode:** LOOP (offline), with an owner
   decision on the identity-bound half. Filed by R11-9.
 - **Evidence (VERIFIED, r11 `result.json` coverage checkpoint, read-only):**
@@ -5593,3 +5593,40 @@ Non-negotiables apply:
     owner approves replaying with substituted credentials.
   - The r11 checkpoint replayed through the new accounting leaves at most the 197
     identity-bound cells.
+- **Offline half (VERIFIED offline, 2026-11-19, branch `claude/r11-10-coverage-credit-611952`):**
+  - The split is in the catalog: `Check.caller_independent` (default False), set on the
+    rows named in `coverage_model._CALLER_INDEPENDENT_CHECKS`.
+  - `CoverageTracker.credit_caller_independent` runs in every `report()`. A cell of an
+    identity with no capture, on a caller-independent check, is credited to the identity
+    that holds the capture, with terminal reason `covered_by_identity` (that cell is
+    conclusive), `open_on_identity` (no verdict yet: the gap is counted once, on that
+    cell) or `not_applicable_on_identity` (that capture was judged protocol-inapplicable).
+    The row carries `covered_by`, and the detail is `<reason>:<id>: ...`. The cell stays
+    INCONCLUSIVE and is never executed. It is left out of `not_tested` and
+    `cases_not_tested` and counted under `credited_by_identity`.
+  - `orchestrator_chain` (`_captured_readiness`, `_run_leg_core`): such a cell returns
+    reason code `covered_by_identity` and no longer adds to `prerequisite_blocks`.
+    No request is sent and no credentials are substituted.
+  - Tests: `harness/test_r11_10_identity_credit.py` (12, one at caller level).
+  - Replay of the r11 checkpoint (read-only, `.test-work/r11-10/replay_r11_checkpoint.py`
+    in the worktree): 543 -> **232** `missing_principal`. 311 cells are credited
+    (103 covered, 193 open on the other identity, 15 not applicable there). None of them
+    is executed or listed in `not_tested`.
+  - **Gap against the "at most 197" criterion:** 232 = the 197 owner-listed cells + 35
+    cells on five rows kept identity-bound under "when unsure, identity-bound":
+    `WSTG-INJT-20` (11) and `AV-MASSASSIGN-02` (9) (an admin may set a privileged
+    field; the write leg needs a non-privileged principal), `WSTG-BUSL-05` (10) (race
+    limits are often per account), `WSTG-CLNT-10` (3) (WebSocket hijacking rides the
+    session) and `WSTG-INJT-03` (2) (verb tampering is an access-control bypass).
+    **Owner:** confirm or move any of these into `_CALLER_INDEPENDENT_CHECKS`
+    (one id each).
+- **Waits for the owner:** the 197 identity-bound cells (232 with the five rows above).
+  Should the drive replay another identity's capture with this identity's credentials?
+  That changes E5b's "only observed requests" rule, so it is not implemented.
+- **Not done (note):** `worklist_investigator.captured_nodes` still marks a variant whose
+  identity key matches no role as `missing_principal`. That is a different case (the
+  capture exists but has no role) and is left as it is.
+- **Optional item, not done (note):** drop crawler-filled paths. In r11, 4 of the 15
+  endpoints were such paths. Worth doing as its own item, because it changes the matrix
+  denominator, not just the accounting. Only drop a `null`, `file` or `-1` segment that
+  no capture took from a response, and test it against the R11-9 template fixture.
