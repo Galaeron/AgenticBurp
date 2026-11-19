@@ -32,6 +32,10 @@ def _delta(before, after):
     return None if before is None or after is None else after - before
 
 
+class _PhaseInterrupted(BaseException):
+    """Thrown into an open `begin` phase by PhaseRecorder.abort(); never escapes."""
+
+
 class PhaseRecorder:
     """Times named phases into `phase_timings`.
 
@@ -87,7 +91,7 @@ class PhaseRecorder:
             ended = self._clock()
             elapsed = max(0.0, ended - started)
             budget = self._budgets.pop(entry, None)
-            self._records.append((entry, {
+            record = {
                 "phase": name,
                 "started_s": round(started - self._t0, 3),
                 "ended_s": round(ended - self._t0, 3),
@@ -96,7 +100,10 @@ class PhaseRecorder:
                 "unused_s": None if budget is None else round(max(0.0, budget - elapsed), 3),
                 "requests_used_delta": _delta(requests_before, _count(self._requests)),
                 "model_calls_delta": _delta(calls_before, _count(self._model_calls)),
-            }))
+            }
+            if aborted:
+                record["interrupted"] = True
+            self._records.append((entry, record))
             if self._announce:
                 try:
                     from harness import activity_feed
@@ -129,6 +136,16 @@ class PhaseRecorder:
         if budget_s is None or self._open is None or self._open_name != name:
             return
         self._budgets[self._open_entry_id] = max(0.0, float(budget_s))
+
+    def abort(self) -> None:
+        """End the open `begin` phase as interrupted, if any: a cancellation that left
+        the caller without closing it (R11-4b: the server's cancelled-job result).
+        Its record carries `interrupted: true` and the hook gets "abort", as when
+        an exception leaves a `phase()` block. Safe to call repeatedly."""
+        cm, self._open = self._open, None
+        self._open_name = None
+        if cm is not None:
+            cm.__exit__(_PhaseInterrupted, _PhaseInterrupted(), None)
 
     def finish(self) -> None:
         """End the open phase, if any. Safe to call repeatedly."""

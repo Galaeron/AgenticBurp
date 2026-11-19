@@ -284,6 +284,7 @@ class FinalPassCallerTests(unittest.TestCase):
         orch = Orchestrator(cfg)
         orch.allowed_hosts = ["shop.test"]
         rc = RunContext.create(allowed_hosts=["shop.test"], max_requests=100, config=cfg)
+        self.rc = rc
         clock = _Clock(start)
         sweeps = []
 
@@ -370,6 +371,14 @@ class FinalPassCallerTests(unittest.TestCase):
         self.assertEqual(self._timing(result, "worklist")["budget_s"], 900.0)
         self.assertEqual(list(instr["sqlmap_targeting"]["seconds_by_family"]),
                          [sqlmap_targeting.endpoint_family("GET", "https://shop.test/rest/search?q=1")])
+
+    def test_the_engagement_leaves_its_instrumentation_on_the_run(self):
+        # R11-4b: the server's cancelled-job result reads it from there.
+        result, _, _ = self._investigate({"investigation_seconds": 900})
+        instr = self.rc.instrumentation
+        self.assertIsInstance(instr, instrumentation.RunInstrumentation)
+        self.assertEqual([r["phase"] for r in instr.phases.timings()],
+                         [r["phase"] for r in result["instrumentation"]["phase_timings"]])
 
     def test_a_phase_ending_at_half_its_slice_gives_the_next_one_the_rest(self):
         result, _, _ = self._investigate({

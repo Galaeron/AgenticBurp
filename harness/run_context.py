@@ -1409,6 +1409,10 @@ class RunContext:
     # E7: the run's durable journal of finished units (run_journal.RunJournal), set by the
     # server when runs.journal is on; None means the run is not journaled or resumed.
     run_journal: object = field(default=None, repr=False, compare=False)
+    # R11-4b: the instrumentation.RunInstrumentation of the engagement that owns this
+    # run, set by investigate_engagement, so a job cancelled before the engagement
+    # returned still reports its phase_timings. None: no engagement started.
+    instrumentation: object = field(default=None, repr=False, compare=False)
     # LB-6: the run's caller-declared objective (objective_profiles.ObjectiveTask),
     # or None, which means objective completion is never attempted. Set only by
     # the code that creates the run (a benchmark runner, a test), never by a model

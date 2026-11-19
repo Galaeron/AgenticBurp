@@ -1158,6 +1158,14 @@ class ChainMixin:
         # phase and opens the next; nothing is reordered or skipped by it.
         _instr = RunInstrumentation(self, run_context or _run_context_mod.current_run_context(),
                                     _run_budget)
+        # R11-4b: the server reads it from the run when the job is cancelled before
+        # this returns, so a cancelled job still reports its phase_timings.
+        _instr_run = run_context or _run_context_mod.current_run_context()
+        if _instr_run is not None:
+            try:
+                _instr_run.instrumentation = _instr
+            except Exception:   # a stand-in run object without the slot: observation only
+                log.debug("run context takes no instrumentation", exc_info=True)
         # Warn before the run when a local model's context window cannot hold the
         # harness's largest prompt (job 0574e29a0799: Ollama cut 88 prompts). Not
         # instrumentation: it runs either way and asks Ollama, never the target.
