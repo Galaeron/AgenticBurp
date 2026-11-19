@@ -144,6 +144,26 @@ def leaf_object_id_index(path: str) -> int | None:
     return found
 
 
+# R11-9: `template["body_source"]` of a write body built from the object's observed
+# read (settable fields only), not a captured request's body.
+READ_BUILT_BODY = "read"
+
+
+def template_body_is_read_built(template: dict | None) -> bool:
+    return (template or {}).get("body_source") == READ_BUILT_BODY
+
+
+def _body_quality(template: dict | None) -> int:
+    """0: no body; 1: the crawler's guess; 2: built from a read; 3: captured."""
+    from harness.models import body_is_placeholder
+    body = str((template or {}).get("body") or "")
+    if not body.strip():
+        return 0
+    if template_body_is_read_built(template):
+        return 2
+    return 1 if body_is_placeholder(body) else 3
+
+
 def template_from_exchange(ex) -> dict:
     """A compact, replayable request TEMPLATE captured from a real exchange (R05):
     method, query string, request body, content-type, and the observed leaf object
@@ -1071,14 +1091,64 @@ class EngagementState:
         if not any(v.get("capture_id") == variant["capture_id"] for v in ep.capture_variants):
             ep.capture_variants.append(variant)
 
-        def _richness(t: dict | None) -> int:
+        def _richness(t: dict | None) -> tuple:
             if not t:
-                return -1
+                return (-1, 0)
+            # R11-9: at equal richness a captured body beats one built from a read,
+            # which beats the crawler's guess, so a real body always takes over.
             return ((1 if t.get("body") else 0) + (1 if t.get("query") else 0)
-                    + (1 if t.get("object_id") else 0))
+                    + (1 if t.get("object_id") else 0), _body_quality(t))
 
         if _richness(tmpl) > _richness(ep.template):
             ep.template = tmpl
+        self._read_built_writes(normalize_path(url))
+
+    def _read_built_writes(self, path: str) -> None:
+        """R11-9: give each PUT/PATCH of one object at `path` whose only body is the
+        crawler's guess a template body built from the object's observed
+        GET: its settable fields only (`read_body.body_from_read`), marked
+        `body_source="read"` (not captured). A captured body is never replaced."""
+        from harness.validators.read_body import body_from_read
+        read_ep = self.endpoints.get(f"GET {path}")
+        if read_ep is None:
+            return
+        for method in ("PUT", "PATCH"):
+            ep = self.endpoints.get(f"{method} {path}")
+            # Only a write that was sent with the guess: a captured body is kept,
+            # one already built is kept, and an unsent route gets none here.
+            if ep is None or _body_quality(ep.template) != 1:
+                continue
+            write = ep.template
+            ids = list(write.get("path_ids") or [])
+            if not write.get("object_id"):
+                continue   # a write of no one object: nothing to read
+            built = None
+            for variant in read_ep.capture_variants:
+                status = variant.get("response_status")
+                read = variant.get("template") or {}
+                if not (isinstance(status, int) and 200 <= status < 300) or not read.get("object_id"):
+                    continue
+                try:
+                    doc = json.loads(variant.get("response_body") or "")
+                except (TypeError, ValueError):
+                    continue
+                fields, _ = body_from_read(doc)
+                if not fields:
+                    continue
+                same = list(read.get("path_ids") or []) == ids
+                if built is None or same:
+                    built = (fields, read)
+                if same:
+                    break   # the object the write named: its own fields
+            if built is None:
+                continue
+            fields, read = built
+            base = {k: v for k, v in write.items() if k not in ("body", "content_type")}
+            ep.template = dict(base, method=method, query=write.get("query", "") or "",
+                               body=json.dumps(fields), content_type="application/json",
+                               object_id=read.get("object_id"),
+                               path_ids=list(read.get("path_ids") or []),
+                               body_source=READ_BUILT_BODY, read_from=f"GET {path}")
 
     def record_identity_probe(self, url: str, method: str, probe: dict) -> None:
         """Attach one role-crawl probe (E5b) to its endpoint as a replayable

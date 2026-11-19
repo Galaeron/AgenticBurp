@@ -55,9 +55,23 @@ def captured_nodes(node, base_url, roles, include_probes=False):
         if not matches:
             yield dict(node, capture_error="missing_principal")
             continue
+        template = _read_built_over_guess(variant["template"], node.get("template"))
         for role in matches:
-            yield dict(node, template=variant["template"], capture=variant,
+            yield dict(node, template=template, capture=variant,
                        probe_session=role, reachable_roles=[role.role])
+
+
+def _read_built_over_guess(captured: dict, endpoint_template: dict | None) -> dict:
+    """R11-9: a capture whose body is the crawler's guess replays the endpoint's
+    read-built body (engagement._read_built_writes) when both name the same object;
+    a captured body, or another object's capture, keeps its own."""
+    from harness.engagement import _body_quality, template_body_is_read_built
+    if (not template_body_is_read_built(endpoint_template) or _body_quality(captured) != 1
+            or list((captured or {}).get("path_ids") or [])
+            != list(endpoint_template.get("path_ids") or [])):
+        return captured
+    return dict(captured, **{k: endpoint_template[k] for k in
+                             ("body", "content_type", "body_source", "read_from")})
 
 
 def node_key(node) -> str:
