@@ -373,6 +373,9 @@ class ValidatorRegistry:
                 allowed_hosts=_allowed, read_backs=bf_cfg.get("read_backs") or (),
                 coupons=bf_cfg.get("coupons") or {},
                 mfa_status_reads=bf_cfg.get("mfa_status_reads") or (),
+                settlement_race=bf_cfg.get("settlement_race") is True,
+                race_copies=int(bf_cfg.get("race_copies", 2) or 2),
+                max_variants=int(bf_cfg.get("max_variants", 2) or 2),
                 allow_writes=parse_validators_flags(cfg)["allow_mutating_replay"])
 
         # DOM-based XSS leg -- drives a real browser with the payload in the URL

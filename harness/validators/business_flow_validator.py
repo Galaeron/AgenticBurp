@@ -37,12 +37,36 @@ Kinds (the finding class the coverage drive hands the leg):
                       earns a discount the read-back shows.
   mfa_disable_stepup  a captured 2FA-disable request with its password/TOTP field
                       missing or wrong turns 2FA off on the status read-back.
+
+R11-7c additions (all inside the same gates):
+
+- Settlement race (`validators.business_flow.settlement_race`, off by default):
+  after a payment_tamper check that did not confirm, a flow with cart steps is
+  settled twice in sequence (the control: how many settlements one filled basket
+  allows), then refilled once and settled by N concurrent copies, N authorized by
+  the gate's `authorize_burst` (so `validators.max_burst_size` caps it). Confirmed
+  only when the read-back shows more settled entries, or more balance spent, from
+  the one filled basket than the sequential control allowed.
+- 2FA restore with the identity's declared TOTP secret (`role.login.totp_secret`):
+  the captured enable request is replayed with a freshly computed one-time code.
+  The secret and the codes are never logged or put in a finding.
+- Cart steps are the actor's captured writes before the settlement that either
+  have a cart-shaped path or are shown by the run's own captured read-backs to
+  add an entry carrying the write's values (so a basket filled through any path
+  is found); tampered variants are spread over the value families first and
+  bounded by `validators.business_flow.max_variants` (hard cap 4) and the ceiling.
 """
 from __future__ import annotations
 
+import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import re
+import struct
+import time
 import secrets
 import string
 from dataclasses import dataclass, field as dc_field
@@ -106,8 +130,26 @@ _TOTAL_ORDER = ("grandtotal", "ordertotal", "totalprice", "totalamount", "total"
 _ID_KEYS = frozenset({"id", "uuid", "guid", "orderid", "ordernumber", "number", "reference"})
 _MAX_PREREQS = 3
 _MAX_READS = 4
-_MAX_AMOUNT_VARIANTS = 2
+_MAX_AMOUNT_VARIANTS = 2          # the default of validators.business_flow.max_variants
+_MAX_VARIANTS_HARD = 4
+_MAX_RACE_COPIES = 5
 _MAX_CAPTURED = 600
+# A one-time-code field in a captured 2FA enable/setup body (its value is 6-8 digits).
+_OTP_FIELD = re.compile(r"^(?:totp|otp|code|token|totptoken|otptoken|totpcode|otpcode|verificationcode|"
+                        r"mfacode|2facode|twofactorcode|initialtoken|inittoken|onetimecode|"
+                        r"onetimepassword|pin)$")
+_TOTP_SECRET_KEYS = ("totp_secret", "totpSecret", "mfa_secret", "otp_secret")
+
+
+def totp_code(secret: str, at: float | None = None, *, digits: int = 6, step: int = 30) -> str:
+    """RFC 6238 TOTP (HMAC-SHA1) for a base32 secret. Never logged by callers."""
+    clean = re.sub(r"[\s=-]", "", str(secret)).upper()
+    key = base64.b32decode(clean + "=" * (-len(clean) % 8))
+    counter = int((time.time() if at is None else at) // step)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = (struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(value).zfill(digits)
 
 
 # -- body and capture helpers ------------------------------------------------------
@@ -448,7 +490,13 @@ class BusinessFlowValidator(Validator):
 
     def __init__(self, *, allowed_hosts: list[str] | None = None, run_context=None,
                  allow_writes: bool = False, read_backs=(), coupons: dict | None = None,
-                 mfa_status_reads=()):
+                 mfa_status_reads=(), settlement_race: bool = False, race_copies: int = 2,
+                 max_variants: int = _MAX_AMOUNT_VARIANTS):
+        # R11-7c: the settlement race is its own off-by-default switch, on top of
+        # the leg's write gates and the gate's burst authorization.
+        self.settlement_race = bool(settlement_race)
+        self.race_copies = max(2, min(int(race_copies or 2), _MAX_RACE_COPIES))
+        self.max_variants = max(1, min(int(max_variants or _MAX_AMOUNT_VARIANTS), _MAX_VARIANTS_HARD))
         self.allowed_hosts = list(allowed_hosts or [])
         self.run_context = run_context
         # validators.allow_mutating_replay frozen at construction (as write_integrity's).
@@ -620,26 +668,68 @@ class BusinessFlowValidator(Validator):
         out += [u for _, _, u in sorted(found)]
         return list(dict.fromkeys(u for u in out if _origin(u) == origin))[:_MAX_READS]
 
+    def _read_index(self, case: _Case, captured: list) -> list:
+        """(index, url, _ReadState) of the actor's captured 2xx JSON GETs."""
+        out = []
+        for i, item in enumerate(captured):
+            status = _get(item, "response_status")
+            if (str(_get(item, "method") or "GET").upper() != "GET" or not self._mine(case, item)
+                    or status is None or not 200 <= int(status) < 300):
+                continue
+            state = _read_state(_json(_get(item, "response_body")))
+            if state is not None:
+                out.append((i, str(_get(item, "url") or ""), state))
+        return out
+
+    @staticmethod
+    def _shared_pairs(fields: dict, record: dict) -> int:
+        """How many of a write's (leaf name, value) pairs a read-back record carries."""
+        wrote = {(_flat(p[-1]), str(v)) for p, v in _leaves(fields)
+                 if isinstance(v, (int, str)) and not isinstance(v, bool) and str(v) != ""}
+        held = {(_flat(p.rsplit(".", 1)[-1]), str(v)) for p, v in _flatten(record)
+                if isinstance(v, (int, str)) and not isinstance(v, bool)}
+        return len(wrote & held)
+
+    def _fills_basket(self, fields: dict, at: int, reads: list, upto: int) -> bool:
+        """R11-7c: whether the run's own captured read-backs show this write adding an
+        entry that carries its values (judged by effect, not by the write's path). A
+        read before and after the write: a new entry sharing one (name, value) pair.
+        Only a read after it: an entry sharing two."""
+        for url in dict.fromkeys(u for _i, u, _s in reads):
+            before = next((s for i, u, s in reversed(reads) if u == url and i < at), None)
+            after = next((s for i, u, s in reads if u == url and at < i < upto), None)
+            if after is None:
+                continue
+            new = [r for k, r in after.records.items() if before is None or k not in before.records]
+            need = 1 if before is not None else 2
+            if any(self._shared_pairs(fields, r) >= need for r in new):
+                return True
+        return False
+
     def _plan_prereqs(self, case: _Case) -> list:
-        """The actor's captured cart writes made before the settlement capture (the
-        steps that fill the basket the settlement consumes), at most three."""
+        """The actor's captured writes made before the settlement capture that fill the
+        basket the settlement consumes, at most three: a cart-shaped path, or any path
+        whose effect the captured read-backs show (_fills_basket)."""
         target = (case.exchange.method.upper(), _norm(_path(case.exchange.url)))
         captured = self._captured()
         upto = next((i for i, item in enumerate(captured)
                      if (str(_get(item, "method") or "").upper(), _norm(_path(str(_get(item, "url") or ""))))
                      == target), len(captured))
+        reads = self._read_index(case, captured)
         steps = []
-        for item in captured[:upto]:
+        for idx, item in enumerate(captured[:upto]):
             method = str(_get(item, "method") or "").upper()
             url = str(_get(item, "url") or "")
             path = _path(url)
             status = _get(item, "response_status")
-            if (method not in _WRITE_METHODS or not self._mine(case, item) or not _CART_PATH.search(path)
+            if (method not in _WRITE_METHODS or not self._mine(case, item)
                     or _SETTLE_PATH.search(path) or _AUTH_PATH.search(path) or _COUPON_PATH.search(path)
-                    or status is None or not 200 <= int(status) < 300):
+                    or _MFA_PATH.search(path) or status is None or not 200 <= int(status) < 300):
                 continue
             fields, kind = _parse(_get(item, "request_body") or "")
             if not kind:
+                continue
+            if not _CART_PATH.search(path) and not self._fills_basket(fields, idx, reads, upto):
                 continue
             from harness.security import is_identity_credential_header
             hdrs = {k: v for k, v in (_get(item, "request_headers") or {}).items()
@@ -656,10 +746,12 @@ class BusinessFlowValidator(Validator):
 
     # -- 1. checkout / payment tamper ---------------------------------------------------------
 
-    async def _flow(self, case: _Case, tamper: _Tamper | None, settle_fields=None):
+    async def _flow(self, case: _Case, tamper: _Tamper | None, settle_fields=None, *,
+                    skip_prereqs: bool = False):
         """Replay the prerequisites and the settlement (one tamper applied). Returns
-        (settlement outcome or None, refused step label or "")."""
-        for i, (method, url, hdrs, fields, kind) in enumerate(case.prereqs):
+        (settlement outcome or None, refused step label or ""). `skip_prereqs`
+        settles the basket a refused settlement left filled."""
+        for i, (method, url, hdrs, fields, kind) in enumerate(() if skip_prereqs else case.prereqs):
             body = fields
             if tamper is not None and tamper.step == i:
                 body = _with(fields, tamper.path, tamper.value, drop=tamper.drop)
@@ -692,19 +784,153 @@ class BusinessFlowValidator(Validator):
         tampers = list(_amount_tampers(case.fields, -1))
         for i, (_m, _u, _h, fields, _k) in enumerate(case.prereqs):
             tampers += [t for t in _amount_tampers(fields, i) if t.family in ("amount", "quantity")]
-        # Amounts first, wherever they sit; a delivery tamper is tried last because a
-        # refused settlement can leave the cart steps' items behind (see _amount_flows).
-        rank = {"amount": 0, "quantity": 1, "delivery": 2}
-        tampers = sorted(tampers, key=lambda t: rank[t.family])[:_MAX_AMOUNT_VARIANTS]
+        tampers = self._pick_variants(tampers)
         flow_writes = len(case.prereqs) + 1
-        if tampers:
-            return await self._amount_flows(case, tampers, flow_writes)
         payments = _payment_fields(case.fields)
-        if not payments:
-            return self._skip(case.finding.vulnerability_class,
-                              "the settlement carries no amount, quantity, delivery or payment field "
-                              "to tamper")
-        return await self._payment_skip(case, payments, flow_writes)
+        if tampers:
+            result = await self._amount_flows(case, tampers, flow_writes)
+        elif payments:
+            result = await self._payment_skip(case, payments, flow_writes)
+        else:
+            result = self._skip(case.finding.vulnerability_class,
+                                "the settlement carries no amount, quantity, delivery or payment field "
+                                "to tamper")
+        if not self.settlement_race or result.status == "confirmed":
+            return result
+        before_left = len(case.left)
+        raced, note = await self._race(case)
+        if raced is not None:
+            return raced
+        extra = case.left[before_left:]
+        result.summary = (result.summary.rstrip() + f" Settlement race: {note}."
+                          + ((" LEFT IN PLACE: " + " | ".join(extra) + ".") if extra else ""))
+        if result.limitation:
+            result.limitation = result.summary[:400]
+        return result
+
+    # -- 1b. settlement race (R11-7c, Strix #25) ---------------------------------------------
+
+    @staticmethod
+    def _entries(eff: _Effect) -> dict:
+        counts: dict = {}
+        for url, _amount, _where in eff.new:
+            counts[url] = counts.get(url, 0) + 1
+        return counts
+
+    async def _race(self, case: _Case):
+        """(confirmed result, "") or (None, why it held or did not run).
+
+        The flow is filled once and settled twice in sequence (the control: how many
+        settled entries, and how much balance, one filled basket allows), then filled
+        once more and settled by N concurrent copies. Confirmed only on the read-back:
+        more new entries on a read that gained exactly one in the sequential control,
+        or more balance spent than the one sequential settlement spent."""
+        if not case.prereqs:
+            return None, ("not run: the flow has no captured cart step, so one filled basket "
+                          "cannot be told apart from repeated purchases (a race on one balance or "
+                          "one-time grant is left open)")
+        if not case.reads:
+            return None, "not run: no read-back of the settled state"
+        method, url = case.exchange.method.upper(), case.exchange.url
+        body = _encode(case.fields, case.body_kind) if case.body_kind else (case.exchange.request_body or None)
+        decision = self.run_context.gate.authorize_burst(
+            validator_name=self.name, method=method, url=url,
+            requested_burst_size=self.race_copies, body=body)
+        if not decision.allowed:
+            return None, f"not run: the safety gate refused the burst ({decision.reason})"
+        copies = int(decision.allowed_burst_size)
+        if copies < 2:
+            return None, "not run: the burst ceiling (validators.max_burst_size) is below 2"
+        prereqs = len(case.prereqs)
+        need = 2 * prereqs + 2 + copies
+        if self._headroom(case) < need:
+            return None, (f"not run: the business_flow ceiling does not pay for the sequential control "
+                          f"and a race of {copies} ({need} writes)")
+        before = await self._snapshot(case, case.reads)
+        if all(v is None for v in before.values()):
+            return None, "not run: no read-back answered"
+        first, why = await self._flow(case, None)
+        if first is None or not _ok(first):
+            if first is not None:
+                self._left_basket(case, "the race's refused sequential control")
+            return None, (f"not run: the sequential control did not settle "
+                          f"({why or 'HTTP ' + str(getattr(first, 'status', None))})")
+        second = await self._send(case, method, url, body)
+        seq = await self._snapshot(case, case.reads)
+        seq_eff = _effect(before, seq)
+        self._left_orders(case, "the race's sequential control", seq_eff)
+        seq_counts = self._entries(seq_eff)
+        if _ok(second) and any(n >= 2 for n in seq_counts.values()):
+            return None, ("not run: a second settlement in sequence settled again from one filled "
+                          "basket, so the basket is not consumed and a concurrent repeat proves nothing")
+        ledgers = [u for u, n in seq_counts.items() if n == 1]
+        debits = {} if _ok(second) else {k: v for k, v in seq_eff.deltas.items() if v < 0}
+        if not ledgers and not debits:
+            return None, "not run: no read-back showed what one settlement of the filled basket added or spent"
+        for m, u, hdrs, fields, kind in case.prereqs:
+            refill = await self._send(case, m, u, _encode(fields, kind), hdrs)
+            if not getattr(refill, "executed", False):
+                return None, f"not run: a cart step of the refill was not sent ({refill.outcome})"
+        release = asyncio.Event()
+
+        async def one():
+            await release.wait()
+            return await self._send(case, method, url, body)
+
+        tasks = [asyncio.ensure_future(one()) for _ in range(copies)]
+        await asyncio.sleep(0)
+        release.set()
+        outs = [o if not isinstance(o, BaseException) else None
+                for o in await asyncio.gather(*tasks, return_exceptions=True)]
+        after = await self._snapshot(case, case.reads)
+        race_eff = _effect(seq, after)
+        accepted = [o for o in outs if _ok(o)]
+        statuses = ", ".join(str(getattr(o, "status", None) if o is not None else "error") for o in outs)
+        if accepted:
+            self._left_orders(case, f"the race's {len(accepted)} concurrent", race_eff)
+        else:
+            self._left_basket(case, "the refused race")
+        race_counts = self._entries(race_eff)
+        excess = ""
+        for u in ledgers:
+            if race_counts.get(u, 0) >= 2:
+                excess = (f"{_path(u)} shows {race_counts[u]} new entries from one filled basket, where "
+                          f"the sequential control added 1 and refused the repeat")
+                break
+        for key, v in race_eff.deltas.items():
+            c = debits.get(key)
+            if not excess and c is not None and v < c - 1e-6:
+                u, where = key.split(" ", 1)
+                excess = (f"{_path(u)} {where} moved by {v:+} where one settlement of the same basket "
+                          f"moved it by {c:+}")
+        evidence = (f"{method} {_path(url)} after {prereqs} captured cart step(s); read back from "
+                    f"{', '.join(_path(u) for u in case.reads)}: sequential control HTTP "
+                    f"{first.status} then HTTP {getattr(second, 'status', None)}; refilled once, then "
+                    f"{copies} concurrent settlements (burst authorized by the safety gate) answered "
+                    f"{statuses}.")
+        if excess and accepted:
+            res = self._result(
+                "confirmed", case,
+                f"Settlement race confirmed: {copies} concurrent settlements of one filled basket were "
+                f"accepted {len(accepted)} time(s) and the read-back shows more settled than one "
+                f"basket allows: {excess}." + self._residue_text(case),
+                confidence=0.85, evidence=evidence)
+            return res.with_artifacts(attack=accepted[0], baseline=first,
+                                      controls=[o for o in (second, *outs[1:]) if o is not None][:3]), ""
+        return None, (f"held: {copies} concurrent settlements of one filled basket ({statuses}) "
+                      f"settled no more than the sequential control allowed")
+
+    def _pick_variants(self, tampers: list[_Tamper]) -> list[_Tamper]:
+        """R11-7c: one variant per value family first (amount, quantity, delivery, in
+        that order: a delivery tamper is most often refused), then the rest; at most
+        `max_variants`. The ceiling bounds it again before each flow."""
+        rank = {"amount": 0, "quantity": 1, "delivery": 2, "payment": 3, "coupon": 4}
+        ordered = sorted(tampers, key=lambda t: rank.get(t.family, 9))
+        seen, first, rest = set(), [], []
+        for t in ordered:
+            (rest if t.family in seen else first).append(t)
+            seen.add(t.family)
+        return (first + rest)[:self.max_variants]
 
     def _left_orders(self, case: _Case, label: str, eff: _Effect | None) -> None:
         new = [f"{_path(u)} (+1 entry{'' if a is None else f', {p}={a}'})" for u, a, p in (eff.new if eff else [])]
@@ -740,12 +966,23 @@ class BusinessFlowValidator(Validator):
                                 "business_flow not decided: the untampered control settled (HTTP "
                                 f"{control.status}) but no read-back showed what it settled, so a "
                                 "tamper could not be compared" + self._residue_text(case))
-        tried, hit, prev = [], None, mid
+        tried, hit, prev, left_full, stray = [], None, mid, False, False
         for tamper in tampers:
-            if self._headroom(case) < flow_writes:
+            # R11-7c: a refused settlement leaves its flow's cart items in the basket.
+            # A further settlement-step variant settles that basket (no refill, so it
+            # is no fuller than the control's); a cart-step variant would overfill it.
+            reuse = left_full and tamper.step < 0
+            if left_full and not reuse:
+                case.notes.append(f"{tamper.describe()} not sent: a refused settlement left this "
+                                  f"flow's cart items in place, so a refill would overfill the basket")
+                break
+            need = 1 if reuse else flow_writes
+            if self._headroom(case) < need:
                 case.notes.append(f"{tamper.describe()} not sent: the ceiling is spent")
                 break
-            outcome, why = await self._flow(case, tamper)
+            outcome, why = await self._flow(case, tamper, skip_prereqs=reuse)
+            if reuse:
+                case.notes.append(f"{tamper.describe()} settled the basket the refused flow left")
             after = await self._snapshot(case, case.reads)
             eff = _effect(prev, after)
             prev = after
@@ -756,13 +993,23 @@ class BusinessFlowValidator(Validator):
             if verdict[0] == "strong" and outcome is not None and _ok(outcome):
                 hit = tried[-1]
                 break
-            if outcome is not None and not _ok(outcome) and case.prereqs:
-                # The cart steps went in but the settlement did not consume them, so a
-                # further flow would settle a fuller basket than the control's.
-                case.notes.append("later variants not sent: a refused settlement may have left "
-                                  "this flow's cart items in place")
-                break
+            if outcome is not None and _ok(outcome):
+                left_full = False
+            elif outcome is not None and case.prereqs and (reuse or not why):
+                left_full = True
+            elif outcome is None and tamper.step > 0:
+                stray = True        # the cart steps before the refused one went in
+        if left_full:
+            self._left_basket(case, "a refused tampered settlement")
+        elif stray:
+            self._left_basket(case, "a flow stopped at a refused tampered cart step")
         return self._amount_verdict(case, control, ctl_eff, tried, hit)
+
+    def _left_basket(self, case: _Case, label: str) -> None:
+        case.left.append(f"the cart items {label} did not consume stay in the basket of the run-owned "
+                         f"identity {case.actor.name or case.actor.principal_id} "
+                         f"({len(case.prereqs)} captured cart step(s)); emptying it needs a DELETE "
+                         f"(owner policy), so they stay")
 
     @staticmethod
     def _compare(ctl: _Effect, eff: _Effect):
@@ -1214,16 +1461,54 @@ class BusinessFlowValidator(Validator):
         from harness.security import is_identity_credential_header
         headers = {k: v for k, v in hdrs.items()
                    if not is_identity_credential_header(k) and k.lower() not in {"host", "content-length"}}
+        secret = self._totp_secret(case)
+        fields, kind = _parse(body or "")
+        code_paths = [p for p, v in _leaves(fields) if _OTP_FIELD.match(_flat(p[-1]))
+                      and isinstance(v, (str, int)) and not isinstance(v, bool)
+                      and re.fullmatch(r"\d{6,8}", str(v))]
+        fresh = bool(secret and code_paths and kind)
+        if fresh:
+            try:
+                # R11-7c: a fresh one-time code from the identity's declared secret,
+                # computed just before the send. Neither is logged nor reported.
+                for p in code_paths:
+                    original = dict(_leaves(fields))[p]
+                    code = totp_code(secret, digits=len(str(original)))
+                    fields = _with(fields, p, _like(original, int(code)) if isinstance(original, int) else code)
+                body = _encode(fields, kind)
+            except (ValueError, TypeError):
+                fresh = False
+                case.notes.append("the declared TOTP secret is not valid base32, so no fresh code "
+                                  "was computed")
         with run_handoff.restore_scope(f"{case.case_ref}:business_flow_mfa"):
             outcome = await self._send(case, method, url, body, headers, cleanup=True)
             now, _u = await self._mfa_status(case)
+        how = ("replaying the run's captured enable request with a fresh one-time code from the "
+               "identity's declared TOTP secret" if fresh else "replaying the run's captured enable request")
         if now is True:
             self._restored([o for o in case.sent], f"business_flow re-enabled 2FA on {who}, verified on "
                                                    f"the status read")
             case.sent = []
-            return "2FA was re-enabled by replaying the run's captured enable request and verified."
-        case.left.append(f"2FA LEFT DISABLED on the run-owned identity {who}: the replayed enable request "
-                         f"answered HTTP {getattr(outcome, 'status', None)} and the status still reads "
-                         f"{'disabled' if now is False else 'unreadable'} (it may need a fresh one-time "
-                         f"code); re-enable it by hand")
+            return f"2FA was re-enabled by {how} and verified."
+        if fresh:
+            hint = ("the declared TOTP secret may not be this account's, or the setup needs a "
+                    "server-issued value the capture no longer holds")
+        elif code_paths:
+            hint = ("it carries a one-time code; declare the identity's role.login.totp_secret so "
+                    "the leg can compute a fresh one")
+        else:
+            hint = "it may need a fresh one-time code"
+        case.left.append(f"2FA LEFT DISABLED on the run-owned identity {who}: {how} answered HTTP "
+                         f"{getattr(outcome, 'status', None)} and the status still reads "
+                         f"{'disabled' if now is False else 'unreadable'} ({hint}); re-enable it by hand")
+        return ""
+
+    @staticmethod
+    def _totp_secret(case: _Case) -> str:
+        """The TOTP secret the identity's declared login carries (role.login), or ""."""
+        login = getattr(case.actor, "login", None) or {}
+        for key in _TOTP_SECRET_KEYS:
+            value = login.get(key) if isinstance(login, dict) else None
+            if isinstance(value, str) and value.strip():
+                return value.strip()
         return ""
