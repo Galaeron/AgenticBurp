@@ -11,7 +11,7 @@ from harness import surface_prioritizer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -129,36 +129,74 @@ def _require_target_fetch(url: str, *, bulk: bool = False) -> None:
         raise HTTPException(status_code=403, detail=reason)
 
 
-def _require_active_crawl(url: str) -> None:
-    """Admission for the crawl endpoints, which send ACTIVE outbound traffic.
+def _require_active_scope(url: str, *, action: str = "crawl") -> None:
+    """Active-mode scope admission: an explicit scope that covers `url`.
 
-    Two safety preconditions, each returning a clear 403 (never a silent empty
-    result):
-      1. An explicit scope that covers `url`. Empty server.allowed_hosts is
-         fail-CLOSED for active fetching (W-17 active_mode) -- a default-config
-         crawl must not reach an arbitrary host.
-      2. Active mode armed (validators.active_enabled, live value including the
-         POST /settings toggle). Crawling is active traffic, so it respects the
-         same master switch as the active validators.
-    """
+    Empty server.allowed_hosts is fail-CLOSED for active traffic (W-17
+    active_mode): a default-config crawl or probe must not reach an arbitrary
+    host. Returns a clear 403, never a silent empty result. The master switch is
+    the separate require_active_traffic dependency."""
     from harness.scope_lock import host_in_scope, out_of_scope_reason
     allowed = orchestrator.allowed_hosts
     if not host_in_scope(url, allowed, active_mode=True):
         if not allowed:
             raise HTTPException(
                 status_code=403,
-                detail="crawl refused: no server.allowed_hosts configured. Crawling "
+                detail=f"{action} refused: no server.allowed_hosts configured. This route "
                        "sends active traffic, so it fails closed without an explicit "
                        "scope. Set server.allowed_hosts (e.g. in config.local.yaml) to "
                        "the target host, then retry.")
-        raise HTTPException(status_code=403, detail=f"crawl refused: {out_of_scope_reason(url, allowed)}")
+        raise HTTPException(status_code=403, detail=f"{action} refused: {out_of_scope_reason(url, allowed)}")
+
+
+def _admit_active_traffic() -> None:
+    """The active-mode master switch (validators.active_enabled, live value
+    including the POST /settings toggle) for a request that sends target traffic.
+    require_active_traffic applies it to whole routes; a route that sends only
+    behind a body flag calls it before that branch."""
     if not orchestrator.validator_registry.active_enabled:
         raise HTTPException(
             status_code=403,
-            detail="crawl refused: active operations are disabled. Crawling sends live "
+            detail="refused: active operations are disabled. This route sends live "
                    "requests to the target, so it requires validators.active_enabled "
                    "(set it in config.local.yaml, or arm active mode via POST /settings "
                    "/ the Burp 'Active testing' toggle), on top of a configured scope.")
+
+
+async def require_active_traffic(authorization: str | None = Header(default=None)) -> None:
+    """ARC-1: the ONE admission dependency for every route that sends target
+    traffic. It authenticates first (401 before 403), then applies the master
+    switch, before the handler parses or does anything else. Scope admission
+    stays per route, because each route names its target differently."""
+    _require_auth(authorization)
+    _admit_active_traffic()
+
+
+# ARC-1 admission registry: every route whose handler reaches RunContext.create,
+# standalone_context or transport_for. test_active_traffic_admission scans
+# app.routes and requires this registry to list exactly those routes, so a new
+# traffic-sending route cannot ship without an admission decision.
+#   ACTIVE_TRAFFIC_ROUTES  carry Depends(require_active_traffic).
+#   ACTIVE_TRAFFIC_WHEN    send only when the named body flag is set; the handler
+#                          calls _admit_active_traffic() before that branch.
+#   PASSIVE_RUN_ROUTES     own a run but send nothing to the target while active
+#                          mode is off (the documented passive-default workflow).
+ACTIVE_TRAFFIC_ROUTES = frozenset({
+    ("POST", "/crawl"),
+    ("POST", "/crawl-roles"),
+    ("POST", "/engagement/{host}/advance"),
+    ("POST", "/engagement/{host}/investigate"),
+    ("POST", "/probe-missing-auth"),
+    ("POST", "/active-probe"),
+})
+ACTIVE_TRAFFIC_WHEN = {("POST", "/engagement/{host}/run"): "execute"}
+PASSIVE_RUN_ROUTES = {
+    ("POST", "/analyze"): "Burp 'Send to LLM Harness': reviews the supplied exchange. Its run's "
+                          "gate carries the live active_enabled, so a passive analysis sends "
+                          "nothing to the target (test_captured_shapes_passive, "
+                          "test_engagement_atomic_passive).",
+}
+_ACTIVE_TRAFFIC = [Depends(require_active_traffic)]
 
 
 def _crawl_route_run():
@@ -706,7 +744,7 @@ class CrawlRequest(_BaseModel):
     max_depth: int = 2
 
 
-@app.post("/crawl")
+@app.post("/crawl", dependencies=_ACTIVE_TRAFFIC)
 async def crawl_endpoint(req: CrawlRequest, authorization: str | None = Header(default=None)):
     """Discover the application's real endpoint surface by fetching its pages
     AND mining the JavaScript bundles they load (js_endpoint_extractor.py) --
@@ -716,7 +754,7 @@ async def crawl_endpoint(req: CrawlRequest, authorization: str | None = Header(d
     endpoints for the site map / attack-surface tab."""
     _require_auth(authorization)
     _require_target_fetch(req.base_url, bulk=True)
-    _require_active_crawl(req.base_url)
+    _require_active_scope(req.base_url, action="crawl")
     from harness import crawler
     async with _crawl_route_run() as run_context:
         session_ref = (_route_session(run_context, "crawl:source", req.headers, req.base_url)
@@ -847,7 +885,7 @@ async def set_identity_session_headers(req: SessionHeadersRequest, authorization
             "identities": [i["name"] for i in identity_headers.identities_for_host(req.host)]}
 
 
-@app.post("/crawl-roles")
+@app.post("/crawl-roles", dependencies=_ACTIVE_TRAFFIC)
 async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None = Header(default=None)):
     """Role-aware crawl: discover the surface per role, probe every endpoint with
     every role, and return the access matrix plus derived auth-bypass and IDOR/
@@ -858,7 +896,7 @@ async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None 
     max_endpoints. Credentials arrive per call and are never persisted."""
     _require_auth(authorization)
     _require_target_fetch(req.base_url, bulk=True)
-    _require_active_crawl(req.base_url)
+    _require_active_scope(req.base_url, action="crawl")
     from harness import role_crawl
     roles = _role_sessions(req.roles)
     if not roles:
@@ -898,7 +936,7 @@ async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None 
     return out
 
 
-@app.post("/probe-missing-auth")
+@app.post("/probe-missing-auth", dependencies=_ACTIVE_TRAFFIC)
 async def probe_missing_auth_endpoint(req: MissingAuthRequest, authorization: str | None = Header(default=None)):
     """Fire discovered endpoints with authentication stripped and flag the ones
     that still return data -- the "generateReport unauthenticated" class an
@@ -984,7 +1022,7 @@ class ActiveProbeRequest(_BaseModel):
     step_budget: int = 0  # 0 -> the configured iterative_agent.max_steps
 
 
-@app.post("/active-probe")
+@app.post("/active-probe", dependencies=_ACTIVE_TRAFFIC)
 async def active_probe(req: ActiveProbeRequest, authorization: str | None = Header(default=None)):
     """Run the iterative (active) agent against one captured exchange, then
     integrate its result through F2 (pause->validate->remember; pivot/combine).
@@ -1347,6 +1385,9 @@ async def engagement_run(host: str, req: RunEngagementRequest, authorization: st
     _require_auth(authorization)
     max_targets = max(1, min(req.max_targets, 50))
     if req.execute:
+        # ARC-1: executing fetches and analyzes target pages (ACTIVE_TRAFFIC_WHEN);
+        # a plan-only call sends nothing and stays available while passive.
+        _admit_active_traffic()
         _require_target_fetch(req.base_url or '', bulk=True)
         if not req.base_url:
             raise HTTPException(status_code=400, detail="execute requires base_url")
@@ -1366,7 +1407,7 @@ class AdvanceRequest(_BaseModel):
     max_endpoints: int = 100
 
 
-@app.post("/engagement/{host}/advance")
+@app.post("/engagement/{host}/advance", dependencies=_ACTIVE_TRAFFIC)
 async def engagement_advance(host: str, req: AdvanceRequest, authorization: str | None = Header(default=None)):
     """Advance the engagement: re-crawl `base_url` as the given roles and fold the
     result (surface + access matrix + IDOR findings) back into the fused
@@ -1376,7 +1417,7 @@ async def engagement_advance(host: str, req: AdvanceRequest, authorization: str 
     _require_target_fetch(req.base_url, bulk=True)
     # RV-G R03: a re-crawl is active traffic, so it obeys the same scope and
     # active-mode admission as /crawl-roles, before any discovery or probing.
-    _require_active_crawl(req.base_url)
+    _require_active_scope(req.base_url, action="crawl")
     from harness import role_crawl, engagement
     roles = _role_sessions(req.roles)
     if not roles:
@@ -1810,7 +1851,7 @@ async def engagement_writeups(host: str, authorization: str | None = Header(defa
             "writeup_count": len(items), "writeups": items}
 
 
-@app.post("/engagement/{host}/investigate")
+@app.post("/engagement/{host}/investigate", dependencies=_ACTIVE_TRAFFIC)
 async def engagement_investigate(host: str, req: InvestigateRequest,
                                  authorization: str | None = Header(default=None)):
     """Start the flagship graph-driven investigation as a background JOB and return

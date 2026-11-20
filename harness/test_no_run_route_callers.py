@@ -324,7 +324,8 @@ class AdvanceActiveModeTests(_RouteFixture):
     def test_fault_injection_removing_the_gate_sends(self):
         site = self._site()
         self.arm(False)
-        with patch.object(self.server, "_require_active_crawl", lambda url: None):
+        # ARC-1: the master switch the shared route dependency applies.
+        with patch.object(self.server, "_admit_active_traffic", lambda: None):
             resp = self._advance(site)
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertTrue(site.requests)

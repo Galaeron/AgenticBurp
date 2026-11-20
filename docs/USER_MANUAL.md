@@ -60,6 +60,13 @@ validators:
   # allow_mutating_replay: true # (stricter) allow state-changing replays
 ```
 
+`active_enabled` is the master switch for every route that sends target
+traffic. While it is off, `/crawl`, `/crawl-roles`, `/probe-missing-auth`,
+`/active-probe`, `/engagement/{host}/advance`, `/engagement/{host}/investigate`
+and `/engagement/{host}/run` with `execute: true` answer 403 before sending
+anything; `/analyze` (review of the traffic you supply) and a plan-only
+`/engagement/{host}/run` stay available.
+
 Mutating/amplifying probes (race/TOCTOU bursts, mass-assignment) need
 `allow_mutating_replay` *and* `max_burst_size` raised above its default of 1,
 and are still capped by `safety_gate.py`'s hard ceilings. The OOB
