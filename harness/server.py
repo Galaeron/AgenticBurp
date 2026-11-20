@@ -1147,7 +1147,7 @@ async def update_settings(req: SettingsRequest, authorization: str | None = Head
     changed: dict = {}
     if req.throttle_rps is not None:
         from harness import global_throttle
-        global_throttle.configure(max(0.0, float(req.throttle_rps)))
+        global_throttle.configure(max(0.0, float(req.throttle_rps)), source="settings")
         changed["throttle"] = global_throttle.throttle.stats()
     if req.retry_budget:
         orchestrator.retry_budget_policy = orchestrator.retry_budget_policy.merged_with(req.retry_budget)
@@ -2017,7 +2017,9 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     def _finish_manifest(status, *, result=None, error=None):
         run_handoff.finish(run_context, status, result)
         try:
-            manifest.finish(status, result=security.sanitize_data(result), error=error)
+            # ARC-3: the run's request-ceiling outcome (stop_reason budget_exhausted).
+            manifest.finish(status, result=security.sanitize_data(result), error=error,
+                            request_ceiling=run_context.budget.state())
         except Exception as exc:
             # Artifact persistence loss is not an unhandled async task failure.
             # Keep cancellation visible, but never advertise a completed durable

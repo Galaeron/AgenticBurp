@@ -49,6 +49,7 @@ import httpcore
 import httpx
 
 from harness import evidence
+from harness import global_throttle
 from harness import scope_lock
 from harness.server_errors import ServerErrorLedger
 from harness.run_observations import RunObservations
@@ -161,6 +162,7 @@ class RequestBudget:
         self._max = max_requests
         self._used = 0
         self._held = 0
+        self._denied = 0
         self._by_label: dict[str, int] = {}
         self._lock = threading.Lock()
 
@@ -170,6 +172,7 @@ class RequestBudget:
         not know theirs leave it blank and are counted as "unlabelled"."""
         with self._lock:
             if self._max is not None and self._used + n > self._max - self._held:
+                self._denied += n
                 return False
             self._used += n
             key = label or "unlabelled"
@@ -204,6 +207,16 @@ class RequestBudget:
     @property
     def remaining(self) -> int | None:
         return None if self._max is None else max(0, self._max - self._used - self._held)
+
+    def state(self) -> dict:
+        """ARC-3: the ceiling's outcome for the run manifest. `exhausted` once a
+        reservation was refused (or the ceiling is fully spent): the run stopped,
+        or lost sends, on `budget_exhausted`."""
+        with self._lock:
+            used, denied = self._used, self._denied
+        exhausted = self._max is not None and (used >= self._max or denied > 0)
+        return {"max_requests": self._max, "used": used, "remaining": self.remaining,
+                "denied": denied, "exhausted": exhausted}
 
 
 class CancelToken:
@@ -912,6 +925,16 @@ class TargetTransport:
             if not decision.allowed:
                 return ExecutionOutcome(outcome="blocked", final_url=url, error=decision.reason,
                                         artifact=self._artifact(url, "blocked", session_ref, case_ref=case_ref, finding_ref=finding_ref))
+            # 2b. ARC-3 pace -- one slot from this ORIGIN's process-wide bucket
+            #     (global_throttle), shared by every run and concurrent job, so the
+            #     configured rate binds the target however many callers send. Each
+            #     redirect hop is paced. A spent budget is refused at once, unpaced.
+            if getattr(ctx.budget, "remaining", None) != 0:
+                await global_throttle.acquire_origin(ScopePolicy.origin_of(url),
+                                                     capability=capability)
+                if ctx.cancel.cancelled and not allow_cancelled_cleanup:
+                    return ExecutionOutcome(outcome="cancelled", final_url=url,
+                                            artifact=self._artifact(url, "cancelled", session_ref, case_ref=case_ref, finding_ref=finding_ref))
             # 3. Budget -- reserve atomically before sending; a denial does not count as executed.
             # Only RequestBudget (and the driver child budget forwarding to it) takes a label.
             if not (ctx.budget.reserve(1, label=capability) if hasattr(ctx.budget, "by_label")

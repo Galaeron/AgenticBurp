@@ -229,8 +229,12 @@ adaptive_respin:
 # each "politely" capped still add up at the target. 0 = OFF (unlimited), the
 # default, so nothing changes until the tester sets a ceiling (exposed as the
 # Burp "Global request throttle" setting). Blocks/paces callers; never drops
-# requests. The race-condition and request-smuggling validators are exempt by
-# design -- they depend on precise intentional concurrency this would defeat.
+# requests. ARC-3: the rate is ENFORCED per target origin inside TargetTransport,
+# one process-wide bucket shared by every run and concurrent job. The race-
+# condition, request-smuggling and TOCTOU validators' bursts are charged to it but
+# not delayed (their point is precise concurrency); the traffic after a burst
+# waits off its cost. Removing a set throttle through Burp /settings needs an
+# explicit confirm_unlimited, and every change is recorded in the run manifest.
 throttle:
   max_requests_per_second: 0   # 0 = unlimited
 
@@ -1187,6 +1191,12 @@ store:
 # Per-run knobs (harness/run_context.py RunContext.create reads
 # runs.cache_namespace; unset here, so cache_namespace defaults to "").
 runs:
+  # ARC-3: a finite per-run ceiling on real target sends (RequestBudget). A run
+  # that reaches it gets budget_exhausted and its manifest records stop_reason
+  # budget_exhausted plus the request_ceiling block. 100000 is a safety net for an
+  # unattended run, not a tuning value (owner decision); a long live run can raise
+  # it in config.local.yaml. The engagement driver's owned-run ceiling inherits it.
+  max_requests: 100000
   # FR-7 (F11): run-INDEPENDENT reuse of the pre-proof half of an analysis
   # (model-inference-derived reports, never proof/case/oracle fields --
   # see cache.HypothesisCacheEntry/get_hypothesis/put_hypothesis) across

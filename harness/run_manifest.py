@@ -120,12 +120,27 @@ class RunManifest:
             "measurement": {"fixture_kind": "unscored", "precision": None, "recall": None,
                             "scoring_limitation": "No independent expected-case mapping supplied"},
         }
+        # ARC-3: the outbound throttle the run started under (and who set it).
+        from harness import global_throttle
+        data["throttle"] = {"at_start": global_throttle.throttle.audit_state()}
         manifest = cls(data, out)
         manifest._persist(append_ledger=True)
         return manifest
 
-    def finish(self, status: str, *, result: dict | None = None, error: str | None = None) -> None:
+    def finish(self, status: str, *, result: dict | None = None, error: str | None = None,
+               request_ceiling: dict | None = None) -> None:
         result = result or {}
+        # ARC-3: every throttle change made while the run was live (Burp /settings,
+        # config), the setting it ended under, and its request-ceiling outcome.
+        from harness import global_throttle
+        self.data["throttle"] = {**(self.data.get("throttle") or {}),
+                                 "at_finish": global_throttle.throttle.audit_state(),
+                                 "changes": global_throttle.throttle.changes(
+                                     since=self.data.get("started_at"))}
+        if request_ceiling is not None:
+            self.data["request_ceiling"] = _counters(request_ceiling)
+            if request_ceiling.get("exhausted"):
+                self.data["stop_reason"] = "budget_exhausted"
         errors = list(result.get("errors") or [])
         instrumentation = result.get("instrumentation") or {}
         if error:
