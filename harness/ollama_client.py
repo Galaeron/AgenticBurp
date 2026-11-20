@@ -731,6 +731,9 @@ class OllamaClient:
         self._context_probed_at: dict[str, float] = {}
         self._max_prompt_tokens: dict[str, int] = {}
         self._context_warned: set[tuple[str, str]] = set()
+        # TOK-4: each model's trained maximum context from POST /api/show
+        # (0 = the server answered without one, never asked again).
+        self._show_windows: dict[str, int] = {}
 
         # Initialize circuit breaker. Uses the shared-registry accessor
         # (not `OllamaCircuitBreaker(...)` directly) so that every
@@ -868,6 +871,83 @@ class OllamaClient:
         settings = data.get("default_generation_settings") if isinstance(data, dict) else None
         length = settings.get("n_ctx") if isinstance(settings, dict) else None
         self._context_windows[_OPENAI_SERVER_KEY] = length if type(length) is int and length > 0 else 0
+
+    async def _probe_show_window(self, model: str) -> None:
+        """POST /api/show: the model's trained maximum context from model_info
+        (`<architecture>.context_length`). Best-effort, short timeout; a failed
+        lookup leaves the cache as it was."""
+        try:
+            async with httpx.AsyncClient(timeout=_CONTEXT_PROBE_TIMEOUT) as client:
+                resp = await client.post(f"{self.base_url}/api/show", json={"model": model})
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            log.debug("context window lookup (POST /api/show) failed: %s", e)
+            return
+        info = data.get("model_info") if isinstance(data, dict) else None
+        info = info if isinstance(info, dict) else {}
+        arch = info.get("general.architecture")
+        length = info.get(f"{arch}.context_length") if isinstance(arch, str) else None
+        if not (type(length) is int and length > 0):
+            length = next((v for k, v in sorted(info.items()) if isinstance(k, str)
+                           and k.endswith(".context_length") and type(v) is int and v > 0), 0)
+        self._show_windows[_model_key(model)] = length
+
+    async def _cached_lookup(self, key: str, cache: dict, probe, probe_key: str | None = None
+                             ) -> int | None:
+        """cache[key], looked up when absent at most once per
+        _CONTEXT_PROBE_RETRY_SECONDS (0 cached = the server reports none)."""
+        if key not in cache:
+            probe_key = probe_key or key
+            probed_at = self._context_probed_at.get(probe_key)
+            if probed_at is None or time.monotonic() - probed_at >= _CONTEXT_PROBE_RETRY_SECONDS:
+                self._context_probed_at[probe_key] = time.monotonic()
+                await probe()
+        return cache.get(key) or None
+
+    async def discovered_context_window(self, model: str) -> dict:
+        """TOK-4: the context window a prompt for `model` is budgeted against.
+
+        {"window", "source", "model_max"}:
+        - api "openai": llama-server's GET /props n_ctx, the per-slot window
+          ("props"); with ollama.num_ctx also set, the smaller of the two;
+        - else ollama.num_ctx when set ("num_ctx");
+        - a local Ollama model: the window GET /api/ps reports it loaded with
+          ("api_ps"). Not loaded, window is None: it loads at the server's
+          default context, which no endpoint reports. model_max is then its
+          trained maximum from POST /api/show, an upper bound;
+        - a cloud model: POST /api/show's context_length ("api_show").
+
+        Each lookup is cached per model on this client (one client, one
+        endpoint); a failed one is retried at most once per
+        _CONTEXT_PROBE_RETRY_SECONDS. Never raises."""
+        try:
+            if self.api == API_OPENAI:
+                props = await self._cached_lookup(_OPENAI_SERVER_KEY, self._context_windows,
+                                                  self._probe_openai_window)
+                if self.num_ctx and (not props or self.num_ctx <= props):
+                    return {"window": self.num_ctx, "source": "num_ctx", "model_max": None}
+                return {"window": props, "source": "props" if props else None, "model_max": None}
+            if self.num_ctx:
+                return {"window": self.num_ctx, "source": "num_ctx", "model_max": None}
+            key = _model_key(model)
+
+            async def show():
+                return await self._cached_lookup(key, self._show_windows,
+                                                 lambda: self._probe_show_window(model),
+                                                 probe_key=f"show:{key}")
+            if is_cloud_model(model):
+                length = await show()
+                return {"window": length, "source": "api_show" if length else None,
+                        "model_max": length}
+            window = await self._cached_lookup(key, self._context_windows,
+                                               self._probe_context_windows)
+            if window:
+                return {"window": window, "source": "api_ps", "model_max": None}
+            return {"window": None, "source": None, "model_max": await show()}
+        except Exception as e:  # discovery is advisory: the budget falls back
+            log.debug("context window discovery failed: %s", type(e).__name__)
+            return {"window": None, "source": None, "model_max": None}
 
     def _window_key(self, model: str) -> str:
         return _OPENAI_SERVER_KEY if self.api == API_OPENAI else _model_key(model)

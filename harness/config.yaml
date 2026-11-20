@@ -105,9 +105,12 @@ ollama:
   allow_cloud_models: false
 
 # Context-window budget for agent and critique prompts (harness/prompt_budget.py).
-# The context is `ollama.num_ctx` when set, else `model_context_tokens` below;
-# with neither (the default, and right for cloud models) prompts go out
-# unchanged. With a context, an oversized prompt is fitted to it minus
+# TOK-4: the context is the window the model's server reports before each
+# prompt (llama-server GET /props n_ctx, Ollama GET /api/ps for a loaded model,
+# POST /api/show for a cloud model), capped by `ollama.num_ctx` when set, else
+# by `model_context_tokens` below. With none of those known, prompts are fitted
+# to `unknown_context_tokens` (capped by the model's trained maximum), never
+# sent unfitted. An oversized prompt is fitted to the context minus
 # `answer_tokens`: methodology notes, inapplicable shared rules, specialty
 # sections the exchange does not match, prior findings, then body text and
 # specialty text are cut in that order, each cut marked in the prompt and listed
@@ -116,6 +119,8 @@ ollama:
 prompt_budget:
   model_context_tokens: null
   answer_tokens: 1024
+  # Ollama's default context on 0.40.13 (a model not loaded yet loads at it).
+  unknown_context_tokens: 4096
 
 # How many specialist agents are allowed to run concurrently against
 # Ollama through one AgentManager. The application orchestrator shares that

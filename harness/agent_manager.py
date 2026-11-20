@@ -138,7 +138,8 @@ class AgentManager:
             model=agent_config.get("model", defaults.get("model", "qwen3:8b")),
             temperature=agent_config.get("temperature", defaults.get("temperature", 0.1)),
         )
-        agent.prompt_budget = prompt_budget.from_config(self.config)
+        # TOK-4: resolved before each prompt from the discovered window.
+        agent.prompt_budget = prompt_budget.for_run(self.config)
         return agent
     
     def get_agent(self, name: str) -> BaseAgent | None:

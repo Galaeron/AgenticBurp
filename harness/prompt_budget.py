@@ -9,8 +9,11 @@ prompt that only just fits leaves no room for the answer.
 
 `from_config` derives a budget from the configured context: `ollama.num_ctx` when
 set, else `prompt_budget.model_context_tokens`, minus `prompt_budget.answer_tokens`
-for the answer. With neither set (a cloud model with a large window) there is no
-budget and every prompt is sent unchanged.
+for the answer. TOK-4: agents and the critique use `for_run`, a DiscoveredBudget
+resolved before each prompt against the window the model's server reports
+(llama-server GET /props n_ctx, Ollama GET /api/ps, POST /api/show for a cloud
+model). A smaller reported window overrides the configured one; with neither, the
+prompt is fitted to `prompt_budget.unknown_context_tokens`, never sent unfitted.
 
 `fit_agent_prompts` leaves a prompt that fits unchanged. Otherwise it applies the
 steps below in order, re-measuring after each, and stops as soon as it fits:
@@ -106,9 +109,94 @@ def from_config(config: dict | None) -> PromptBudget | None:
         context, source = int(pb["model_context_tokens"]), "prompt_budget.model_context_tokens"
     else:
         return None
+    return PromptBudget(context_tokens=context, answer_tokens=_answer_tokens(pb), source=source)
+
+
+def _answer_tokens(pb: dict) -> int:
     answer = pb.get("answer_tokens")
-    answer = DEFAULT_ANSWER_TOKENS if answer is None else max(0, int(answer))
-    return PromptBudget(context_tokens=context, answer_tokens=answer, source=source)
+    return DEFAULT_ANSWER_TOKENS if answer is None else max(0, int(answer))
+
+
+# TOK-4: the window a prompt is fitted to when none is configured and none is
+# discovered: Ollama's default context on 0.40.13 (a model not yet loaded loads
+# at it unless OLLAMA_CONTEXT_LENGTH is set). Owner value:
+# prompt_budget.unknown_context_tokens.
+UNKNOWN_CONTEXT_TOKENS = 4096
+_fallback_warned: set[tuple[str, int]] = set()
+
+
+def _positive_int(value) -> int | None:
+    return value if type(value) is int and value > 0 else None
+
+
+def unknown_context_tokens(config: dict | None) -> int:
+    """`prompt_budget.unknown_context_tokens` (default UNKNOWN_CONTEXT_TOKENS);
+    anything but a positive integer is a config fault."""
+    value = ((config or {}).get("prompt_budget") or {}).get("unknown_context_tokens")
+    if value is None:
+        return UNKNOWN_CONTEXT_TOKENS
+    if _positive_int(value) is None:
+        raise ValueError("invalid prompt_budget config: unknown_context_tokens must be a "
+                         f"positive integer, got {value!r}")
+    return value
+
+
+@dataclass(frozen=True)
+class DiscoveredBudget:
+    """TOK-4: a prompt budget seeded per call from the context window the
+    model's server reports (OllamaClient.discovered_context_window), so no
+    prompt is sent unfitted. `configured` (ollama.num_ctx or
+    prompt_budget.model_context_tokens) is an operator-declared ceiling: a
+    smaller discovered window wins. With neither, the prompt is fitted to
+    `fallback_tokens` (capped by the model's trained maximum when /api/show
+    reports one), never sent as is."""
+    answer_tokens: int
+    fallback_tokens: int
+    configured: PromptBudget | None = None
+
+    async def resolve(self, client, model: str) -> PromptBudget:
+        info = {}
+        probe = getattr(client, "discovered_context_window", None)
+        if probe is not None:
+            try:
+                info = await probe(model)
+            except Exception as e:  # discovery is advisory: fall back, never send unfitted
+                log.debug("context window discovery failed: %s", type(e).__name__)
+        info = info if isinstance(info, dict) else {}
+        window = _positive_int(info.get("window"))
+        source = info.get("source") if isinstance(info.get("source"), str) else "server"
+        configured = self.configured
+        if configured is not None:
+            if window and window < configured.context_tokens:
+                return PromptBudget(window, configured.answer_tokens, f"discovered:{source}")
+            return configured
+        if window:
+            return PromptBudget(window, self.answer_tokens, f"discovered:{source}")
+        model_max = _positive_int(info.get("model_max"))
+        fallback = min(self.fallback_tokens, model_max) if model_max else self.fallback_tokens
+        if (str(model), fallback) not in _fallback_warned:
+            _fallback_warned.add((str(model), fallback))
+            log.warning("context window of %s unknown (ollama.num_ctx unset, none reported): "
+                        "prompts are fitted to %d tokens (prompt_budget.unknown_context_tokens). "
+                        "Set ollama.num_ctx to the real window.", model, fallback)
+        return PromptBudget(fallback, self.answer_tokens,
+                            "fallback:prompt_budget.unknown_context_tokens")
+
+
+def for_run(config: dict | None) -> DiscoveredBudget:
+    """The budget spec agents and the critique resolve before each prompt."""
+    config = config or {}
+    return DiscoveredBudget(answer_tokens=_answer_tokens(config.get("prompt_budget") or {}),
+                            fallback_tokens=unknown_context_tokens(config),
+                            configured=from_config(config))
+
+
+async def resolve(budget, client, model: str) -> "PromptBudget | None":
+    """A PromptBudget for one call: a DiscoveredBudget is resolved against
+    `client`; a PromptBudget (or None, a caller that opted out) is returned as is."""
+    if isinstance(budget, DiscoveredBudget):
+        return await budget.resolve(client, model)
+    return budget
 
 
 # --- relevance -------------------------------------------------------------
