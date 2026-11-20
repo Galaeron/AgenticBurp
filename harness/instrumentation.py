@@ -245,6 +245,7 @@ class RunInstrumentation:
         self._started_monotonic = time.monotonic()
         self._model_baseline = self._model_snapshot()
         self._store_baseline = self._store_snapshot()
+        self._routing_baseline = self._routing_stats()
         # The context-window preflight report for this run, set by
         # investigate_engagement (ollama_client.run_context_preflight); reported only.
         self.context_preflight: dict | None = None
@@ -267,6 +268,34 @@ class RunInstrumentation:
         except Exception:
             return None
 
+    def _routing_stats(self) -> dict | None:
+        """The coordinator's fail-open counters: this run's own dict when its run
+        context has one, else the ambient or process-wide counters (TOK-5)."""
+        try:
+            from harness import coordinator
+            counters = getattr(self._run_context, "fail_open_counters", None)
+            return (coordinator.stats_of(counters) if isinstance(counters, dict)
+                    else coordinator.fail_open_stats())
+        except Exception:
+            return None
+
+    def _routing_report(self) -> dict | None:
+        """{calls, fail_opens, fail_open_rate, by_reason} for THIS run: the counters now
+        less the baseline taken at the start, so a process-wide fallback still reports
+        only this run's share. rate is None before any routing call (never 0.0)."""
+        now = self._routing_stats()
+        if now is None:
+            return None
+        base = self._routing_baseline or {}
+        calls = max(0, now["calls"] - base.get("calls", 0))
+        opens = max(0, now["count"] - base.get("count", 0))
+        base_reasons = base.get("by_reason") or {}
+        reasons = {k: v - base_reasons.get(k, 0) for k, v in now["by_reason"].items()
+                   if v - base_reasons.get(k, 0) > 0}
+        return {"calls": calls, "fail_opens": opens,
+                "fail_open_rate": round(opens / calls, 4) if calls else None,
+                "by_reason": reasons}
+
     @staticmethod
     def _store_snapshot() -> dict | None:
         try:
@@ -283,6 +312,8 @@ class RunInstrumentation:
             model["stages"] = {label: row for label, row in model.get("stages", {}).items()
                                if row.get("calls") or row.get("completed")}
         out["model_metrics"] = model
+        # TOK-5: how often routing failed open to a wider agent set on this run.
+        out["coordinator_routing"] = self._routing_report()
         try:
             from harness import tool_runner
             out["tool_lifecycle"] = tool_runner.lifecycle_snapshot(since=self._started_wall)

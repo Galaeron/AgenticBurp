@@ -182,7 +182,9 @@ class RunManifest:
                           "sqlmap_targeting": redact(instrumentation.get("sqlmap_targeting")),
                           # Whether each local model's context window held the
                           # largest prompt at run start (OllamaClient.context_preflight).
-                          "context_preflight": _counters(instrumentation.get("context_preflight"))})
+                          "context_preflight": _counters(instrumentation.get("context_preflight")),
+                          # TOK-5: routing calls, fail-opens and the fail-open rate.
+                          "coordinator_routing": _counters(instrumentation.get("coordinator_routing"))})
         self._persist(append_ledger=True)
 
     def _persist(self, *, append_ledger: bool) -> None:
