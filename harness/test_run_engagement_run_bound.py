@@ -175,7 +175,8 @@ async def _legacy_run_engagement(self, host, base_url, *, max_targets=5, max_rou
         funded = [t for t in plan["targets"]
                   if t["action"] != "deferred" and t["method"].upper() == "GET"]
         analyzed = []
-        _tt, _owned = transport_for(None, allowed_hosts=self.allowed_hosts, config=self.config)
+        _tt, _owned = transport_for(None, allowed_hosts=self.allowed_hosts, config=self.config,
+                                    active_mode=True)
         try:
             for t in funded:
                 url = origin + t["path"].replace("{id}", "1")

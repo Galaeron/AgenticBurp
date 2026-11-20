@@ -65,13 +65,13 @@ class StandaloneContextTests(unittest.TestCase):
 
     def test_transport_for_ownership(self):
         # No run of its own -> a standalone context is created and returned as owned.
-        tt, owned = rc.transport_for(None, allowed_hosts=["example.com"])
+        tt, owned = rc.transport_for(None, allowed_hosts=["example.com"], active_mode=True)
         self.assertIsInstance(tt, rc.TargetTransport)
         self.assertIsNotNone(owned)
         _run(owned.aclose())
         # A provided run is used directly and must NOT be owned/closed by the caller.
         ctx = rc.standalone_context(["example.com"])
-        tt2, owned2 = rc.transport_for(ctx, allowed_hosts=["example.com"])
+        tt2, owned2 = rc.transport_for(ctx, allowed_hosts=["example.com"], active_mode=True)
         self.assertIsInstance(tt2, rc.TargetTransport)
         self.assertIsNone(owned2)
 

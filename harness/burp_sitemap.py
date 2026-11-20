@@ -278,6 +278,11 @@ def item_to_exchange(item: BurpItem) -> HttpExchange:
 
 
 def _host_allowed(url: str, allowed_hosts: list[str] | None) -> bool:
+    # A read-only IMPORT filter: this module parses an operator-supplied Burp export and
+    # sends nothing (test_empty_scope_fail_closed asserts it has no sender), so an unset
+    # scope keeps the passive admission -- the import is the operator's own traffic. Any
+    # later send of an imported exchange is scoped by its run's transport, which fails
+    # closed on an empty scope. A path that SENDS must not copy this default.
     if not allowed_hosts:
         return True
     host = (urlsplit(url).hostname or "").lower()

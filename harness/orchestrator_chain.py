@@ -710,7 +710,8 @@ class ChainMixin:
         # URL's origin), matching a raw client that just sent it to `url`. I05: it
         # spends the analysis run when there is one; a standalone context otherwise.
         _tt, _owned = transport_for(
-            run_context, allowed_hosts=self.allowed_hosts, config=self.config)
+            run_context, allowed_hosts=self.allowed_hosts, config=self.config,
+            active_mode=True)
         try:
             await global_throttle.acquire()
             cred = await _tt.send_creds("GET", url, capability="credential_probe",
@@ -1882,7 +1883,7 @@ class ChainMixin:
                     # when present, else a standalone one). send_creds forwards the probe
                     # role's own credentials; max_redirects=0 == follow_redirects=False.
                     _tt, _owned = transport_for(run_context, allowed_hosts=self.allowed_hosts,
-                                                config=self.config)
+                                                config=self.config, active_mode=True)
                     try:
                         await global_throttle.acquire()
                         out = await _tt.send_creds("GET", exchange.url,

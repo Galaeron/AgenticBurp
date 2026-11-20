@@ -277,8 +277,9 @@ def _header_value(headers, name: str) -> str:
 
 
 def _host_in_scope(url: str, allowed_hosts) -> bool:
+    # Guards every probe, which is a live send: an empty or unset scope admits no host.
     if not allowed_hosts:
-        return True
+        return False
     return scope_lock.host_in_scope(url, allowed_hosts)
 
 
