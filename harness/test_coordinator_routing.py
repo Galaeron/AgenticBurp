@@ -187,6 +187,15 @@ class FailOpenRateTest(unittest.TestCase):
         self.assertEqual(saved["coordinator_routing"]["fail_open_rate"], round(2 / 3, 4))
         self.assertEqual(saved["coordinator_routing"]["calls"], 3)
 
+    def test_a_sanitiser_failure_fails_open_and_is_counted(self):
+        """The routing prompt is built inside the try: a sanitiser error takes the
+        fail-open path (counted) instead of escaping choose_agents."""
+        with mock.patch("harness.security.sanitized_exchange", side_effect=RecursionError("deep")):
+            dispatch, reason = _route(_RecordingStub(), "a")
+        self.assertEqual(set(dispatch), set(_AVAILABLE))
+        self.assertIn("fallback", reason)
+        self.assertEqual(coordinator.fail_open_stats()["count"], 1)
+
     def test_rate_disappears_when_the_call_counter_is_forced_off(self):
         """Negative control: with the denominator counter disabled the run reports no
         calls and no rate, so the assertions above depend on _record_routing_call."""
