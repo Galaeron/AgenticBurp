@@ -21,6 +21,7 @@ from harness.models import (AnalysisRequest, AnalysisResponse, ValidationSubmiss
                      ObservationAttributionCorrection)
 import harness.identity as identity_mod
 from harness.orchestrator import Orchestrator
+from harness.orchestrator_confirm import ProbeScopeRefused
 
 logging.basicConfig(level=logging.INFO)
 security.install_privacy_log_filters()
@@ -1036,11 +1037,17 @@ async def active_probe(req: ActiveProbeRequest, authorization: str | None = Head
     _require_target_fetch(req.exchange.url, bulk=True)
     if not orchestrator.iterative_agent_enabled:
         raise HTTPException(status_code=403, detail="iterative_agent is disabled in config.yaml")
+    # ARC-2: the model chooses these requests, so they need an explicit scope that
+    # covers the exchange; an empty server.allowed_hosts refuses instead of
+    # admitting whatever host the submitted exchange names.
+    _require_active_scope(req.exchange.url, action="active probe")
     try:
         return await orchestrator.run_active_probe(
             req.exchange, req.hypothesis, req.specialty,
             model=req.model or "", step_budget=req.step_budget or None,
         )
+    except ProbeScopeRefused as e:
+        raise HTTPException(status_code=403, detail=str(e)) from None
     except Exception as e:
         log.error("Unhandled error during active probe: %s", security.safe_error_summary(e))
         return JSONResponse(status_code=500, content={"error": security.safe_error_summary(e)})

@@ -1292,14 +1292,17 @@ def _address_pins_from_config(config: dict | None) -> "AddressPins | None":
 
 
 def standalone_context(allowed_hosts, *, config: dict | None = None, gate=None,
-                       active_mode: bool = False, timeout: float = 15.0,
+                       active_mode: bool = True, timeout: float = 15.0,
                        max_requests: int | None = None) -> "RunContext":
     """A minimal RunContext for a caller that has no run of its own but still wants
     the ONE TargetTransport path instead of a raw httpx client (W-16 full closure).
 
     Its scope is a HostAllowScope, so a send previously guarded by
     `scope_discovery.is_host_allowed(url, allowed_hosts)` uses the same strict
-    exact-host intersection as the gate. Pass `gate` to
+    exact-host intersection as the gate. ARC-2: `active_mode` defaults to True, so
+    an empty `allowed_hosts` admits no host. A caller that only replays traffic the
+    operator supplied, and keeps the passive empty-scope admission, must pass
+    active_mode=False explicitly (transport_for does, by its own default). Pass `gate` to
     reuse the caller's existing SafetyGate (e.g. the
     iterative agent's) so mutating-method decisions are unchanged; otherwise a fresh
     per-context gate is used. The caller owns the returned context and must aclose()

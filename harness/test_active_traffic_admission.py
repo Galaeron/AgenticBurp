@@ -1,5 +1,5 @@
-"""ARC-1 (2026-11-19 principal audit): admission for routes that send target
-traffic.
+"""ARC-1 and ARC-2 (2026-11-19 principal audit): admission for routes that send
+target traffic.
 
 ARC-1. A static call-graph scan of `app.routes` finds every handler that reaches
 `RunContext.create`, `standalone_context` or `transport_for`; server's admission
@@ -9,12 +9,20 @@ each answers 403 while an owned loopback target counts zero requests.
 Negative control: strip the dependency from one route; the structural check
 reports it, the behavioural check fails, and that route then sends.
 
+ARC-2. With iterative_agent.enabled and server.allowed_hosts=[], POST /active-probe
+answers 403 and the target receives nothing. Each layer refuses on its own: the
+route's active scope admission, run_active_probe's standalone admission, and the
+standalone context's active default (its transport refuses the send).
+Negative control: the old default (active_mode=False, no admission) sends the
+model-chosen request to the unscoped host.
+
 Every target is an owned loopback server (test_no_run_route_callers._Target);
 nothing leaves 127.0.0.1.
 """
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib
 import inspect
 import shutil
@@ -27,7 +35,7 @@ from unittest.mock import patch
 
 from fastapi.routing import APIRoute
 
-from harness import global_throttle, run_context, safety_gate, store
+from harness import global_throttle, iterative_agent, run_context, safety_gate, store
 from harness.test_no_run_route_callers import _IN_SCOPE, _Target, _page
 
 _MISSING = object()
@@ -357,6 +365,118 @@ class TrafficRouteAdmissionTests(_AdmissionFixture):
                 self.assert_refused_without_sends(("POST", "/probe-missing-auth"))
         self.assertIn("/api/report", self.site.paths())
         self.assertTrue(self.transport_sends)
+
+
+# ---------------------------------------------------------------------------
+# ARC-2
+# ---------------------------------------------------------------------------
+
+def _old_default_standalone(real):
+    def standalone(*args, **kwargs):
+        return real(*args, **{**kwargs, "active_mode": False})
+    return standalone
+
+
+class ActiveProbeEmptyScopeTests(_AdmissionFixture):
+    """/active-probe with the agent enabled and server.allowed_hosts=[]."""
+
+    def setUp(self):
+        super().setUp()
+        self.arm(True)
+        self.server.orchestrator.allowed_hosts = []
+        self.agent_sends: list[tuple] = []
+
+        async def model_run(agent, exchange, hypothesis, specialty, **kwargs):
+            # The model's first move: re-send the captured request through the
+            # agent's own send path (its run's TargetTransport).
+            self.agent_sends.append(await agent._execute("GET", exchange.url, {}, None))
+            return iterative_agent.IterativeResult(agent=f"iterative:{specialty}", stop_reason="gave_up")
+        model = patch.object(iterative_agent.IterativeAgent, "run", model_run)
+        model.start()
+        self.addCleanup(model.stop)
+
+    def _probe(self):
+        return self.client.post("/active-probe", json={
+            "exchange": self.exchange(), "hypothesis": "idor on report id", "specialty": "idor"})
+
+    def _layers(self, *, route=True, orchestrator=True, active_default=True):
+        from harness import orchestrator_confirm
+        patches = []
+        if not route:
+            patches.append(patch.object(self.server, "_require_active_scope", lambda *a, **k: None))
+        if not orchestrator:
+            patches.append(patch.object(orchestrator_confirm, "_require_standalone_probe_scope",
+                                        lambda *a, **k: None))
+        if not active_default:
+            patches.append(patch.object(run_context, "standalone_context",
+                                        _old_default_standalone(run_context.standalone_context)))
+        return patches
+
+    def _run(self, **layers):
+        patches = self._layers(**layers)
+        for p in patches:
+            p.start()
+        try:
+            return self._probe()
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def test_empty_scope_refuses_with_zero_sends(self):
+        response = self._run()
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertIn("no server.allowed_hosts configured", response.json()["detail"])
+        self.assertEqual(self.agent_sends, [])
+        self.assertEqual(self.site.requests, [])
+        self.assertEqual(self.transport_sends, [])
+
+    def test_route_admission_alone_refuses(self):
+        response = self._run(orchestrator=False, active_default=False)
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(self.agent_sends, [])
+        self.assertEqual(self.site.requests, [])
+
+    def test_standalone_probe_admission_alone_refuses(self):
+        response = self._run(route=False, active_default=False)
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertIn("allowed_hosts", response.json()["detail"])
+        self.assertEqual(self.agent_sends, [])
+        self.assertEqual(self.site.requests, [])
+
+    def test_active_standalone_default_alone_blocks_the_send(self):
+        response = self._run(route=False, orchestrator=False)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.agent_sends), 1)
+        status, reason = self.agent_sends[0]
+        self.assertIsNone(status)
+        self.assertIn("out of scope", reason)
+        self.assertEqual(self.site.requests, [])
+
+    def test_negative_control_old_default_sends_to_the_unscoped_host(self):
+        response = self._run(route=False, orchestrator=False, active_default=False)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.agent_sends[0][0], 200)
+        self.assertIn("/api/report", self.site.paths())
+
+
+class StandaloneContextDefaultTests(unittest.TestCase):
+    """standalone_context() is active by default: an empty scope admits nothing."""
+
+    def _in_scope(self, **kwargs) -> bool:
+        async def check():
+            context = run_context.standalone_context([], **kwargs)
+            try:
+                return context.scope.in_scope("http://127.0.0.1:8080/api/report")
+            finally:
+                await context.aclose()
+        return asyncio.run(check())
+
+    def test_default_is_active_and_empty_scope_fails_closed(self):
+        self.assertIs(inspect.signature(run_context.standalone_context).parameters["active_mode"].default, True)
+        self.assertFalse(self._in_scope())
+
+    def test_negative_control_explicit_passive_mode_admits_any_host(self):
+        self.assertTrue(self._in_scope(active_mode=False))
 
 
 if __name__ == "__main__":
