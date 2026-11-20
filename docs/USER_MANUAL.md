@@ -5,6 +5,16 @@ too — this tool is an unproven research prototype, not a drop-in scanner.
 
 ## 1. First run — and why it may "find nothing"
 
+Install first, from the repository root (the lock is the dependency set CI tests; the
+server also warns at startup, and lists any difference under `dependency_lock` in
+`/health/details`, when installed versions differ from it):
+
+```bash
+pip install -r harness/requirements.lock
+pip install -e . --no-deps
+python -m harness.lock_preflight    # optional: report installed-vs-lock mismatches
+```
+
 ```bash
 ollama serve                 # 1. start the model backend
 ollama pull qwen3:8b         # 2. pull the default model (name must match config.yaml)

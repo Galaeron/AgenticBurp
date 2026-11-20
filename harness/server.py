@@ -95,6 +95,15 @@ config, _explicit_config_keys = load_config()
 orchestrator = Orchestrator(config, explicit_keys=_explicit_config_keys)
 from harness.source_identity import capture_source_snapshot
 _startup_source = capture_source_snapshot()
+# OPS-3: warn at startup when installed packages differ from harness/requirements.lock
+# (advisory: never blocks startup); the same report is served by the authenticated
+# GET /health/details as `dependency_lock`.
+try:
+    from harness import lock_preflight
+    _dependency_lock = lock_preflight.log_report(lock_preflight.check_lock(), log).to_dict()
+except Exception as _lock_check_error:
+    log.warning("dependency lock check skipped (%s)", _lock_check_error)
+    _dependency_lock = {"lock_found": False, "ok": True, "error": str(_lock_check_error)}
 app = FastAPI(title="Burp LLM Harness", version="0.1.0")
 
 
@@ -533,6 +542,8 @@ async def health_details(authorization: str | None = Header(default=None)):
         "coordinator_fail_opens": coordinator.fail_open_stats(),
         "model_egress": model_egress.egress_state(
             config, model_egress.agent_models_of(orchestrator.agent_manager)),
+        # OPS-3: installed-versus-lock mismatches found at startup (advisory).
+        "dependency_lock": _dependency_lock,
     }
 
 
