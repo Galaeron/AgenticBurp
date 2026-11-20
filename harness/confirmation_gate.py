@@ -432,8 +432,9 @@ def lifecycle_counts(findings) -> dict:
             given_reason = finding.get("lead_reason") if isinstance(finding, dict) else None
             reason = given_reason or _LEAD_REASON_BY_VERDICT.get(
                 _confirmed_and_verdict(finding)[1].lower(), "")
-            if reason in counts["lead_by_reason"]:
-                counts["lead_by_reason"][reason] += 1
+            # A LEAD with no known reason had no held negative on record: untested,
+            # so the split always sums to the LEAD total.
+            counts["lead_by_reason"][reason if reason in LEAD_REASONS else LEAD_UNTESTED] += 1
     return counts
 
 

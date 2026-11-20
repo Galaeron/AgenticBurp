@@ -556,7 +556,7 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
                  f"**{len(unconfirmed)} unconfirmed finding(s)**, "
                  f"**{len(chains)} potential attack chain(s)**{_leads_note}{_appendix_note}.")
     lines.append("")
-    lines.append(_lifecycle_line(confirmed + tool_reported + unconfirmed))
+    lines.append(_lifecycle_line(confirmed + tool_reported + unconfirmed + leads_bucket))
     if collapsed_count:
         lines.append("")
         lines.append(f"*{collapsed_count} duplicate finding(s) were collapsed* -- the same class proven or "

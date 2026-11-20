@@ -63,6 +63,13 @@ class LeadReasonMappingTests(unittest.TestCase):
         self.assertEqual(counts["lead_by_reason"],
                          {"refuted": 1, "untested": 2, "rejected": 1, "environment": 0})
 
+    def test_a_lead_without_a_known_reason_counts_as_untested(self):
+        counts = cg.lifecycle_counts([{"confirmed": False, "review_verdict": "",
+                                       "lifecycle_state": "LEAD", "lead_reason": ""}])
+        self.assertEqual(counts["LEAD"], 1)
+        self.assertEqual(sum(counts["lead_by_reason"].values()), 1)
+        self.assertEqual(counts["lead_by_reason"]["untested"], 1)
+
 
 class LeadReasonCallerTests(unittest.TestCase):
     """Gate -> store -> findings API -> report, for a held-control negative
@@ -117,6 +124,16 @@ class LeadReasonCallerTests(unittest.TestCase):
         store.persist_findings(HttpExchange(url=f"{_URL}/open", method="GET"), "sqli", [_finding()])
         md = generate_markdown_report("target.test", store.all_host_findings(_URL))
         self.assertIn("Lifecycle: **0 CONFIRMED**, **1 SUSPECTED**, **0 LEAD**.", md)
+
+    def test_quarantined_leads_count_in_the_headline_totals(self):
+        finding = self._gate_and_persist("", "silent")
+        rows = store.all_host_findings(_URL)
+        for row in rows:
+            row["basis"] = "assumed"  # routed to the quarantined leads bucket
+        md = generate_markdown_report("target.test", rows, quarantine_leads=True)
+        self.assertIn("quarantined test suggestion", md)
+        self.assertIn("**1 LEAD** (1 untested -- no leg ran a held negative)", md)
+        self.assertEqual(finding.review_verdict, "inconclusive_unverified")
 
 
 if __name__ == "__main__":
