@@ -125,9 +125,12 @@ class Finding(BaseModel):
     # no leg is known to have proved it, structurally, not by string luck.
     confirmed_by_leg: str = ""
 
-    # Originating-case coordinates (T01).  Producers may supply authoritative
-    # values; the orchestrator derives a stable invocation-local finding_id when
-    # legacy findings omit one.  proof_id/case_id are populated only after the
+    # Originating-case coordinates (T01).  Harness producers may supply
+    # authoritative values; the orchestrator derives a stable invocation-local
+    # finding_id when a finding has none.  An agent's JSON never sets
+    # finding_id, request_template_id or workflow_state_id, and its principal_id
+    # stands only when it names a session principal of the run (ARC-5,
+    # sanitize_agent_finding).  proof_id/case_id are populated only after the
     # exact finding's proof is durably persisted.
     finding_id: str = ""
     principal_id: str = ""
@@ -198,14 +201,49 @@ AGENT_AUTHORITY_FIELDS = frozenset({
 })
 
 
-def sanitize_agent_finding(raw: dict) -> dict:
-    """Strip every harness-owned authority field (R02) from one raw finding
-    dict parsed from an agent's JSON output, before it is passed to
-    Finding(**...). Pydantic silently ignores unrecognized keys rather than
-    rejecting them, so an unlisted field the model invents is harmless on
-    its own; this only removes the specific REAL fields that would
-    otherwise grant unearned authority."""
-    clean = {k: v for k, v in raw.items() if k not in AGENT_AUTHORITY_FIELDS}
+# ARC-5: the only fields an agent's JSON may set -- its hypothesis. Everything
+# else on Finding is the harness's: the R02 authority fields above, and the case
+# identity (finding_id, request_template_id, workflow_state_id) that keys case
+# refs and proofs. An allowlist, so a field added to Finding later stays the
+# harness's until it is listed here. principal_id is listed but stands only when
+# it names a session principal of the run (session_principal_ids), because it
+# keys the stored fingerprint that tester suppressions match.
+AGENT_SETTABLE_FIELDS = frozenset({
+    "vulnerability_class", "confidence", "summary", "evidence", "suggested_test",
+    "basis", "severity", "owasp_category", "validation_hints",
+    "parameter_location", "parameter_name", "principal_id",
+})
+assert not AGENT_SETTABLE_FIELDS & AGENT_AUTHORITY_FIELDS
+
+
+def session_principal_ids(run_context=None) -> frozenset[str]:
+    """The principals of the run's sessions (default: the run whose `async with`
+    encloses this call). Empty when there is no run: then no agent-named
+    principal stands."""
+    if run_context is None:
+        from harness.run_context import current_run_context
+        run_context = current_run_context()
+    try:
+        return frozenset(s.principal_id for s in run_context.sessions.all() if s.principal_id)
+    except Exception:
+        return frozenset()
+
+
+def sanitize_agent_finding(raw: dict, *, principals: frozenset[str] | None = None) -> dict:
+    """Keep only the fields an agent may set (AGENT_SETTABLE_FIELDS, ARC-5) of one
+    raw finding dict parsed from an agent's JSON output, before it is passed to
+    Finding(**...). Every harness-owned field is dropped: the R02 authority
+    fields (confirmed, proof_id, ...) and the case identity (finding_id,
+    request_template_id, workflow_state_id), so a model can neither mint a
+    confirmation nor choose the id two findings share a case under. A
+    principal_id stands only when it is one of `principals` (default: the
+    current run's session principals); otherwise it is dropped, before the
+    finding is ever fingerprinted."""
+    clean = {k: v for k, v in raw.items() if k in AGENT_SETTABLE_FIELDS}
+    if "principal_id" in clean:
+        allowed = session_principal_ids() if principals is None else principals
+        if not (isinstance(clean["principal_id"], str) and clean["principal_id"] in allowed):
+            del clean["principal_id"]
     # The parameter a finding names steers which injection point a leg tests
     # first. A model writing null or a non-string there must not fail the whole
     # report on Finding's str type, so anything unusable becomes "unnamed".
