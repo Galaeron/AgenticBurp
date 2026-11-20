@@ -14,11 +14,18 @@ python -m harness.server     # 3. start the harness on 127.0.0.1:8787
 Then **check readiness** — this is the first thing to do if results look empty:
 
 ```bash
-curl -s http://127.0.0.1:8787/health
+curl -s -H "Authorization: Bearer $HARNESS_TOKEN" http://127.0.0.1:8787/health/details
 ```
 
-`status` is `"ok"` only when Ollama is reachable **and** every configured local
-model is pulled. If it is `"degraded"`, the `ollama` block says why
+`$HARNESS_TOKEN` is the pairing token the Burp extension uses: your
+`HARNESS_BEARER_TOKEN` if you set one, else the ephemeral token the server
+writes to `harness/.harness_token.lock` at startup. `GET /health` is liveness
+only: it needs no token, contacts nothing and answers `{"status": "ok"}` while
+the server runs. `GET /health/details` caches its backend probe for 10 s
+(`probe_age_seconds`); `model_egress` lists any slot that holds a cloud model
+and whether `ollama.allow_cloud_models` lets it run. Its `status` is `"ok"` only
+when Ollama is reachable **and** every configured local model is pulled. If it
+is `"degraded"`, the `ollama` block says why
 (`reachable: false`, or `missing_models: ["qwen3:8b"]` with an `ollama pull`
 hint) and `agent_models` shows the model each agent will actually use. A server
 with no working model still answers `/analyze` with HTTP 200, but the response

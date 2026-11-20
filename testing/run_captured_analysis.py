@@ -110,7 +110,9 @@ def main(argv=None) -> int:
     if args.limit:
         exchanges = exchanges[: args.limit]
 
-    status, health = http_json("GET", f"{args.server}/health", None, 30)
+    # ARC-8: readiness (backend probe, agent models, model egress) is the
+    # authenticated /health/details; /health is liveness only.
+    status, health = http_json("GET", f"{args.server}/health/details", None, 30)
     status, cleared = http_json("POST", f"{args.server}/cache/clear", None, 60)
 
     meta = {

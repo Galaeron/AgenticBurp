@@ -710,7 +710,7 @@ agent_defaults:
 # that agent behind on the old one. These agents therefore set only `enabled`
 # and inherit the default model; the harness logs each agent's resolved model
 # at startup, warns when an override shadows the default, and exposes the full
-# agent->model map at GET /health so you can verify what actually runs. Add a
+# agent->model map at GET /health/details so you can verify what actually runs. Add a
 # `model:` here ONLY when it must genuinely differ from the default.
 agents:
   sqli:
@@ -857,7 +857,7 @@ server:
   # /telemetry, /test-plans/{plan_id}, GET /settings) require the same
   # effective bearer token already required on mutations (server.auth_token/
   # HARNESS_BEARER_TOKEN if configured, else the ephemeral RB-1 token).
-  # /health stays open either way, for pairing/liveness.
+  # /health (liveness only) stays open either way; /health/details needs the token.
   #
   # SAFE DEFAULT: false. Shipping true here would break the Burp extension's
   # existing unauthenticated reads until its Java side is updated to send the
