@@ -139,12 +139,25 @@ class OllamaContextTruncatedError(OllamaError):
         self.window_source = window_source
 
 
+class OllamaCloudModelRefusedError(OllamaError):
+    """SEC-1: a call to an Ollama cloud model (`-cloud` / `:cloud` suffix) while
+    `ollama.allow_cloud_models` is false. Such a model runs off-host, so the
+    sanitised but real exchange content in the prompt would leave the machine.
+    Raised before any request is sent; a config fault, never retried and kept
+    out of the circuit breaker. `slots` names the config slots involved when the
+    run-start check raised it (model_egress.refuse_cloud_models)."""
+
+    def __init__(self, message: str = "", *, slots: list[dict] | None = None):
+        super().__init__(message)
+        self.slots = list(slots or [])
+
+
 # Exceptions that do not count as circuit-breaker failures: a config-level,
 # per-prompt or rate-limit fault, not a service outage. What still counts: a
 # transport failure, a timeout, a 5xx. Shared with RunContext's per-run breaker.
 BREAKER_EXCLUDED_ERRORS = (OllamaModelNotFoundError, OllamaInvalidJSONError,
                            OllamaContextTruncatedError, OllamaEmptyResponseError,
-                           OllamaRateLimitedError)
+                           OllamaRateLimitedError, OllamaCloudModelRefusedError)
 
 
 # Context-window guard. Ollama does not say when it cuts a prompt: the reply
@@ -172,9 +185,30 @@ _OPENAI_SERVER_KEY = "*server*"
 def is_cloud_model(model: str) -> bool:
     """True for an Ollama cloud model (`gemma4:31b-cloud`, `glm-4.6:cloud`). Those
     run off-host, ignore options.num_ctx and are not in /api/ps, so the context
-    guard and the preflight leave them alone."""
+    guard and the preflight leave them alone. SEC-1: OllamaClient refuses them
+    unless `ollama.allow_cloud_models` is true (see parse_allow_cloud_models)."""
     name = str(model or "").strip().lower()
     return name.endswith("-cloud") or name.endswith(":cloud")
+
+
+def parse_allow_cloud_models(value) -> bool:
+    """`ollama.allow_cloud_models`, strictly: unset means false. Anything but an
+    unquoted boolean raises at startup, so the string "false" cannot be read as
+    an opt-in (the same rule as privacy.external_lookups)."""
+    if value is None:
+        return False
+    if type(value) is not bool:
+        raise ValueError("invalid ollama config: ollama.allow_cloud_models must be an unquoted "
+                         f"true or false, got {value!r}")
+    return value
+
+
+def cloud_refusal_reason(models) -> str:
+    """The operator-facing reason a cloud model was refused (SEC-1)."""
+    names = ", ".join(sorted({str(m) for m in models if m}))
+    return (f"cloud model(s) {names} refused: a -cloud/:cloud model runs off-host, so "
+            "exchange content would leave this machine. Use a local model, or set "
+            "ollama.allow_cloud_models: true in harness/config.local.yaml to accept that egress.")
 
 
 def _model_key(model: str) -> str:
@@ -509,16 +543,20 @@ def parse_backend_settings(api=None, max_output_tokens=None, reasoning_effort=No
 
 def backend_options(ollama_config: dict | None) -> dict:
     """The backend keyword arguments for OllamaClient(...) from a config's `ollama`
-    block, so every construction site passes the same three keys."""
+    block, so every construction site passes the same keys (SEC-1 added
+    allow_cloud_models: every client refuses cloud models unless it is true)."""
     cfg = ollama_config or {}
     return {"api": cfg.get("api"), "max_output_tokens": cfg.get("max_output_tokens"),
-            "reasoning_effort": cfg.get("reasoning_effort")}
+            "reasoning_effort": cfg.get("reasoning_effort"),
+            "allow_cloud_models": cfg.get("allow_cloud_models")}
 
 
 def backend_setting(ollama_config: dict | None) -> dict:
     """Plain-data description of the backend settings for run provenance:
     {"api", "max_output_tokens", "reasoning_effort"}, validated."""
-    api, cap, effort = parse_backend_settings(**backend_options(ollama_config))
+    options = backend_options(ollama_config)
+    api, cap, effort = parse_backend_settings(
+        options["api"], options["max_output_tokens"], options["reasoning_effort"])
     return {"api": api, "max_output_tokens": cap, "reasoning_effort": effort}
 
 
@@ -593,13 +631,21 @@ class OllamaClient:
                  num_ctx: int | None = None, seed: int | None = None,
                  transient_retries: int | None = DEFAULT_TRANSIENT_RETRIES,
                  think: bool | list[str] | None = None, *, api: str | None = None,
-                 max_output_tokens: int | None = None, reasoning_effort: str | None = None):
+                 max_output_tokens: int | None = None, reasoning_effort: str | None = None,
+                 allow_cloud_models: bool | None = None):
         self.base_url = base_url.rstrip("/")
         # `ollama.api` / `ollama.max_output_tokens` / `ollama.reasoning_effort`
         # (see parse_backend_settings). All unset => the Ollama payload is
         # byte-identical to the one sent before these keys existed.
         self.api, self.max_output_tokens, self.reasoning_effort = parse_backend_settings(
             api, max_output_tokens, reasoning_effort, think)
+        # SEC-1: `ollama.allow_cloud_models` (default false). Every model call
+        # goes through _chat, which refuses a cloud-suffixed model before any
+        # request unless this is true, whichever slot (coordinator, routing,
+        # agent override, critique, writeups) or live /settings toggle chose it.
+        self.allow_cloud_models = parse_allow_cloud_models(allow_cloud_models)
+        self.model_cloud_refused_count = 0
+        self._cloud_refusal_warned: set[str] = set()
         # AR-10 P2: opt-in thinking mode (`ollama.think`, see
         # parse_think_setting). Default off, so every payload keeps
         # `"think": False` byte-identical unless a config sets it.
@@ -758,10 +804,12 @@ class OllamaClient:
                            "context_truncated": self.model_context_truncated_count,
                            "output_capped": self.model_output_capped_count,
                            "output_capped_retried": self.model_output_capped_retry_count,
-                           "output_capped_recovered": self.model_output_capped_recovered_count},
+                           "output_capped_recovered": self.model_output_capped_recovered_count,
+                           "cloud_refused": self.model_cloud_refused_count},
                 # Which wire protocol served the run, and its output cap.
                 "backend": {"api": self.api, "max_output_tokens": self.max_output_tokens,
-                            "reasoning_effort": self.reasoning_effort},
+                            "reasoning_effort": self.reasoning_effort,
+                            "allow_cloud_models": self.allow_cloud_models},
                 # Whether this run measured reasoning mode: the configured
                 # setting plus the calls that actually sent think on.
                 "think": {**think_setting(self.think),
@@ -987,8 +1035,28 @@ class OllamaClient:
             return True
         return bool(self.think) and _MODEL_STAGE.get() in self.think
 
+    def _refuse_cloud_model(self, model) -> None:
+        """SEC-1: raise OllamaCloudModelRefusedError, before anything is sent or
+        counted as an attempt, for a cloud model this client may not use. The
+        receipt marks the call as not attempted, so no tokens are settled."""
+        if self.allow_cloud_models or not is_cloud_model(model):
+            return
+        self.model_cloud_refused_count += 1
+        err = OllamaCloudModelRefusedError(cloud_refusal_reason([model]))
+        err.inference_usage = {"prompt_tokens": None, "completion_tokens": None,
+                               "attempted": False, "completed": False, "usable": False,
+                               "outcome": "error", "refused": "cloud_model"}
+        first = model not in self._cloud_refusal_warned
+        self._cloud_refusal_warned.add(model)
+        log.log(logging.WARNING if first else logging.DEBUG, "%s", err)
+        if first:
+            self.audit_logger.log_security_event(
+                event_type="cloud_model_refused", message=str(err), severity="warning")
+        raise err
+
     async def _chat(self, model, system_prompt, user_prompt, temperature=0.1, seed=None):
         """Keep consumption independent of successful JSON parsing."""
+        self._refuse_cloud_model(model)
         started = time.monotonic()
         self.model_attempted_count += 1
         stage = self._stage_row()

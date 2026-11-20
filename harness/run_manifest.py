@@ -104,6 +104,11 @@ class RunManifest:
         out = Path(output_dir or Path(__file__).parent / "run-output")
         root = Path(repo_root or Path(__file__).parent.parent)
         revision, dirty = _git_state(root)
+        # SEC-1: which slots send prompts off-host (cloud models) and whether
+        # ollama.allow_cloud_models opted in, from the config and the models the
+        # agents resolved. A run that would be refused records refused: true.
+        from harness.model_egress import egress_state
+        egress = egress_state(config, (model_versions or {}).get("agents"))
         data = {
             "schema_version": SCHEMA_VERSION, "run_id": run_id,
             "git": {"revision": revision, "dirty": dirty},
@@ -111,6 +116,7 @@ class RunManifest:
             "config": redact(deepcopy(config)), "config_fingerprint": config_fingerprint(config),
             "cache_namespace": cache_namespace, "target_identifier": target_identifier,
             "model_versions": redact(model_versions or {}),
+            "model_egress": redact(egress),
             "tool_versions": redact(tool_versions or {"python": platform.python_version(),
                                                         "platform": platform.platform()}),
             "started_at": time.time(), "finished_at": None, "request_count": None,

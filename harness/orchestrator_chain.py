@@ -1120,6 +1120,11 @@ class ChainMixin:
         `protected_paths` and `owners` are the operator's engagement declarations
         (I16): merged into the state after discovery, where the missing-auth (RV-S)
         and ownership (RV-T) confirmations read them. None or empty changes nothing."""
+        # SEC-1: a cloud-suffixed model in any slot, without
+        # ollama.allow_cloud_models, refuses the run here, before any model call.
+        from harness import model_egress
+        model_egress.refuse_cloud_models(
+            self.config, model_egress.agent_models_of(getattr(self, "agent_manager", None)))
         from harness import engagement_builder
         from harness import worklist_investigator
         from harness import chain_linker

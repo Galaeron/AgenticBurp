@@ -373,6 +373,7 @@ class InvalidEscapeEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 "done": True, "prompt_eval_count": 100, "eval_count": 20,
             })
         client = _make_client(self, handler)
+        client.allow_cloud_models = True  # SEC-1 opt-in: a cloud model's reply is under test
         result = await client.chat_json(model="gemma4:31b-cloud", system_prompt="s", user_prompt="u")
         self.assertEqual(result["findings"][0]["vulnerability_class"], "sql_injection")
         self.assertIn(r"\s", result["findings"][0]["suggested_test"])

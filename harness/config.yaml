@@ -93,6 +93,16 @@ ollama:
   #   reasoning included. A reply that reaches it is discarded and counted as
   #   output_capped, so a model stuck repeating itself fails fast instead of
   #   running to timeout_seconds.
+  #
+  # SEC-1: a model named *-cloud or *:cloud runs on Ollama's cloud, so exchange
+  # content in its prompts leaves this machine. With this false, such a model in
+  # any slot (coordinator.model, coordinator.cloud_model while cloud_primary or
+  # cloud_reasoning is on, agent_defaults.model, agents.<name>.model,
+  # critique.model, surface_prioritization.model, writeups.model) refuses the run
+  # before its first model call, and every call to one is refused unsent. Set it
+  # true only in config.local.yaml, for an engagement that permits the egress;
+  # the run manifest and GET /health/details record it under model_egress.
+  allow_cloud_models: false
 
 # Context-window budget for agent and critique prompts (harness/prompt_budget.py).
 # The context is `ollama.num_ctx` when set, else `model_context_tokens` below;

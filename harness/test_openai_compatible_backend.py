@@ -174,7 +174,7 @@ class OpenAIWireTests(_Base):
         self.assertEqual(snapshot["totals"]["completion_tokens"], 80)
         self.assertEqual(snapshot["client"]["completed"], 1)
         self.assertEqual(snapshot["backend"], {"api": "openai", "max_output_tokens": 2048,
-                                               "reasoning_effort": "low"})
+                                               "reasoning_effort": "low", "allow_cloud_models": False})
 
     async def test_reasoning_content_is_dropped_and_only_its_length_kept(self):
         self.fake.chat_reply = _openai_reply(reasoning=_TRACE)
@@ -265,7 +265,8 @@ class OllamaDefaultControlTests(_Base):
         await client.chat_json("m", "sys", "user")
         self.assertEqual([body for _, _, body in self.fake.requests], [self._base_body("m")])
         self.assertEqual(client.metrics_snapshot()["backend"],
-                         {"api": "ollama", "max_output_tokens": None, "reasoning_effort": None})
+                         {"api": "ollama", "max_output_tokens": None, "reasoning_effort": None,
+                          "allow_cloud_models": False})
 
     async def test_explicit_ollama_api_sends_the_same_bytes(self):
         client = self._orchestrator(api="ollama").ollama
