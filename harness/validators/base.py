@@ -309,10 +309,11 @@ def proves_finding_class(validator, result, finding, exchange=None) -> bool:
     mechanism is the finding's class -- the validator claims that class
     (claims_class), or the result names it among the classes it proves. An
     observation never stands for a vulnerability class (b). A validator without
-    claims_class (a duck-typed stub) keeps the applies() routing as its claim."""
-    from harness.issues import issue_class
+    claims_class (a duck-typed stub) keeps the applies() routing as its claim.
+    Classes are read by categories.finding_class, as proof binding reads them."""
+    from harness.categories import finding_class
     label = finding.vulnerability_class or ""
-    cls = issue_class(label)
+    cls = finding_class(label)
     claims = getattr(validator, "claims_class", None)
     if claims is not None:
         bound = bool(claims(finding, exchange))
@@ -320,9 +321,54 @@ def proves_finding_class(validator, result, finding, exchange=None) -> bool:
         applies = getattr(validator, "applies", None)
         bound = applies is None or bool(applies(finding, exchange))
     if not bound:
-        bound = cls in {issue_class(m) for m in (getattr(result, "mechanism_classes", ()) or ()) if m}
+        bound = cls in {finding_class(m) for m in (getattr(result, "mechanism_classes", ()) or ()) if m}
     if bound and is_observation(result):
         from harness.categories import CANONICAL_CATEGORIES
         if cls in CANONICAL_CATEGORIES and cls not in _OBSERVATION_CLASSES:
             return False
     return bound
+
+
+def binds_routed_class(validator, result, finding, exchange=None, *,
+                       routed_class: str = "", catalog_bound: bool = False) -> bool:
+    """EFF-2: the R11-1 class gate for the dispatchers that pick a leg by check or
+    by label substring rather than by applies(): the engagement graph's _confirm,
+    its shape-precondition legs and its coverage drive (all through
+    orchestrator_chain._ConfirmationCache). A confirmed result counts for `finding`
+    when it proves the finding's class (proves_finding_class), and otherwise only
+    when nothing says it proved another class.
+
+    Readings beyond PASS1, which reaches a validator only through applies():
+    - A label this taxonomy cannot read (categories.is_known_class) names no class
+      the proof could be against, so the dispatcher's routing stands.
+    - An observation never stands for a vulnerability class (as in PASS1).
+    - `catalog_bound`: the check catalog chose this validator for the check's class
+      (coverage drive), so only the result's own contradiction refuses.
+    - A result naming mechanism_classes proved those classes and no other.
+    - `routed_class`: the branch's own class; the dispatcher already matched the
+      finding to this leg, so the leg stands for it unless the validator's
+      class-only claims_class (or its declared finding_classes, for a validator
+      whose claims_class is the shape-dependent default) excludes the class."""
+    if not getattr(result, "confirmed", False):
+        return True
+    from harness.categories import CANONICAL_CATEGORIES, finding_class, is_known_class
+    cls = finding_class(getattr(finding, "vulnerability_class", "") or "")
+    if not is_known_class(cls):
+        return True
+    if proves_finding_class(validator, result, finding, exchange):
+        return True
+    if is_observation(result) and cls in CANONICAL_CATEGORIES and cls not in _OBSERVATION_CLASSES:
+        return False
+    if catalog_bound:
+        return True
+    named = {finding_class(m) for m in (getattr(result, "mechanism_classes", ()) or ()) if m}
+    if named:
+        return False   # the result says which classes it proved; this is not one
+    if not isinstance(validator, Validator):
+        return False   # a duck-typed stub has no claim to stand on
+    if type(validator).claims_class is not Validator.claims_class:
+        return False   # a class-only claims_class already said no
+    declared = {finding_class(fc) for fc in (getattr(validator, "finding_classes", ()) or ())}
+    if routed_class and finding_class(routed_class) == cls:
+        return not declared or cls in declared
+    return cls in declared

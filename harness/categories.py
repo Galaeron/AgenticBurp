@@ -463,6 +463,29 @@ def grouping_class(raw: str | None) -> str | None:
     return None
 
 
+def finding_class(raw: str | None) -> str:
+    """The one class reading used wherever a proof meets a claim (EFF-2): the R11-1
+    class gate (validators.base.proves_finding_class), proof binding to stored rows
+    (store.bind_confirmation_proof) and issue grouping (issues.issue_class).
+
+    The canonical class, else a distinctive class token in the label ("Broken Access
+    Control (BOLA) on Workflow Scope" -> idor), else the label variant's class (R11-2:
+    case and separators folded, a "potential_"/lead marker dropped,
+    "exposed_public_metrics_endpoint" -> metrics_exposure; see grouping_class), else
+    the raw lowercased label. The stored fingerprint keeps legacy_canonicalize, so
+    suppressions stay valid."""
+    vc = raw or ""
+    return (canonicalize(vc) or distinctive_token(vc) or grouping_class(vc)
+            or vc.strip().lower())
+
+
+def is_known_class(cls: str | None) -> bool:
+    """Whether `cls` (a finding_class() result) is one this taxonomy names. A label
+    that reads as none of them is free text: it names no class a proof could be
+    for or against."""
+    return bool(cls) and (cls in CANONICAL_CATEGORIES or cls in GROUPING_CLASSES)
+
+
 def all_known_phrases() -> dict[str, str]:
     """
     Public accessor for the full exact-match phrase table: every

@@ -26,6 +26,7 @@ from harness.circuit_breaker import get_ollama_circuit_breaker
 from harness.run_context import transport_for, ExecutionOutcome, case_scope, count_sends
 from harness.execution_registry import ExecutionRegistry
 from harness.validators.injection_targets import REQUEST_LEVEL_INPUTS, case_target
+from harness.validators.base import binds_routed_class, mechanism_class_of
 from harness.coverage_model import derive_input_cases_from_template
 from harness import run_journal
 from harness import review_overlap
@@ -110,7 +111,7 @@ class _ConfirmationCache:
         returns the cached result. A hit for another case returns a copy
         without the named exchanges, which were recorded under the first case
         and do not resolve here: that proof stays a candidate. The cached
-        original is never changed."""
+        original is never changed. Ungated: callers go through confirm()."""
         if case_ref is None:
             try:
                 case_ref = self._case_for(getattr(finding_obj, "vulnerability_class", ""), exchange)
@@ -134,6 +135,32 @@ class _ConfirmationCache:
         # A same-case hit is the cached object itself: it carries the original
         # attempt id, which the matrix merges by id, so no fresh attempt is
         # counted twice. A hit for another case is the registry's covered copy.
+        return result
+
+    async def confirm(self, validator, finding_obj, exchange, case_ref=None, *,
+                      routed_class: str = "", catalog_bound: bool = False):
+        """validate(), then the R11-1 class gate (EFF-2).
+
+        Every graph, shape-precondition and coverage leg dispatches through
+        here, so this is where the gate PASS1 applies holds for them
+        (validators.base.binds_routed_class). `routed_class` is the class of the
+        _confirm branch that chose the leg; `catalog_bound` marks a coverage leg,
+        which the check catalog chose for the finding's class. A confirmation
+        that does not prove the finding's class comes back as a skipped copy
+        naming the class it proved."""
+        result = await self.validate(validator, finding_obj, exchange, case_ref)
+        if (result is not None and getattr(result, "confirmed", False)
+                and not binds_routed_class(validator, result, finding_obj, exchange,
+                                           routed_class=routed_class,
+                                           catalog_bound=catalog_bound)):
+            import dataclasses
+            proved = mechanism_class_of(validator, result)
+            label = getattr(finding_obj, "vulnerability_class", "") or ""
+            # A copy, as PASS1's gate makes: the cached original stays as it ran.
+            result = dataclasses.replace(
+                result, confirmed=False, status="skipped", confidence=0.0,
+                summary=(f"{result.validator} proved {proved!r}, not this finding's class "
+                         f"{label!r}; not bound to it ({result.summary})"))
         return result
 
 
@@ -1593,7 +1620,7 @@ class ChainMixin:
         # review or the drive.
         _cached_validate = _ConfirmationCache(
             run_context, lambda cls, exchange: _rb4_case(cls, exchange).case_id,
-            registry=_exec_registry).validate
+            registry=_exec_registry).confirm
 
         # RB-4/INV-2: this path (worklist_investigator's confirm_fn for agent
         # findings, and its precondition_fn for every shape-driven leg dispatch
@@ -1851,7 +1878,7 @@ class ChainMixin:
                 # Before access control: "cross_identity_write" and friends are
                 # creates this leg reads back and deletes, not object reads.
                 try:
-                    await _apply(finding, await _cached_validate(_wi, _as_finding(finding, "write_integrity"), exchange),
+                    await _apply(finding, await _cached_validate(_wi, _as_finding(finding, "write_integrity"), exchange, routed_class="write_integrity"),
                            "write-integrity", 0.9, exchange)
                 except Exception:
                     return
@@ -1885,21 +1912,21 @@ class ChainMixin:
                         if _owned is not None:
                             await _owned.aclose()
                 try:
-                    await _apply(finding, await _cached_validate(_xval, _as_finding(finding, "idor"), exchange), "cross-identity", 0.9, exchange)
+                    await _apply(finding, await _cached_validate(_xval, _as_finding(finding, "idor"), exchange, routed_class="idor"), "cross-identity", 0.9, exchange)
                     # Single-principal follow-up: if no second identity confirmed a
                     # cross-identity breach, run the object-id read differential
                     # (own vs foreign vs absent) as the captured principal. It never
                     # confirms (RV-D2), so `_apply` leaves the finding unconfirmed
                     # and keeps only any manual-verification guidance it carries.
                     if not finding.get("confirmed"):
-                        await _apply(finding, await _cached_validate(_idor_read, _as_finding(finding, "idor"), exchange), "idor-read", 0.75, exchange)
+                        await _apply(finding, await _cached_validate(_idor_read, _as_finding(finding, "idor"), exchange, routed_class="idor"), "idor-read", 0.75, exchange)
                 except Exception:
                     return
             elif ("dom" in low and "xss" in low) or "dom_xss" in low or "dom-based" in low or "client-side xss" in low:
                 # DOM-based XSS: fragment-payload browser execution (client-side
                 # source->sink), distinct from server-reflected browser_xss.
                 try:
-                    await _apply(finding, await _cached_validate(_domxss, _as_finding(finding, "dom_xss"), exchange),
+                    await _apply(finding, await _cached_validate(_domxss, _as_finding(finding, "dom_xss"), exchange, routed_class="dom_xss"),
                            "dom-xss", 0.95, exchange)
                 except Exception:
                     return
@@ -1908,26 +1935,26 @@ class ChainMixin:
                 # XSS and (crucially for a JSON API) declines what never reaches an HTML
                 # sink. Skips gracefully if no browser engine is installed.
                 try:
-                    await _apply(finding, await _cached_validate(_bxss, _as_finding(finding, "xss"), exchange), "browser-xss", 0.95, exchange)
+                    await _apply(finding, await _cached_validate(_bxss, _as_finding(finding, "xss"), exchange, routed_class="xss"), "browser-xss", 0.95, exchange)
                     # reflected browser_xss handles GET reflections; a write-shaped
                     # exchange may instead be a STORED-XSS plant point -- try that leg too.
                     if not finding.get("confirmed") and (exchange.method or "GET").upper() in ("POST", "PUT", "PATCH"):
-                        await _apply(finding, await _cached_validate(_sxss, _as_finding(finding, "xss"), exchange), "stored-xss", 0.9, exchange)
+                        await _apply(finding, await _cached_validate(_sxss, _as_finding(finding, "xss"), exchange, routed_class="xss"), "stored-xss", 0.9, exchange)
                 except Exception:
                     return
             elif "jwt" in low or "algorithm confusion" in low or "algorithm_confusion" in low or "weak_token" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_jwt, _as_finding(finding, "jwt"), exchange), "jwt-forge", 0.9, exchange)
+                    await _apply(finding, await _cached_validate(_jwt, _as_finding(finding, "jwt"), exchange, routed_class="jwt"), "jwt-forge", 0.9, exchange)
                 except Exception:
                     return
             elif "ssrf" in low or "server-side request" in low or "server_side_request" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_ssrf, _as_finding(finding, "ssrf"), exchange), "ssrf", 0.95, exchange)
+                    await _apply(finding, await _cached_validate(_ssrf, _as_finding(finding, "ssrf"), exchange, routed_class="ssrf"), "ssrf", 0.95, exchange)
                 except Exception:
                     return
             elif "xxe" in low or "xml external" in low or "xml_external" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_xxe, _as_finding(finding, "xxe"), exchange), "xxe", 0.95, exchange)
+                    await _apply(finding, await _cached_validate(_xxe, _as_finding(finding, "xxe"), exchange, routed_class="xxe"), "xxe", 0.95, exchange)
                 except Exception:
                     return
             elif ("sqli" in low or "sql injection" in low
@@ -1937,44 +1964,46 @@ class ChainMixin:
                 try:
                     await _apply(
                         finding,
-                        await _cached_validate(_sqlmap, _as_finding(finding, "sqli"), exchange),
+                        await _cached_validate(_sqlmap, _as_finding(finding, "sqli"), exchange, routed_class="sqli"),
                         "sqlmap", 0.95, exchange)
                 except Exception:
                     return
             elif "nosql" in low or "mongodb injection" in low or "mongo injection" in low:
                 try:
                     await _apply(finding, await _cached_validate(
-                        _nosql, _as_finding(finding, "nosql"), exchange),
+                        _nosql, _as_finding(finding, "nosql"), exchange,
+                        routed_class="nosql"),
                         "nosql", 0.95, exchange)
                 except Exception:
                     return
             elif "race_condition" in low or "race condition" in low:
                 try:
                     await _apply(finding, await _cached_validate(
-                        _race, _as_finding(finding, "race_condition"), exchange),
+                        _race, _as_finding(finding, "race_condition"), exchange,
+                        routed_class="race_condition"),
                         "race-condition", 0.95, exchange)
                 except Exception:
                     return
             elif "command" in low or low in ("rce", "remote code execution", "code injection", "shell injection"):
                 try:
-                    await _apply(finding, await _cached_validate(_cmdi, _as_finding(finding, "command_injection"), exchange),
+                    await _apply(finding, await _cached_validate(_cmdi, _as_finding(finding, "command_injection"), exchange, routed_class="command_injection"),
                            "command-injection", 0.95, exchange)
                 except Exception:
                     return
             elif "ssti" in low or "template injection" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_ssti, _as_finding(finding, "ssti"), exchange), "ssti", 0.95, exchange)
+                    await _apply(finding, await _cached_validate(_ssti, _as_finding(finding, "ssti"), exchange, routed_class="ssti"), "ssti", 0.95, exchange)
                 except Exception:
                     return
             elif "traversal" in low or "lfi" in low or "file inclusion" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_path, _as_finding(finding, "path_traversal"), exchange),
+                    await _apply(finding, await _cached_validate(_path, _as_finding(finding, "path_traversal"), exchange, routed_class="path_traversal"),
                            "path-traversal", 0.95, exchange)
                 except Exception:
                     return
             elif "redirect" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_redir, _as_finding(finding, "open_redirect"), exchange),
+                    await _apply(finding, await _cached_validate(_redir, _as_finding(finding, "open_redirect"), exchange, routed_class="open_redirect"),
                            "open-redirect", 0.9, exchange)
                 except Exception:
                     return
@@ -1984,19 +2013,19 @@ class ChainMixin:
                 # TOCTOU privilege-escalation race: concurrent check-then-write.
                 # Must precede the mass/privilege->sequence branch below.
                 try:
-                    await _apply(finding, await _cached_validate(_toctou, _as_finding(finding, "toctou"), exchange),
+                    await _apply(finding, await _cached_validate(_toctou, _as_finding(finding, "toctou"), exchange, routed_class="toctou"),
                            "toctou", 0.85, exchange)
                 except Exception:
                     return
             elif "mass" in low or "assignment" in low or "privilege" in low or low in ("api_security", "api security"):
                 try:
-                    await _apply(finding, await _cached_validate(_seq, _as_finding(finding, "mass_assignment"), exchange),
+                    await _apply(finding, await _cached_validate(_seq, _as_finding(finding, "mass_assignment"), exchange, routed_class="mass_assignment"),
                            "sequence", 0.9, exchange)
                 except Exception:
                     return
             elif "deserial" in low or "pickle" in low or "object injection" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_deser, _as_finding(finding, "deserialization"), exchange),
+                    await _apply(finding, await _cached_validate(_deser, _as_finding(finding, "deserialization"), exchange, routed_class="deserialization"),
                            "deserialization", 0.95, exchange)
                 except Exception:
                     return
@@ -2013,34 +2042,35 @@ class ChainMixin:
                     _record_no_applicable_leg(finding, "auth-sequence", _gap)
                     return
                 try:
-                    await _apply(finding, await _cached_validate(_auth, _as_finding(finding, low or "broken_authentication"), exchange),
+                    await _apply(finding, await _cached_validate(_auth, _as_finding(finding, low or "broken_authentication"), exchange, routed_class=low or "broken_authentication"),
                            "auth-sequence", 0.85, exchange)
                 except Exception:
                     return
             elif ("client_trust" in low or "business" in low or "client-side" in low or "price" in low
                   or "excessive trust" in low or "logic_flaw" in low):
                 try:
-                    await _apply(finding, await _cached_validate(_ct, _as_finding(finding, "business_logic"), exchange),
+                    await _apply(finding, await _cached_validate(_ct, _as_finding(finding, "business_logic"), exchange, routed_class="business_logic"),
                            "client-trust", 0.9, exchange)
                 except Exception:
                     return
             elif "rate limit" in low or "rate_limit" in low or "lockout" in low or "brute" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_rate, _as_finding(finding, "rate_limit"), exchange),
+                    await _apply(finding, await _cached_validate(_rate, _as_finding(finding, "rate_limit"), exchange, routed_class="rate_limit"),
                            "rate-limit", 0.85, exchange)
                 except Exception:
                     return
             elif "csrf" in low or "cross-site request forgery" in low or "cross site request forgery" in low:
                 try:
                     await _apply(finding, await _cached_validate(
-                        _csrf, _as_finding(finding, "csrf"), exchange),
+                        _csrf, _as_finding(finding, "csrf"), exchange,
+                        routed_class="csrf"),
                         "csrf", 0.95, exchange)
                 except Exception:
                     return
             elif ("reset_token" in low or "reset token" in low or "predictable token" in low
                   or "weak token" in low or "token entropy" in low):
                 try:
-                    await _apply(finding, await _cached_validate(_reset, _as_finding(finding, "reset_token"), exchange),
+                    await _apply(finding, await _cached_validate(_reset, _as_finding(finding, "reset_token"), exchange, routed_class="reset_token"),
                            "reset-token", 0.9, exchange)
                 except Exception:
                     return
@@ -2869,9 +2899,12 @@ class ChainMixin:
                         leg_finding = leg_finding.model_copy(update={
                             "parameter_location": REQUEST_LEVEL_INPUTS[check.confirmation],
                             "parameter_name": "", "parameter_only": True})
+                    # EFF-2: the catalog chose this leg for the check's class, so only
+                    # the result itself (an observation) can say it proved another.
                     res = await _cached_validate(
                         validator, leg_finding, ex,
-                        case_ref=leg_case.case_id if leg_case is not None else "")
+                        case_ref=leg_case.case_id if leg_case is not None else "",
+                        routed_class=capability["finding_class"], catalog_bound=True)
                     source = (node.get("capture") or {}).get("substituted_from")
                     if source and res is not None:
                         # R11-10: the cell, the proof and the finding all say whose
