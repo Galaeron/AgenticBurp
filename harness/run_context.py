@@ -49,6 +49,7 @@ import httpcore
 import httpx
 
 from harness import evidence
+from harness import global_throttle
 from harness import scope_lock
 from harness.server_errors import ServerErrorLedger
 from harness.run_observations import RunObservations
@@ -161,6 +162,7 @@ class RequestBudget:
         self._max = max_requests
         self._used = 0
         self._held = 0
+        self._denied = 0
         self._by_label: dict[str, int] = {}
         self._lock = threading.Lock()
 
@@ -170,6 +172,7 @@ class RequestBudget:
         not know theirs leave it blank and are counted as "unlabelled"."""
         with self._lock:
             if self._max is not None and self._used + n > self._max - self._held:
+                self._denied += n
                 return False
             self._used += n
             key = label or "unlabelled"
@@ -204,6 +207,16 @@ class RequestBudget:
     @property
     def remaining(self) -> int | None:
         return None if self._max is None else max(0, self._max - self._used - self._held)
+
+    def state(self) -> dict:
+        """ARC-3: the ceiling's outcome for the run manifest. `exhausted` once a
+        reservation was refused (or the ceiling is fully spent): the run stopped,
+        or lost sends, on `budget_exhausted`."""
+        with self._lock:
+            used, denied = self._used, self._denied
+        exhausted = self._max is not None and (used >= self._max or denied > 0)
+        return {"max_requests": self._max, "used": used, "remaining": self.remaining,
+                "denied": denied, "exhausted": exhausted}
 
 
 class CancelToken:
@@ -912,6 +925,16 @@ class TargetTransport:
             if not decision.allowed:
                 return ExecutionOutcome(outcome="blocked", final_url=url, error=decision.reason,
                                         artifact=self._artifact(url, "blocked", session_ref, case_ref=case_ref, finding_ref=finding_ref))
+            # 2b. ARC-3 pace -- one slot from this ORIGIN's process-wide bucket
+            #     (global_throttle), shared by every run and concurrent job, so the
+            #     configured rate binds the target however many callers send. Each
+            #     redirect hop is paced. A spent budget is refused at once, unpaced.
+            if getattr(ctx.budget, "remaining", None) != 0:
+                await global_throttle.acquire_origin(ScopePolicy.origin_of(url),
+                                                     capability=capability)
+                if ctx.cancel.cancelled and not allow_cancelled_cleanup:
+                    return ExecutionOutcome(outcome="cancelled", final_url=url,
+                                            artifact=self._artifact(url, "cancelled", session_ref, case_ref=case_ref, finding_ref=finding_ref))
             # 3. Budget -- reserve atomically before sending; a denial does not count as executed.
             # Only RequestBudget (and the driver child budget forwarding to it) takes a label.
             if not (ctx.budget.reserve(1, label=capability) if hasattr(ctx.budget, "by_label")
@@ -1175,9 +1198,11 @@ Executor = TargetTransport
 # The pin sits in the httpcore network backend, so the Host header, TLS SNI and
 # certificate hostname checks stay on the name, and nothing changes for clients that
 # never open a socket (mock transports). ON by default; `security.pin_connect_address:
-# false` is an explicit opt-out. Behind an HTTP(S) proxy (trust_env) the proxy
-# resolves the target, so only the connection to the proxy is pinned. A name whose
-# FIRST answer is private or loopback is accepted -- lab targets do that.
+# false` is an explicit opt-out. ARC-14: target clients never honour HTTP(S)_PROXY /
+# ALL_PROXY from the environment (trust_env=False), so a proxy can never take over
+# resolving the target and bypass the pin; the harness has no configured upstream
+# proxy for target traffic. A name whose FIRST answer is private or loopback is
+# accepted -- lab targets do that.
 # ---------------------------------------------------------------------------
 
 class DestinationBlocked(Exception):
@@ -1275,15 +1300,18 @@ def _pinned_backend(pins: "AddressPins | None"):
 
 def _target_client(*, verify, timeout: float, http2: bool,
                    pins: "AddressPins | None") -> httpx.AsyncClient:
-    """An httpx client for target traffic whose connections honour the run's pins."""
-    transport = httpx.AsyncHTTPTransport(verify=verify, http2=http2)
+    """An httpx client for target traffic whose connections honour the run's pins.
+
+    ARC-14: trust_env=False on the client and its transport, so no environment
+    proxy (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY), .netrc or SSL_CERT_* setting is
+    applied: every send connects to the pinned target address itself."""
+    transport = httpx.AsyncHTTPTransport(verify=verify, http2=http2, trust_env=False)
     backend = _pinned_backend(pins)
     if backend is not None:
         transport._pool._network_backend = backend
-    # verify/http2 are passed to the client too, so environment-proxy mounts use the
-    # same trust as the pinned transport.
     return httpx.AsyncClient(follow_redirects=False, verify=verify, timeout=timeout,
-                             cookies=httpx.Cookies(), http2=http2, transport=transport)
+                             cookies=httpx.Cookies(), http2=http2, transport=transport,
+                             trust_env=False)
 
 
 def _address_pins_from_config(config: dict | None) -> "AddressPins | None":
