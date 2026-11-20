@@ -239,6 +239,14 @@ class ServerRefusalTests(_FreshBreaker, unittest.TestCase):
     def _cloud_slot(self):
         return patch.dict(self.server.orchestrator.config["agent_defaults"], {"model": CLOUD})
 
+    def _arm_active(self):
+        # /engagement/{host}/investigate sends target traffic, so ARC-1 admission
+        # (403 while validators.active_enabled is off) runs before the SEC-1 check.
+        # Arm it so these tests reach the cloud-slot refusal they exercise.
+        registry = self.server.orchestrator.validator_registry
+        self.addCleanup(registry.set_active_enabled, registry.active_enabled)
+        registry.set_active_enabled(True)
+
     def _assert_refused(self, resp):
         self.assertEqual(resp.status_code, 409, resp.text)
         detail = resp.json()["detail"]
@@ -262,6 +270,7 @@ class ServerRefusalTests(_FreshBreaker, unittest.TestCase):
         orch = self.server.orchestrator
         run = AsyncMock(return_value={"summary": {}})
         body = {"base_url": "http://shop.test:5002", "roles": []}
+        self._arm_active()
         with self._cloud_slot(), patch.object(orch, "investigate_engagement", run):
             resp = self.client.post("/engagement/shop.test/investigate", json=body)
         self._assert_refused(resp)
@@ -271,6 +280,7 @@ class ServerRefusalTests(_FreshBreaker, unittest.TestCase):
     def test_control_local_slots_are_admitted(self):
         # Control: without a cloud slot the same request is admitted (200).
         run = AsyncMock(return_value={"summary": {}})
+        self._arm_active()
         with patch.object(self.server.orchestrator, "investigate_engagement", run):
             resp = self.client.post("/engagement/shop.test/investigate",
                                     json={"base_url": "http://shop.test:5002", "roles": []})
