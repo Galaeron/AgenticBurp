@@ -33,7 +33,6 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-import httpx
 
 from harness import crawler
 from harness import engagement as _engagement
@@ -521,7 +520,8 @@ async def probe_cross_role_objects(
                 continue
             session_ref = session_refs[role_index] if session_refs is not None else None
             status, body, _ = await _probe(method, url, r.norm_headers(), timeout,
-                                           run_context=run_context, session_ref=session_ref)
+                                           run_context=run_context, session_ref=session_ref,
+                                           allowed_hosts=allowed_hosts)
             if status is None:
                 classification = "error"
             elif map_._substantive(status, body):
@@ -642,7 +642,8 @@ class RoleCrawlResult:
 
 async def _probe(method: str, url: str, headers: dict, timeout: float, *,
                  run_context=None, session_ref: str | None = None,
-                 body: str = "", content_type: str = "") -> tuple[int | None, str, dict]:
+                 body: str = "", content_type: str = "",
+                 allowed_hosts=None) -> tuple[int | None, str, dict]:
     if not method:
         method = "GET"
     if run_context is None and method not in ("GET", "HEAD", "OPTIONS"):
@@ -650,30 +651,31 @@ async def _probe(method: str, url: str, headers: dict, timeout: float, *,
     req_headers = dict(headers or {})
     if content_type and not any((k or "").lower() == "content-type" for k in req_headers):
         req_headers["Content-Type"] = content_type
-    try:
-        if run_context is not None:
-            from harness.run_context import TypedRequest
-            await global_throttle.acquire()
-            outcome = await run_context.executor().execute(
-                TypedRequest(method=method, url=url, body=body or None,
-                            headers={"Content-Type": content_type} if content_type else {}),
-                capability="role_crawl", session_ref=session_ref)
-            if not outcome.ok:
-                return None, f"request {outcome.outcome}: {outcome.error}", {}
-            return outcome.status, outcome.body or "", dict(outcome.headers or {})
+    if run_context is not None:
+        from harness.run_context import TypedRequest
         await global_throttle.acquire()
-        # `content` is only passed when there is a body; older test doubles
-        # and bodyless GET/HEAD/OPTIONS calls do not require the keyword.
-        request_kwargs = {"headers": req_headers or None}
-        if body:
-            request_kwargs["content"] = body.encode("utf-8")
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            resp = await client.request(method, url, **request_kwargs)
-        # getattr guard: test stubs return a minimal response object with no
-        # .headers -- capture must degrade to empty headers, not crash.
-        return resp.status_code, (resp.text or ""), dict(getattr(resp, "headers", None) or {})
-    except httpx.HTTPError as e:
-        return None, f"request failed: {e.__class__.__name__}", {}
+        outcome = await run_context.executor().execute(
+            TypedRequest(method=method, url=url, body=body or None,
+                        headers={"Content-Type": content_type} if content_type else {}),
+            capability="role_crawl", session_ref=session_ref)
+    else:
+        # ARC-7: no raw client. A caller with no run sends through a standalone one
+        # (transport_for), so scope, budget and the connect-time pin still apply;
+        # an empty scope admits no host (active_mode).
+        from harness.run_context import transport_for
+        await global_throttle.acquire()
+        _tt, _owned = transport_for(None, allowed_hosts=allowed_hosts or [],
+                                    active_mode=True, timeout=timeout)
+        try:
+            outcome = await _tt.send_creds(method, url, capability="role_crawl",
+                                           headers=req_headers or None, body=body or None,
+                                           max_redirects=0)
+        finally:
+            if _owned is not None:
+                await _owned.aclose()
+    if not outcome.ok:
+        return None, f"request {outcome.outcome}: {outcome.error}", {}
+    return outcome.status, outcome.body or "", dict(outcome.headers or {})
 
 
 async def crawl_roles(
@@ -920,7 +922,8 @@ async def crawl_roles(
             session_ref = session_refs[role_index] if session_refs is not None else None
             status, body, resp_headers = await _probe(
                 probe_method, url, r.norm_headers(), timeout, run_context=run_context,
-                session_ref=session_ref, body=req_body, content_type=req_ctype)
+                session_ref=session_ref, body=req_body, content_type=req_ctype,
+                allowed_hosts=allowed_hosts)
             substantive = map_._substantive(status, body)
             if status is not None:
                 probe_headers = dict(r.norm_headers())

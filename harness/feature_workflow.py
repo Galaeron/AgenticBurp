@@ -416,7 +416,7 @@ async def crawl_features(
     `fetch_fn(method, url, headers, body) -> response` is the network seam. The
     response must expose `.status_code`, `.text`, and `.headers` (an httpx
     Response, or a test double). Production passes a scope-gated, throttled,
-    optionally-gated client wrapper (see `default_fetch_fn`).
+    run-context executor (see `run_context_fetch_fn`).
 
     BFS from `seed_paths` (default `/`): GET a node, extract its forms + links,
     enqueue same-origin links, and -- when `submit_forms` -- submit each new form
@@ -532,33 +532,6 @@ def _redirect_location(resp, fallback: str) -> str | None:
     if status and 300 <= status < 400 and loc:
         return urljoin(fallback, loc)
     return None
-
-
-def default_fetch_fn(allowed_hosts: list[str] | None = None, *, timeout: float = 15.0,
-                     gate=None, validator_name: str = "feature_workflow"):
-    """A production `fetch_fn`: scope-gated + globally-throttled. Mutating
-    submits route through the safety gate (`GatedAsyncClient`) so the crawl obeys
-    the same allow_mutating_replay authorisation as every other active leg; GETs
-    use a plain client. Returned as a closure so `crawl_features` stays
-    network-agnostic and fully unit-testable with an in-memory double."""
-    from harness import global_throttle
-    import httpx
-    from harness.safety_gate import GatedAsyncClient, get_default_gate
-
-    _gate = gate or get_default_gate()
-
-    async def _fetch(method, url, req_headers, body):
-        await global_throttle.acquire()
-        m = (method or "GET").upper()
-        if m in ("GET", "HEAD", "OPTIONS"):
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False,
-                                         verify=False) as client:
-                return await client.request(m, url, headers=req_headers or None)
-        async with GatedAsyncClient(_gate, validator_name, timeout=timeout,
-                                    follow_redirects=False, verify=False) as client:
-            return await client.request(m, url, headers=req_headers or None, content=body or None)
-
-    return _fetch
 
 
 def run_context_fetch_fn(run_context, session_ref: str | None, *,

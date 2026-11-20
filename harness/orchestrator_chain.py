@@ -1811,15 +1811,27 @@ class ChainMixin:
                             top = max(authed, key=lambda r: role_crawl._trust(r.role))
                             baseline = {**(baseline or {}), **{
                                 k: v for k, v in top.headers.items() if _credential(k)}}
-                    outcome = await missing_auth_probe.probe(
-                        base_url, (method, path),
-                        allowed_hosts=self.allowed_hosts,
-                        baseline_headers=baseline,
-                        send_garbage_token=False,
-                        expected_protected=declared is not None,
-                        protected_baseline=True,
-                        run_context=run_context,
-                        identity_headers=supplied)
+                    # ARC-7: the probe sends only through a run. This analysis's run
+                    # (or the enclosing one) when there is one, else a standalone one
+                    # that is closed here.
+                    _probe_run = run_context or _run_context_mod.current_run_context()
+                    _probe_owned = None
+                    if _probe_run is None:
+                        _probe_owned = _probe_run = _run_context_mod.standalone_context(
+                            self.allowed_hosts, config=self.config, active_mode=True)
+                    try:
+                        outcome = await missing_auth_probe.probe(
+                            base_url, (method, path),
+                            allowed_hosts=self.allowed_hosts,
+                            baseline_headers=baseline,
+                            send_garbage_token=False,
+                            expected_protected=declared is not None,
+                            protected_baseline=True,
+                            run_context=_probe_run,
+                            identity_headers=supplied)
+                    finally:
+                        if _probe_owned is not None:
+                            await _probe_owned.aclose()
                     if outcome.finding is not None:
                         proof = outcome.finding
                         why = (f" Route declared protected by {declared.describe()}."

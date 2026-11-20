@@ -133,7 +133,7 @@ class DiscoverFromScopeChangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, [])
 
     async def test_candidate_outside_allowed_hosts_is_never_sent(self):
-        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock) as mock_get:
             result = await scope_discovery.discover_from_scope_change(
                 _exchange(), [_confirmed_finding()], self._config(),
                 allowed_hosts=["some-other-host.invalid"],
@@ -143,12 +143,13 @@ class DiscoverFromScopeChangeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_confirmed_trigger_probes_candidates_within_scope(self):
         fake_response = httpx.Response(200, headers={}, text="ok", request=httpx.Request("GET", "https://target.invalid/api/users"))
-        with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=fake_response) as mock_get:
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock, return_value=fake_response) as mock_get:
             result = await scope_discovery.discover_from_scope_change(
                 _exchange(), [_confirmed_finding()], self._config(candidate_paths=["/api/users"]),
                 allowed_hosts=["target.invalid"],
             )
         mock_get.assert_called_once()
+        self.assertEqual(mock_get.call_args.args[:2], ("GET", "https://target.invalid/api/users"))
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].url, "https://target.invalid/api/users")
         self.assertEqual(result[0].response_status, 200)
@@ -157,7 +158,7 @@ class DiscoverFromScopeChangeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_max_new_requests_per_trigger_caps_candidates(self):
         fake_response = httpx.Response(200, headers={}, text="ok", request=httpx.Request("GET", "https://target.invalid/x"))
-        with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=fake_response) as mock_get:
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock, return_value=fake_response) as mock_get:
             await scope_discovery.discover_from_scope_change(
                 _exchange(), [_confirmed_finding()],
                 self._config(candidate_paths=["/a", "/b", "/c", "/d"], max_requests=2),
@@ -166,7 +167,7 @@ class DiscoverFromScopeChangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_get.call_count, 2)
 
     async def test_per_candidate_network_failure_does_not_raise(self):
-        with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
             result = await scope_discovery.discover_from_scope_change(
                 _exchange(), [_confirmed_finding()], self._config(candidate_paths=["/api/users"]),
                 allowed_hosts=["target.invalid"],
