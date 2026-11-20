@@ -1,4 +1,9 @@
 """
+EXPERIMENTAL -- not enforced. No production code imports this module (ARC-10):
+it is exercised only by its own tests, so nothing in a run depends on it and it
+enforces nothing. Whether to wire it in, move it to harness/experimental/ or delete it is an
+owner decision; harness.test_experimental_modules keeps this marker honest.
+
 P1.2/P2.3 -- RAG retrieval with citations, over harness.knowledge's corpus.
 
 `harness.knowledge` already implements the retrieval primitive VulnBot's
@@ -29,6 +34,9 @@ store.list_knowledge_notes's job, threaded through knowledge.retrieve's
 optional `engagement_id`; this module just passes it through unchanged.
 """
 from __future__ import annotations
+
+# ARC-10: no production importer; see the docstring.
+EXPERIMENTAL = True
 
 import hashlib
 from dataclasses import dataclass

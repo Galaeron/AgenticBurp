@@ -737,7 +737,8 @@ class ChainMixin:
         # URL's origin), matching a raw client that just sent it to `url`. I05: it
         # spends the analysis run when there is one; a standalone context otherwise.
         _tt, _owned = transport_for(
-            run_context, allowed_hosts=self.allowed_hosts, config=self.config)
+            run_context, allowed_hosts=self.allowed_hosts, config=self.config,
+            active_mode=True)
         try:
             await global_throttle.acquire()
             cred = await _tt.send_creds("GET", url, capability="credential_probe",
@@ -1400,11 +1401,22 @@ class ChainMixin:
                 import harness.engagement as _eng
                 from harness.safety_gate import get_default_gate as _get_gate
                 discovered_paths = [ep.path for ep in rc.endpoints] if rc.endpoints else None
-                feature_caps = await engagement_builder.feature_crawl_captures(
-                    base_url, roles, allowed_hosts=self.allowed_hosts,
-                    submit_forms=_get_gate().config.allow_mutating_replay,
-                    seed_paths=discovered_paths, run_context=run_context, errors=_errors,
-                    **({"per_principal": True} if _per_principal else {}))
+                # ARC-7: the crawl sends only through a run: this one, the enclosing
+                # one, or a standalone one closed here.
+                _fc_run = run_context or _run_context_mod.current_run_context()
+                _fc_owned = None
+                if _fc_run is None:
+                    _fc_owned = _fc_run = _run_context_mod.standalone_context(
+                        self.allowed_hosts, config=self.config, active_mode=True)
+                try:
+                    feature_caps = await engagement_builder.feature_crawl_captures(
+                        base_url, roles, allowed_hosts=self.allowed_hosts,
+                        submit_forms=_get_gate().config.allow_mutating_replay,
+                        seed_paths=discovered_paths, run_context=_fc_run, errors=_errors,
+                        **({"per_principal": True} if _per_principal else {}))
+                finally:
+                    if _fc_owned is not None:
+                        await _fc_owned.aclose()
                 # Make workflow routes and their real request shapes visible to
                 # prioritisation. Content-level model review remains deferred.
                 for ex in feature_caps:
@@ -1838,15 +1850,27 @@ class ChainMixin:
                             top = max(authed, key=lambda r: role_crawl._trust(r.role))
                             baseline = {**(baseline or {}), **{
                                 k: v for k, v in top.headers.items() if _credential(k)}}
-                    outcome = await missing_auth_probe.probe(
-                        base_url, (method, path),
-                        allowed_hosts=self.allowed_hosts,
-                        baseline_headers=baseline,
-                        send_garbage_token=False,
-                        expected_protected=declared is not None,
-                        protected_baseline=True,
-                        run_context=run_context,
-                        identity_headers=supplied)
+                    # ARC-7: the probe sends only through a run. This analysis's run
+                    # (or the enclosing one) when there is one, else a standalone one
+                    # that is closed here.
+                    _probe_run = run_context or _run_context_mod.current_run_context()
+                    _probe_owned = None
+                    if _probe_run is None:
+                        _probe_owned = _probe_run = _run_context_mod.standalone_context(
+                            self.allowed_hosts, config=self.config, active_mode=True)
+                    try:
+                        outcome = await missing_auth_probe.probe(
+                            base_url, (method, path),
+                            allowed_hosts=self.allowed_hosts,
+                            baseline_headers=baseline,
+                            send_garbage_token=False,
+                            expected_protected=declared is not None,
+                            protected_baseline=True,
+                            run_context=_probe_run,
+                            identity_headers=supplied)
+                    finally:
+                        if _probe_owned is not None:
+                            await _probe_owned.aclose()
                     if outcome.finding is not None:
                         proof = outcome.finding
                         why = (f" Route declared protected by {declared.describe()}."
@@ -1897,7 +1921,7 @@ class ChainMixin:
                     # when present, else a standalone one). send_creds forwards the probe
                     # role's own credentials; max_redirects=0 == follow_redirects=False.
                     _tt, _owned = transport_for(run_context, allowed_hosts=self.allowed_hosts,
-                                                config=self.config)
+                                                config=self.config, active_mode=True)
                     try:
                         await global_throttle.acquire()
                         out = await _tt.send_creds("GET", exchange.url,

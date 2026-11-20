@@ -10,13 +10,18 @@ from harness.test_run_context import _Fixture
 
 
 class _Resp:
-    def __init__(self, text, url=None):
+    """What the run transport reads from the patched httpx response."""
+    def __init__(self, text, url=None, status=200, headers=None):
         self.text = text
         self.url = url
+        self.status_code = status
+        self.headers = dict(headers or {})
+        self.content = (text or "").encode()
+        self.http_version = "HTTP/1.1"
 
 
 def _fake_pages(mapping):
-    async def fake_get(self, url, headers=None):
+    async def fake_get(self, method, url, headers=None, **kw):
         key = url.split("#", 1)[0]
         return _Resp(mapping.get(key, ""))
     return fake_get
@@ -27,7 +32,7 @@ class CrawlerTests(unittest.TestCase):
         global_throttle.configure(0)  # off, so tests don't block
 
     def _crawl(self, pages, **kw):
-        with patch("httpx.AsyncClient.get", _fake_pages(pages)):
+        with patch("httpx.AsyncClient.request", _fake_pages(pages)):
             return asyncio.run(crawler.crawl("http://t.test/", allowed_hosts=["t.test"], **kw))
 
     def test_mines_js_bundle_referenced_by_html(self):
@@ -68,10 +73,10 @@ class CrawlerTests(unittest.TestCase):
         self.assertFalse(crawler._host_allowed("http://anything.test/", []))
         self.assertFalse(crawler._host_allowed("http://anything.test/", None))
 
-        async def _boom(self, url, headers=None):
+        async def _boom(self, method, url, headers=None, **kw):
             raise AssertionError(f"empty-scope crawl attempted a network fetch: {url}")
 
-        with patch("httpx.AsyncClient.get", _boom):
+        with patch("httpx.AsyncClient.request", _boom):
             for scope in ([], None):
                 r = asyncio.run(crawler.crawl("http://t.test/", allowed_hosts=scope))
                 self.assertEqual(r.pages_fetched, 0)
@@ -166,13 +171,18 @@ class CrawlerTests(unittest.TestCase):
                 '</form>'
             ),
         }
-        with patch("httpx.AsyncClient.request") as send:
+        sent = []
+
+        async def record(self, method, url, headers=None, **kw):
+            sent.append(method)
+            return _Resp(pages.get(url.split("#", 1)[0], ""))
+        with patch("httpx.AsyncClient.request", record):
             r = self._crawl(pages, max_pages=1)
         self.assertEqual(len(r.forms), 1)
         self.assertEqual(r.forms[0].method, "POST")
         self.assertEqual(r.forms[0].action, "http://t.test/product/stock")
         self.assertEqual(r.forms[0].body(), "productId=1&storeId=1")
-        send.assert_not_called()  # passive discovery did not submit the form
+        self.assertNotIn("POST", sent)  # passive discovery did not submit the form
 
     def test_destructive_form_action_is_recorded_but_not_captured(self):
         # A form whose action deletes state must never become a replay template:
@@ -193,10 +203,14 @@ class CrawlerTests(unittest.TestCase):
         self.assertIn("http://t.test/admin/delete-user", r.suppressed_navigation)
 
     def test_preserves_final_redirect_query_as_input_surface(self):
-        async def redirected(self, url, headers=None):
-            return _Resp("<html>out of stock</html>",
-                         "http://t.test/?message=Unfortunately+out+of+stock")
-        with patch("httpx.AsyncClient.get", redirected):
+        async def redirected(self, method, url, headers=None, **kw):
+            # The run transport follows redirects itself, hop by hop: the product page
+            # answers 302 and the next hop is the out-of-stock page.
+            if "message=" in url:
+                return _Resp("<html>out of stock</html>")
+            return _Resp("", status=302, headers={
+                "location": "http://t.test/?message=Unfortunately+out+of+stock"})
+        with patch("httpx.AsyncClient.request", redirected):
             r = asyncio.run(crawler.crawl(
                 "http://t.test/product?productId=1", allowed_hosts=["t.test"], max_pages=1))
         self.assertIn("/?message=Unfortunately+out+of+stock", r.endpoints)

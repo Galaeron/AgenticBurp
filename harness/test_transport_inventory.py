@@ -1,17 +1,16 @@
 """T08 verification: the transport inventory is complete, current, and enforced.
 
-The point of these tests is a MODULE-granular routing-regression guard: if a NEW
-production module opens an httpx client without either routing it through the
-run-scoped executor or recording it in `transport_inventory.TRANSPORT_SITES` with
-an owner, `test_scan_matches_registry` fails. This narrows -- but does not close --
-the "green tests, dead pipeline" transport risk: the guard is module-granular, so a
-second direct site added inside an ALREADY-registered module, an aliased
-constructor, or a non-httpx transport API is not caught. That limitation is made
-explicit in `test_inventory_is_module_granular` (review R11).
+Two guards. The module registry (`TRANSPORT_SITES`) keeps every production module that
+opens an outbound channel named and owned. ARC-7 adds a FUNCTION-level guard: an AST walk
+finds every raw httpx client construction by (module, qualified function) and the paired
+tests require it to equal `RAW_CLIENT_ALLOWLIST` exactly, so a new raw client -- in any
+function, aliased or not, or a second one inside an allowed function -- fails here until
+it is routed through `run_context` or listed with a reason. The controls below inject
+such a client into a copy of real source and assert the guard fails.
 """
 import os
-import re
 import unittest
+from unittest.mock import patch
 
 import harness.transport_inventory as ti
 
@@ -37,22 +36,6 @@ class InventoryEnforcementTests(unittest.TestCase):
         for site in ti.TRANSPORT_SITES:
             self.assertTrue(os.path.isfile(os.path.join(root, site.module)),
                             f"inventory references a missing module: {site.module}")
-
-    def test_inventory_is_module_granular(self):
-        """R11 limitation control: the guard is a MODULE inventory. Two httpx
-        constructions in one file collapse to a single module entry, so a SECOND
-        direct site added to an already-registered module would not change the
-        scanned set. This test pins that honest limitation so the guard's claim is
-        never overstated as site- or alias-level detection."""
-        root = ti.harness_dir()
-        # a module already in the registry that constructs an httpx client
-        sample = next(iter(ti.scan_http_client_modules(root)))
-        with open(os.path.join(root, sample), encoding="utf-8") as f:
-            text = f.read()
-        # the scanner keys on presence, not count -- N occurrences -> 1 module entry
-        occurrences = len(re.findall(r"httpx\.(?:AsyncClient|Client)\(", text))
-        self.assertGreaterEqual(occurrences, 1)
-        self.assertIn(sample, ti.scan_http_client_modules(root))  # counted once regardless of N
 
     def test_cors_validator_no_longer_constructs_its_own_client(self):
         """W-1: the CORS validator's raw httpx fallback was removed; it now
@@ -87,6 +70,133 @@ class InventoryEnforcementTests(unittest.TestCase):
                     "httpx" in text or any(m in text for m in routed_markers),
                     f"{site.module} is a routed HTTP site but references neither httpx "
                     f"nor the run-scoped transport")
+
+
+class RawClientGuardTests(unittest.TestCase):
+    """ARC-7: the function-level guard and its negative controls."""
+
+    def _assert_no_drift(self, counts=None):
+        unlisted, stale, miscounted = ti.raw_client_drift(counts)
+        self.assertFalse(
+            unlisted,
+            "A production function constructs a raw httpx client but is NOT on "
+            "transport_inventory.RAW_CLIENT_ALLOWLIST. Send through run_context "
+            "(standalone_context / transport_for), or list it with a reason: "
+            f"{unlisted}")
+        self.assertFalse(stale, f"the allowlist names a raw client that is gone: {stale}")
+        self.assertFalse(miscounted,
+                         f"a function holds a different number of raw clients: {miscounted}")
+
+    def _counts_with(self, module, transform):
+        """The scan over the real tree with `module`'s source passed through
+        `transform` first -- a temp copy, the file on disk is untouched."""
+        real = ti._iter_production_py
+
+        def patched(root):
+            for rel, text in real(root):
+                yield rel, (transform(text) if rel == module else text)
+
+        with patch.object(ti, "_iter_production_py", patched):
+            return ti.raw_client_site_counts()
+
+    def test_every_raw_client_site_is_allowlisted_exactly(self):
+        self._assert_no_drift()
+
+    def test_allowlist_entries_name_a_real_module_a_category_and_a_reason(self):
+        seen = set()
+        for site in ti.RAW_CLIENT_ALLOWLIST:
+            self.assertNotIn(site.key, seen, f"duplicate allowlist entry {site.key}")
+            seen.add(site.key)
+            self.assertIn(site.category, ti.RAW_CATEGORIES, site.key)
+            self.assertGreater(len(site.reason), 20, f"{site.key} has no real reason")
+            self.assertGreaterEqual(site.count, 1)
+            self.assertTrue(os.path.isfile(os.path.join(ti.harness_dir(), site.module)),
+                            f"allowlist references a missing module: {site.module}")
+
+    def test_target_clients_are_only_the_listed_legacy_and_gate_sites(self):
+        """Egress and llm sites talk to non-target services; infra is the transport
+        itself. Everything else that can reach a target is named as gate or
+        legacy_no_run, so the open ARC-7 list is exactly this set."""
+        open_items = {s.module for s in ti.RAW_CLIENT_ALLOWLIST
+                      if s.category in (ti.RAW_GATE, ti.RAW_LEGACY_NO_RUN)}
+        self.assertIn("safety_gate.py", open_items)
+        for module in open_items - {"safety_gate.py"}:
+            self.assertTrue(module.startswith("validators/"), module)
+
+    def test_converted_modules_hold_no_raw_client(self):
+        scanned_modules = {m for m, _ in ti.scan_raw_client_sites()}
+        for module in ti.ARC7_CONVERTED_MODULES:
+            self.assertNotIn(module, scanned_modules, f"ARC-7 regressed in {module}")
+            self.assertTrue(os.path.isfile(os.path.join(ti.harness_dir(), module)), module)
+
+    def test_scan_sees_aliases_and_module_level_helpers(self):
+        cases = {
+            "alias": "import httpx as h\n\nasync def f():\n    async with h.AsyncClient() as c:\n        pass\n",
+            "from-import": "from httpx import AsyncClient as C\n\ndef f():\n    return C(timeout=1)\n",
+            "sync client": "import httpx\n\ndef f():\n    return httpx.Client()\n",
+            "helper": "import httpx\n\ndef f(u):\n    return httpx.get(u)\n",
+        }
+        for name, text in cases.items():
+            self.assertEqual([q for q, _ in ti.raw_client_sites_in_source(text)], ["f"], name)
+        # not a client: other httpx names, and a same-named attribute of another object
+        for text in ("import httpx\n\ndef f():\n    return httpx.Timeout(1)\n",
+                     "import httpx\n\ndef f(x):\n    return x.AsyncClient()\n"):
+            self.assertEqual(ti.raw_client_sites_in_source(text), [])
+
+    # ---- negative controls: each injection must trip the guard ----
+    def test_control_a_new_function_in_a_converted_module_fails_the_guard(self):
+        injected = "\n\nasync def sneaky(url):\n    async with httpx.AsyncClient() as c:\n        return await c.get(url)\n"
+        for module in ("missing_auth_probe.py", "crawler.py", "feature_workflow.py"):
+            counts = self._counts_with(
+                module, lambda t: "import httpx\n" + t + injected)
+            self.assertIn((module, "sneaky"), counts)
+            with self.assertRaises(AssertionError):
+                self._assert_no_drift(counts)
+
+    def test_control_an_aliased_client_in_a_converted_module_fails_the_guard(self):
+        injected = "\n\ndef sneaky():\n    import httpx as h\n    return h.AsyncClient()\n"
+        counts = self._counts_with("role_crawl.py", lambda t: t + injected)
+        self.assertIn(("role_crawl.py", "sneaky"), counts)
+        with self.assertRaises(AssertionError):
+            self._assert_no_drift(counts)
+
+    def test_control_a_second_client_in_an_allowed_function_fails_the_guard(self):
+        """The site key alone would miss this -- the count catches it."""
+        line = "        self._client = httpx.AsyncClient(**httpx_kwargs)\n"
+
+        def twice(text):
+            assert line in text
+            return text.replace(line, line + line, 1)
+
+        counts = self._counts_with("safety_gate.py", twice)
+        self.assertEqual(counts[("safety_gate.py", "GatedAsyncClient.__init__")], 2)
+        with self.assertRaises(AssertionError):
+            self._assert_no_drift(counts)
+
+    def test_control_a_new_target_module_with_a_client_fails_the_guard(self):
+        real = ti._iter_production_py
+
+        def patched(root):
+            yield from real(root)
+            yield "brand_new_probe.py", ("import httpx\n\nasync def go(u):\n"
+                                         "    async with httpx.AsyncClient() as c:\n"
+                                         "        return await c.get(u)\n")
+
+        with patch.object(ti, "_iter_production_py", patched):
+            counts = ti.raw_client_site_counts()
+        with self.assertRaises(AssertionError):
+            self._assert_no_drift(counts)
+
+    def test_control_removing_an_allowlisted_client_is_reported_stale(self):
+        counts = self._counts_with(
+            "kev_check.py", lambda t: t.replace("httpx.AsyncClient(", "make_client("))
+        self.assertNotIn(("kev_check.py", "KevClient._ensure_loaded"), counts)
+        with self.assertRaises(AssertionError):
+            self._assert_no_drift(counts)
+
+    def test_control_clean_source_passes_the_same_check(self):
+        """The injection harness itself is sound: a no-op transform leaves no drift."""
+        self._assert_no_drift(self._counts_with("missing_auth_probe.py", lambda t: t))
 
 
 class RoutingAuditTests(unittest.TestCase):

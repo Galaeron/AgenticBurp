@@ -14,6 +14,7 @@ from harness.role_crawl import RoleSession, _template_ids
 class _Resp:
     def __init__(self, status, text):
         self.status_code, self.text = status, text
+        self.headers = {}   # the run transport reads these
 
 
 def _fake_crawl_empty():
@@ -35,7 +36,7 @@ def _fake_discovery(paths):
 
 
 def _fake_probe(matrix):
-    async def fake_request(self, method, url, headers=None):
+    async def fake_request(self, method, url, headers=None, **kw):
         from urllib.parse import urlsplit
         fn = matrix.get(urlsplit(url).path)
         if fn is None:

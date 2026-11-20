@@ -174,10 +174,17 @@ class ChainMissingAuthDeclarationTests(unittest.TestCase):
         # caller's token is attached.
         server = _Loopback(lambda h: (200, '{"report": "q3 payroll", "rows": 41}'))
         self.addCleanup(server.close)
-        outcome = asyncio.run(missing_auth_probe.probe(
-            server.origin, ("GET", "/admin/report"), allowed_hosts=["127.0.0.1"],
-            baseline_headers={"Authorization": "Bearer owner"}, send_garbage_token=False,
-            expected_protected=True, protected_baseline=True))
+        async def go():
+            from harness.run_context import standalone_context
+            run = standalone_context(["127.0.0.1"], active_mode=True)
+            try:
+                return await missing_auth_probe.probe(
+                    server.origin, ("GET", "/admin/report"), allowed_hosts=["127.0.0.1"],
+                    baseline_headers={"Authorization": "Bearer owner"}, send_garbage_token=False,
+                    expected_protected=True, protected_baseline=True, run_context=run)
+            finally:
+                await run.aclose()
+        outcome = asyncio.run(go())
         self.assertEqual(outcome.classification, "missing_auth")
         self.assertTrue(outcome.finding.confirmed)
         self.assertEqual([("authorization" in h) for _, h in server.requests], [False, True])

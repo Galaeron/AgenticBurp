@@ -1343,9 +1343,12 @@ def standalone_context(allowed_hosts, *, config: dict | None = None, gate=None,
 
 
 def transport_for(run_context, *, allowed_hosts, config: dict | None = None, gate=None,
-                  active_mode: bool = False, timeout: float = 15.0):
+                  active_mode: bool, timeout: float = 15.0):
     """Return (transport, owned_context) for a call site that may or may not have a
-    run of its own. If `run_context` is provided, its TargetTransport is used and
+    run of its own. `active_mode` has no default (a1 open item): each caller states
+    whether an EMPTY `allowed_hosts` admits any host (False, a caller that only
+    replays traffic the operator supplied) or none (True, a caller that originates
+    the request). It only matters when a standalone context is built. If `run_context` is provided, its TargetTransport is used and
     owned_context is None (the caller must NOT close the shared run). Otherwise a
     `standalone_context` is built and returned as owned_context, which the caller
     must aclose() when done. I05: inside an entered run, a call site that passed no

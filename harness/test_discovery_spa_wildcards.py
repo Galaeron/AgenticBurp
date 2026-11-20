@@ -8,6 +8,13 @@ from harness.api_surface_discovery import SurfaceDiscovery
 from harness.models import HttpExchange
 
 
+
+def _page(text, url):
+    """A response as the run transport reads it from the patched httpx call."""
+    return SimpleNamespace(text=text, url=url, status_code=200, headers={},
+                           content=text.encode(), http_version="HTTP/1.1")
+
+
 class SpaDiscoveryCallerTests(unittest.IsolatedAsyncioTestCase):
     async def test_browser_capture_is_wired_to_run_and_worklist(self):
         from harness.run_context import RunContext
@@ -51,27 +58,27 @@ class SpaDiscoveryCallerTests(unittest.IsolatedAsyncioTestCase):
             "https://app.test/assets/main.js": 'import("./chunks/api.js"); import("https://outside.test/no.js");',
             "https://app.test/assets/chunks/api.js": 'fetch("/api/profile", {method: "POST"});',
         }
-        async def get(url, **kwargs):
+        async def get(method, url, **kwargs):
             self.assertIn(url, pages)
-            return SimpleNamespace(text=pages[url], url=url, status_code=200)
-        with patch("httpx.AsyncClient.get", side_effect=get) as fetch, patch(
+            return _page(pages[url], url)
+        with patch("httpx.AsyncClient.request", side_effect=get) as fetch, patch(
                 "harness.role_crawl._probe", AsyncMock(return_value=(200, '{"ok":true}', {}))) as probe:
             state, result = await engagement_builder.build_engagement(
                 "https://app.test/", [role_crawl.RoleSession("anonymous", {})],
                 allowed_hosts=["app.test"], active_discovery=False)
-        self.assertIn("https://app.test/assets/chunks/api.js", [c.args[0] for c in fetch.call_args_list])
+        self.assertIn("https://app.test/assets/chunks/api.js", [c.args[1] for c in fetch.call_args_list])
         self.assertIn(("POST", "/api/profile"), [(e.method, e.path) for e in result.endpoints])
         self.assertIn("POST", [c.args[0] for c in probe.call_args_list])
         self.assertTrue(any(e.path == "/api/profile" for e in state.endpoints.values()))
 
     async def test_script_depth_and_fetch_cap_are_enforced(self):
-        async def get(url, **kwargs):
+        async def get(method, url, **kwargs):
             body = '<script src="/main.js"></script>' if url.endswith("/") else 'import("./next.js")'
-            return SimpleNamespace(text=body, url=url, status_code=200)
-        with patch("httpx.AsyncClient.get", side_effect=get) as fetch:
+            return _page(body, url)
+        with patch("httpx.AsyncClient.request", side_effect=get) as fetch:
             await crawler.crawl("https://app.test/", allowed_hosts=["app.test"], max_pages=3, max_depth=0)
         self.assertEqual(fetch.call_count, 3)
-        self.assertNotIn("https://app.test/next.js", [c.args[0] for c in fetch.call_args_list])
+        self.assertNotIn("https://app.test/next.js", [c.args[1] for c in fetch.call_args_list])
 
     async def test_captured_runtime_api_keeps_shape_and_identity_without_replay(self):
         ex = HttpExchange(url="https://app.test/api/profile?mode=full", method="POST",

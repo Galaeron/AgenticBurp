@@ -116,8 +116,14 @@ async def discover_from_scope_change(
     }
 
     discovered: list[HttpExchange] = []
-    client = None if run_context is not None else httpx.AsyncClient(
-        timeout=10.0, follow_redirects=False)
+    # ARC-7: no raw client. Without a run the probes send through a standalone one
+    # (transport_for): scope, budget and the connect-time pin apply, and an empty
+    # scope admits no host.
+    _tt, _owned = (None, None)
+    if run_context is None:
+        from harness.run_context import transport_for
+        _tt, _owned = transport_for(None, allowed_hosts=allowed_hosts or [],
+                                    active_mode=True, timeout=10.0)
     try:
         for path in candidate_paths[:max_requests]:
             candidate_url = base + path
@@ -142,9 +148,13 @@ async def discover_from_scope_change(
                 else:
                     from harness import global_throttle
                     await global_throttle.acquire()
-                    resp = await client.get(candidate_url, headers=carried_headers)
+                    outcome = await _tt.send_creds("GET", candidate_url,
+                                                   capability="scope_discovery",
+                                                   headers=carried_headers, max_redirects=0)
+                    if not outcome.ok:
+                        continue
                     status, response_headers, response_body = (
-                        resp.status_code, dict(resp.headers), resp.text)
+                        outcome.status, outcome.headers, outcome.body)
             except httpx.HTTPError as e:
                 log.debug("scope_discovery: %s unreachable (%s) -- normal, not an error", candidate_url, e)
                 continue
@@ -160,8 +170,8 @@ async def discover_from_scope_change(
                 analyst_note=f"Autonomous discovery, triggered by a confirmed finding on {exchange.url}",
             ))
     finally:
-        if client is not None:
-            await client.aclose()
+        if _owned is not None:
+            await _owned.aclose()
 
     if discovered:
         log.info(

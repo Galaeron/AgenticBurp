@@ -7,7 +7,7 @@ from harness import global_throttle
 import harness.missing_auth_probe as map_
 from harness.js_endpoint_extractor import CallShape
 from harness.safety_gate import SafetyGate, SafetyGateConfig
-from harness.run_context import RunContext
+from harness.run_context import RunContext, standalone_context
 from harness.test_run_context import _Fixture
 
 
@@ -15,6 +15,23 @@ class _Resp:
     def __init__(self, status, text):
         self.status_code = status
         self.text = text
+        self.content = text.encode()
+        self.headers = {}
+        self.url = "http://t.test/"
+        self.http_version = "HTTP/1.1"
+
+
+def _with_run(fn, *, gate=None, hosts=("t.test",)):
+    """Run `fn(ctx)` against a standalone run context (ARC-7: the probe sends only
+    through a run). The tests patch httpx.AsyncClient.request, which that run's
+    transport uses, so no socket is opened."""
+    async def go():
+        ctx = standalone_context(list(hosts), gate=gate, active_mode=True)
+        try:
+            return await fn(ctx)
+        finally:
+            await ctx.aclose()
+    return asyncio.run(go())
 
 
 def _has_auth(headers) -> bool:
@@ -24,7 +41,7 @@ def _has_auth(headers) -> bool:
 def _fake(mapping):
     """mapping: (METHOD, url) -> {"unauth": (status, body), "garbage": (status, body)}.
     Missing "garbage" defaults to the same as "unauth"."""
-    async def fake_request(self, method, url, headers=None):
+    async def fake_request(self, method, url, headers=None, **kw):
         entry = mapping.get((method.upper(), url))
         if entry is None:
             return _Resp(404, "")
@@ -40,10 +57,11 @@ class MissingAuthProbeTests(unittest.TestCase):
     def setUp(self):
         global_throttle.configure(0)  # off, so tests don't block
 
-    def _probe(self, mapping, shape, **kw):
+    def _probe(self, mapping, shape, *, gate=None, **kw):
         kw.setdefault("allowed_hosts", ["t.test"])
         with patch("httpx.AsyncClient.request", _fake(mapping)):
-            return asyncio.run(map_.probe(self.BASE, shape, **kw))
+            return _with_run(lambda ctx: map_.probe(self.BASE, shape, run_context=ctx, **kw),
+                             gate=gate)
 
     # --- the core positive: data served with no credentials ---
     def test_unauth_2xx_substantive_is_missing_auth(self):
@@ -150,8 +168,8 @@ class MissingAuthProbeTests(unittest.TestCase):
         gate = SafetyGate(SafetyGateConfig(active_enabled=False))
         m = {("POST", "http://t.test/api/x"): {"unauth": (200, "ok data here")}}
         o = self._probe(m, ("POST", "/api/x"), include_mutating=True, gate=gate)
-        self.assertEqual(o.classification, "skipped")
-        self.assertIn("safety gate", o.note)
+        self.assertEqual(o.classification, "error")     # the run's gate refused the send
+        self.assertIn("blocked", o.note)
 
     def test_mutating_method_probed_when_gate_allows(self):
         gate = SafetyGate(SafetyGateConfig(active_enabled=True, allow_mutating_replay=True,
@@ -164,15 +182,15 @@ class MissingAuthProbeTests(unittest.TestCase):
     def test_baseline_auth_headers_are_stripped(self):
         seen = {}
 
-        async def spy(self, method, url, headers=None):
+        async def spy(self, method, url, headers=None, **kw):
             seen["headers"] = dict(headers or {})
             return _Resp(401, "no")
 
         with patch("httpx.AsyncClient.request", spy):
-            asyncio.run(map_.probe(
+            _with_run(lambda ctx: map_.probe(
                 self.BASE, ("GET", "/api/x"), allowed_hosts=["t.test"],
                 baseline_headers={"Authorization": "Bearer real", "Cookie": "s=1", "Accept": "application/json"},
-                send_garbage_token=False,
+                send_garbage_token=False, run_context=ctx,
             ))
         keys = {k.lower() for k in seen["headers"]}
         self.assertNotIn("authorization", keys)
@@ -180,12 +198,13 @@ class MissingAuthProbeTests(unittest.TestCase):
         self.assertIn("accept", keys)  # non-auth header preserved
 
     def test_transport_error_is_error(self):
-        async def boom(self, method, url, headers=None):
+        async def boom(self, method, url, headers=None, **kw):
             import httpx
             raise httpx.ConnectError("refused")
 
         with patch("httpx.AsyncClient.request", boom):
-            o = asyncio.run(map_.probe(self.BASE, ("GET", "/x"), allowed_hosts=["t.test"]))
+            o = _with_run(lambda ctx: map_.probe(
+                self.BASE, ("GET", "/x"), allowed_hosts=["t.test"], run_context=ctx))
         self.assertEqual(o.classification, "error")
         self.assertIsNone(o.finding)
 
@@ -229,6 +248,77 @@ class MissingAuthProbeTests(unittest.TestCase):
         finally:
             fixture.close()
 
+    # --- ARC-7: no raw fallback; a run is required ---
+    def test_a_missing_run_context_is_a_type_error(self):
+        """Negative control for the signature: forgetting the run cannot silently
+        fall back to a private client."""
+        with self.assertRaises(TypeError):
+            asyncio.run(map_.probe(self.BASE, ("GET", "/x"), allowed_hosts=["t.test"]))
+
+    def test_run_context_none_sends_nothing(self):
+        sent = []
+
+        async def spy(self, method, url, headers=None, **kw):
+            sent.append(url)
+            return _Resp(200, '{"leak": 1}')
+
+        with patch("httpx.AsyncClient.request", spy):
+            o = asyncio.run(map_.probe(self.BASE, ("GET", "/api/x"), allowed_hosts=["t.test"],
+                                       run_context=None))
+        self.assertEqual(o.classification, "error")
+        self.assertIn("no run context", o.note)
+        self.assertEqual(sent, [])
+
+    # --- a1 open item: an empty scope fails closed (zero sends) ---
+    def _empty_scope_probe(self, fixture, allowed_hosts):
+        # The run itself admits the loopback host: only the probe's own scope check
+        # stands between an empty `allowed_hosts` and a send.
+        ctx = RunContext.create(allowed_hosts=["127.0.0.1"], max_requests=5,
+                                gate_config={"active_enabled": True})
+
+        async def scenario():
+            try:
+                return await map_.probe(fixture.base, ("GET", "/public-data"),
+                                        allowed_hosts=allowed_hosts, expected_protected=True,
+                                        send_garbage_token=False, run_context=ctx)
+            finally:
+                await ctx.aclose()
+        return asyncio.run(scenario()), ctx
+
+    def test_empty_scope_sends_nothing(self):
+        fixture = _Fixture()
+        try:
+            for empty in ([], None):
+                o, ctx = self._empty_scope_probe(fixture, empty)
+                self.assertEqual(o.classification, "skipped")
+                self.assertIn("no scope configured", o.note)
+                self.assertEqual(ctx.budget.used, 0)
+            self.assertEqual(fixture.httpd.received, [])
+        finally:
+            fixture.close()
+
+    def test_control_the_old_open_scope_check_sends(self):
+        """Negative control: with the pre-fix `_host_allowed` (True on an empty scope)
+        the same call reaches the target, so the zero-send test above is not vacuous."""
+        fixture = _Fixture()
+        try:
+            with patch.object(map_, "_host_allowed", lambda url, hosts: True):
+                o, ctx = self._empty_scope_probe(fixture, [])
+            self.assertEqual(o.classification, "missing_auth")
+            self.assertEqual(len(fixture.httpd.received), 1)
+            self.assertEqual(ctx.budget.used, 1)
+        finally:
+            fixture.close()
+
+    def test_a_scoped_host_is_still_probed(self):
+        fixture = _Fixture()
+        try:
+            o, ctx = self._empty_scope_probe(fixture, ["127.0.0.1"])
+            self.assertEqual(o.classification, "missing_auth")
+            self.assertEqual(len(fixture.httpd.received), 1)
+        finally:
+            fixture.close()
+
     # --- batch ---
     def test_batch_dedupes_and_collects_findings(self):
         m = {
@@ -237,8 +327,9 @@ class MissingAuthProbeTests(unittest.TestCase):
         }
         shapes = [CallShape("GET", "/api/a"), CallShape("GET", "/api/a"), CallShape("GET", "/api/b")]
         with patch("httpx.AsyncClient.request", _fake(m)):
-            outcomes = asyncio.run(map_.probe_call_shapes(
-                self.BASE, shapes, allowed_hosts=["t.test"], send_garbage_token=False))
+            outcomes = _with_run(lambda ctx: map_.probe_call_shapes(
+                self.BASE, shapes, allowed_hosts=["t.test"], send_garbage_token=False,
+                run_context=ctx))
         self.assertEqual(len(outcomes), 2)  # /api/a deduped
         findings = map_.findings_from(outcomes)
         self.assertEqual(len(findings), 1)

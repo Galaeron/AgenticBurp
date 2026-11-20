@@ -11,31 +11,32 @@ against is that a NEW direct send is added and silently bypasses the
 gate/transport -- exactly the "green tests, dead pipeline" failure mode this
 project guards against, one channel down.
 
-This module makes the transport surface *auditable*, with a MODULE-granular guard:
+This module makes the transport surface *auditable*, with two guards:
 
   - `TRANSPORT_SITES` is a curated registry: every production module that opens an
     outbound channel (HTTP, container, browser, raw socket), with its scope
     (target | egress | llm | infra), its current routing, an owner, and -- for a
     target-directed send not yet on the executor -- the specific remaining gap.
-  - `scan_http_client_modules()` scans the source tree for `httpx` client
-    constructions. The paired test asserts the scan and the registry agree, so a
-    new MODULE that opens an httpx client fails CI until it is either routed through
-    the executor or documented here with an owner.
+  - ARC-7: `raw_client_site_counts()` walks every production module's AST and finds
+    each raw `httpx` client construction by (module, qualified function), counting
+    them; `import httpx as h`, `from httpx import AsyncClient` and httpx's module-level
+    helpers (`httpx.get(...)`) are seen too. `RAW_CLIENT_ALLOWLIST` names every
+    allowed site with a category and a reason; the paired test requires the scan and
+    the allowlist to agree exactly, so a new raw client -- in a new module, a new
+    function, or a second construction inside an allowed function -- fails CI until it
+    is routed through `run_context` or listed here with a reason.
 
-Scope and limits of the guard (review R11 -- do not overstate it). It is a
-*module* inventory, not a call-site or transport-family detector. It will NOT
-catch: a SECOND direct client added inside an already-registered module; an
-aliased constructor (`import httpx as h; h.AsyncClient(...)`); or a non-httpx
-transport API (requests/aiohttp/raw socket beyond the ones already listed).
-`test_inventory_is_module_granular` documents that gap explicitly. Adding an owner
-to the registry is inventory, NOT executor-policy enforcement -- the actual
-migration of a gap onto the run-scoped executor is tracked separately by each
-site's `owner`/`gap`.
+Limits of the guard (do not overstate it). It finds httpx constructions only: not
+`requests`/`aiohttp`/raw sockets (those channels are listed in `TRANSPORT_SITES`), not a
+client built through `getattr`, and not a client handed in from another module. An
+allowlisted `legacy_no_run` site is a raw client that a validator falls back to when it
+has no run context; it is listed, not fixed (see the ARC-7 HANDOFF).
 
 The inventory began as an audit and is updated as each production route migrates.
 """
 from __future__ import annotations
 
+import ast
 import os
 from dataclasses import dataclass, field
 
@@ -142,26 +143,32 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     # ---- target: discovery / crawl (routing gaps -- not yet on the executor) ----
     TransportSite("api_surface_discovery.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (T03/T08)",
+                  constructs_client=False,
                   note="production role discovery uses the run executor; legacy standalone "
                        "callers retain a direct compatibility path."),
     TransportSite("crawler.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (T03/T08)",
+                  constructs_client=False,
                   note="production role crawl routes page/script fetches through the run "
                        "executor, including manual scope-checked redirects."),
     TransportSite("role_crawl.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (F01/T03)",
+                  constructs_client=False,
                   note="production access-matrix probes bind each principal to an isolated "
                        "run session; direct transport remains compatibility-only."),
     TransportSite("scope_discovery.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (T03/T08)",
+                  constructs_client=False,
                   note="production scope-change probes preserve the triggering run session and "
                        "use executor scope, budget, cancellation, and evidence policy."),
     TransportSite("feature_workflow.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (T07)",
+                  constructs_client=False,
                   note="production stateful feature crawl and declared T07 workflows route "
                        "through the executor with per-session state; direct fetch is legacy."),
     TransportSite("missing_auth_probe.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (T03/T08)",
+                  constructs_client=False,
                   note="API probes run in a bounded invocation context; anonymous and garbage-token "
                        "controls use distinct executor session state."),
     TransportSite("iterative_agent.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
@@ -184,6 +191,7 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
     # isolation, cancellation, artifact capture) is F01/F04/T08 follow-on.
     TransportSite("validators/cross_identity_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (F04/T03)",
+                  constructs_client=False,
                   note="production graph validation binds every identity and anonymous replay "
                        "to isolated RunContext sessions; legacy registry use remains compatible."),
     TransportSite("validators/jwt_forge_validator.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
@@ -244,6 +252,120 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
 )
 
 
+# --------------------------------------------------------------------------- #
+# ARC-7: every raw httpx client construction that is allowed to exist, by function.
+# --------------------------------------------------------------------------- #
+
+RAW_EGRESS = "egress"          # public intelligence API, never the target
+RAW_LLM = "llm"                # the model plane, never the target
+RAW_INFRA = "infra"            # the run-scoped transport's own client
+RAW_GATE = "gate"              # the safety gate's no-run client: every send authorised first
+RAW_LEGACY_NO_RUN = "legacy_no_run"   # target-capable, used only when there is no run context
+RAW_CATEGORIES = frozenset({RAW_EGRESS, RAW_LLM, RAW_INFRA, RAW_GATE, RAW_LEGACY_NO_RUN})
+
+
+@dataclass(frozen=True)
+class RawClientSite:
+    module: str          # path relative to the harness dir
+    function: str        # qualified name, e.g. "Class.method" or "<module>"
+    category: str
+    reason: str
+    count: int = 1       # how many constructions the function holds
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.module, self.function)
+
+
+def _site(module, function, category, reason, count=1):
+    return RawClientSite(module, function, category, reason, count)
+
+
+_NO_RUN = ("the run-context branch sends through the executor; this else-branch is the "
+           "no-run fallback and is a raw client. Left open (ARC-7): converting it means "
+           "requiring run_context on a registry validator and rewriting the tests that "
+           "patch httpx.AsyncClient.")
+
+RAW_CLIENT_ALLOWLIST: tuple[RawClientSite, ...] = (
+    # ---- egress: public APIs, not the target ----
+    _site("github_advisories.py", "GitHubAdvisoryClient._lookup_network", RAW_EGRESS,
+          "GitHub advisory API lookup; public egress."),
+    _site("kev_check.py", "KevClient._ensure_loaded", RAW_EGRESS,
+          "CISA KEV feed download; public egress."),
+    _site("package_registry_checks.py", "PackageRegistryClient._check_npm", RAW_EGRESS,
+          "npm registry lookup; public egress."),
+    _site("package_registry_checks.py", "PackageRegistryClient._check_pypi", RAW_EGRESS,
+          "PyPI registry lookup; public egress."),
+    _site("package_registry_checks.py", "PackageRegistryClient._load_malware_feeds", RAW_EGRESS,
+          "public malware-feed download; public egress."),
+    # ---- llm: the model plane ----
+    _site("ollama_client.py", "OllamaClient._probe_context_windows", RAW_LLM,
+          "model-server context-window probe (the configured Ollama / llama-server host)."),
+    _site("ollama_client.py", "OllamaClient._probe_openai_window", RAW_LLM,
+          "model-server context-window probe, OpenAI-compatible wire."),
+    _site("ollama_client.py", "OllamaClient._probe_show_window", RAW_LLM,
+          "model-server /api/show probe."),
+    _site("ollama_client.py", "OllamaClient._send_once", RAW_LLM,
+          "model chat request to the configured model server."),
+    _site("ollama_client.py", "OllamaClient.health_check", RAW_LLM,
+          "model-server health check."),
+    _site("ollama_client.py", "OllamaClient.list_models", RAW_LLM,
+          "model-server tags listing."),
+    _site("openai_provider.py", "OpenAiProvider.chat_json", RAW_LLM,
+          "optional remote OpenAI-compatible coordinator/critique provider (opt-in)."),
+    _site("anthropic_provider.py", "AnthropicProvider.chat_json", RAW_LLM,
+          "optional remote Anthropic Messages provider (opt-in)."),
+    # ---- infra ----
+    _site("run_context.py", "_target_client", RAW_INFRA,
+          "the TargetTransport's own client: pinned connect, trust_env=False (ARC-14)."),
+    _site("safety_gate.py", "GatedAsyncClient.__init__", RAW_GATE,
+          "backs the no-run path of ~40 validator send sites: SafetyGate.authorize() "
+          "(scope, tier; an empty scope fails closed under active mode) runs before every "
+          "send, and a bound or ambient run reroutes through the TargetTransport. It has "
+          "no budget or connect pin outside a run. Left open (ARC-7)."),
+    # ---- target-capable validators with a no-run fallback (left open) ----
+    _site("validators/csp_validator.py", "CspValidator._fetch_fresh_headers",
+          RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/header_injection_validator.py", "HeaderInjectionValidator._probe_param",
+          RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/http_request_smuggling_validator.py",
+          "HttpRequestSmugglingValidator.__aenter__", RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/http_request_smuggling_validator.py",
+          "HttpRequestSmugglingValidator._perform_hrs_tests", RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/http_request_smuggling_validator.py",
+          "HttpRequestSmugglingValidator._send_raw_request", RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/jwt_forge_validator.py", "JwtForgeValidator._probe",
+          RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/oauth_validator.py", "OAuthValidator._check_redirect_uri_validation",
+          RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/race_condition_validator.py", "RaceConditionValidator.validate",
+          RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/rate_limit_validator.py", "RateLimitValidator.validate",
+          RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/recon_validator.py", "ReconValidator.__aenter__",
+          RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/recon_validator.py", "ReconValidator._send_request",
+          RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/sqlmap.py", "SqlmapValidator._boolean_probe_fallback.routed",
+          RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/subdomain_takeover_validator.py",
+          "SubdomainTakeoverValidator._check_fingerprint", RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/toctou_validator.py", "ToctouValidator._get_json",
+          RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/toctou_validator.py", "ToctouValidator.validate.fire_one",
+          RAW_LEGACY_NO_RUN, _NO_RUN),
+    _site("validators/web_cache_poisoning_validator.py", "WebCachePoisoningValidator._send",
+          RAW_LEGACY_NO_RUN, _NO_RUN),
+)
+
+# Modules whose raw clients ARC-7 removed. The guard test asserts none comes back.
+ARC7_CONVERTED_MODULES: tuple[str, ...] = (
+    "feature_workflow.py", "engagement_builder.py", "missing_auth_probe.py",
+    "api_surface_discovery.py", "role_crawl.py", "crawler.py", "scope_discovery.py",
+    "validators/cross_identity_validator.py",
+)
+
+
 def harness_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
@@ -267,15 +389,96 @@ def _iter_production_py(root: str):
                 continue
 
 
+# --------------------------------------------------------------------------- #
+# ARC-7: the function-level scan. A call site is (module, qualified function), found by
+# walking the AST, so a SECOND raw client added inside an already-registered module is a
+# new site, and `import httpx as h` / `from httpx import AsyncClient` are seen too.
+# --------------------------------------------------------------------------- #
+
+_CLIENT_CTORS = frozenset({"AsyncClient", "Client"})
+# httpx's module-level helpers each build a throwaway client of their own.
+_HELPER_FUNCS = frozenset({"get", "post", "put", "patch", "delete", "head", "options",
+                           "request", "stream"})
+
+
+def _raw_call_sites(tree: "ast.AST") -> list[tuple[str, int]]:
+    """(qualified function, line) of every raw httpx client construction in `tree`.
+    "<module>" names a module-level call; "Class.method" a method."""
+    modules: set[str] = set()      # local names bound to the httpx module
+    ctors: set[str] = set()        # local names bound to httpx.AsyncClient / Client / helpers
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "httpx":
+                    modules.add(a.asname or "httpx")
+        elif isinstance(node, ast.ImportFrom) and node.module == "httpx":
+            for a in node.names:
+                if a.name in _CLIENT_CTORS or a.name in _HELPER_FUNCS:
+                    ctors.add(a.asname or a.name)
+    found: list[tuple[str, int]] = []
+
+    def visit(node, stack):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            stack = stack + [node.name]
+        if isinstance(node, ast.Call):
+            f = node.func
+            hit = ((isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                    and f.value.id in modules
+                    and (f.attr in _CLIENT_CTORS or f.attr in _HELPER_FUNCS))
+                   or (isinstance(f, ast.Name) and f.id in ctors))
+            if hit:
+                found.append((".".join(stack) or "<module>", node.lineno))
+        for child in ast.iter_child_nodes(node):
+            visit(child, stack)
+
+    visit(tree, [])
+    return found
+
+
+def raw_client_sites_in_source(text: str) -> list[tuple[str, int]]:
+    """The raw-client call sites of one source text (the unit the negative controls
+    inject into)."""
+    return _raw_call_sites(ast.parse(text))
+
+
+def raw_client_site_counts(root: str | None = None) -> dict[tuple[str, str], int]:
+    """(module, qualified function) -> number of raw httpx client constructions, over
+    the production tree, discovered from source."""
+    root = root or harness_dir()
+    found: dict[tuple[str, str], int] = {}
+    for rel, text in _iter_production_py(root):
+        try:
+            sites = raw_client_sites_in_source(text)
+        except SyntaxError:
+            continue
+        for qualname, _line in sites:
+            found[(rel, qualname)] = found.get((rel, qualname), 0) + 1
+    return found
+
+
+def scan_raw_client_sites(root: str | None = None) -> set[tuple[str, str]]:
+    """Every (module, qualified function) in the production tree that constructs a raw
+    httpx client."""
+    return set(raw_client_site_counts(root))
+
+
+def raw_client_drift(counts: dict[tuple[str, str], int] | None = None
+                     ) -> tuple[list, list, list]:
+    """Compare the scan with RAW_CLIENT_ALLOWLIST: (unlisted sites, stale allowlist
+    entries, sites whose construction count differs from the allowlist)."""
+    counts = raw_client_site_counts() if counts is None else counts
+    allowed = {site.key: site.count for site in RAW_CLIENT_ALLOWLIST}
+    unlisted = sorted(k for k in counts if k not in allowed)
+    stale = sorted(k for k in allowed if k not in counts)
+    miscounted = sorted((k, counts[k], allowed[k]) for k in counts
+                        if k in allowed and counts[k] != allowed[k])
+    return unlisted, stale, miscounted
+
+
 def scan_http_client_modules(root: str | None = None) -> set[str]:
     """Production modules (relpaths) that construct an httpx client -- the live
     HTTP transport surface, discovered from source, not the registry."""
-    root = root or harness_dir()
-    found = set()
-    for rel, text in _iter_production_py(root):
-        if "httpx.AsyncClient(" in text or "httpx.Client(" in text:
-            found.add(rel)
-    return found
+    return {module for module, _ in scan_raw_client_sites(root)}
 
 
 def http_modules_in_registry() -> set[str]:

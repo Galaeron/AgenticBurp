@@ -27,7 +27,8 @@ only real data returned to an anonymous caller is the bug.
 
 Safe by construction, same envelope as every other outbound path here:
   - Scope-gated against `allowed_hosts` (never probes off-target).
-  - Throttled through the global request throttle.
+  - Paced by the run's shared per-origin throttle (TargetTransport).
+  - Sends only through a required run_context (ARC-7): no raw client.
   - Read-only by default: only GET/HEAD/OPTIONS are probed unless the caller
     opts into mutating methods, which then go through the safety_gate exactly
     like the iterative agent and the mass-assignment validator.
@@ -43,13 +44,10 @@ from dataclasses import dataclass, field
 from typing import Iterable
 from urllib.parse import urlsplit
 
-import httpx
-
-from harness import global_throttle, security
+from harness import security
 from harness.engagement import is_public_request_header
 from harness.js_endpoint_extractor import CallShape
 from harness.models import Finding
-from harness.safety_gate import SafetyGate, get_default_gate
 
 log = logging.getLogger("harness.missing_auth_probe")
 
@@ -118,9 +116,10 @@ class ProbeOutcome:
 
 
 def _host_allowed(url: str, allowed_hosts: list[str] | None) -> bool:
+    # Every probe is a live send, so an empty or unset scope fails CLOSED: nothing is
+    # in scope, nothing is sent (the same W-17 contract crawler._host_allowed holds).
     if not allowed_hosts:
-        return True
-    host = (urlsplit(url).hostname or "").lower()
+        return False
     return scope_lock.host_in_scope(url, allowed_hosts)
 
 
@@ -170,23 +169,17 @@ def _strip_auth(headers: dict[str, str] | None) -> dict[str, str]:
     return out
 
 
-async def _send(method: str, url: str, headers: dict[str, str], timeout: float, *,
-                run_context=None, session_ref: str | None = None) -> tuple[int | None, str]:
-    try:
-        if run_context is not None:
-            from harness.run_context import TypedRequest
-            outcome = await run_context.executor().execute(
-                TypedRequest(method, url, headers=headers),
-                capability="missing_auth_probe", session_ref=session_ref)
-            if not outcome.ok:
-                return None, f"request {outcome.outcome}: {outcome.error}"
-            return outcome.status, outcome.body or ""
-        await global_throttle.acquire()
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            resp = await client.request(method, url, headers=headers)
-        return resp.status_code, (resp.text or "")
-    except httpx.HTTPError as e:
-        return None, f"request failed: {e.__class__.__name__}"
+async def _send(method: str, url: str, headers: dict[str, str], *,
+                run_context, session_ref: str | None = None) -> tuple[int | None, str]:
+    """One probe send through the run's executor (scope, gate, budget, pins). ARC-7:
+    there is no raw-client branch, so `run_context` is required."""
+    from harness.run_context import TypedRequest
+    outcome = await run_context.executor().execute(
+        TypedRequest(method, url, headers=headers),
+        capability="missing_auth_probe", session_ref=session_ref)
+    if not outcome.ok:
+        return None, f"request {outcome.outcome}: {outcome.error}"
+    return outcome.status, outcome.body or ""
 
 
 def _finding(kind: str, method: str, url: str, outcome: ProbeOutcome,
@@ -231,7 +224,7 @@ def _finding(kind: str, method: str, url: str, outcome: ProbeOutcome,
 
 async def _unconfirmed_reason(method: str, url: str, unauth_body: str, outcome: ProbeOutcome, *,
                               baseline_headers: dict[str, str] | None, expected_protected: bool,
-                              protected_baseline: bool, timeout: float, run_context=None,
+                              protected_baseline: bool, run_context,
                               identity_headers: frozenset = frozenset()) -> str:
     """Why an anonymous substantive response does NOT confirm missing
     authentication, or "" when it does (RV-G R15).
@@ -249,22 +242,16 @@ async def _unconfirmed_reason(method: str, url: str, unauth_body: str, outcome: 
     if not credentials:
         return "no credentials were supplied for an authenticated baseline"
     plain = {k: v for k, v in (baseline_headers or {}).items() if k not in credentials}
-    baseline_ref = None
-    if run_context is not None:
-        from harness.run_context import ScopePolicy
-        baseline_ref = "missing-auth:baseline"
-        run_context.sessions.register(
-            baseline_ref, baseline_ref, credentials,
-            allowed_origins=[ScopePolicy.origin_of(url)], role="baseline", ephemeral=True)
-        send_headers = plain
-    else:
-        send_headers = dict(baseline_headers or {})
+    from harness.run_context import ScopePolicy
+    baseline_ref = "missing-auth:baseline"
+    run_context.sessions.register(
+        baseline_ref, baseline_ref, credentials,
+        allowed_origins=[ScopePolicy.origin_of(url)], role="baseline", ephemeral=True)
     try:
-        b_status, b_body = await _send(method, url, send_headers, timeout,
+        b_status, b_body = await _send(method, url, plain,
                                        run_context=run_context, session_ref=baseline_ref)
     finally:
-        if baseline_ref is not None:
-            await run_context.sessions.unregister(baseline_ref)
+        await run_context.sessions.unregister(baseline_ref)
     outcome.baseline_status = b_status
     if not _substantive(b_status, b_body):
         return "the authenticated baseline returned no protected payload"
@@ -284,8 +271,7 @@ async def probe(
     expected_protected: bool = False,
     id_fill: str = "1",
     timeout: float = 15.0,
-    gate: SafetyGate | None = None,
-    run_context=None,
+    run_context,
     protected_baseline: bool = False,
     identity_headers: Iterable[str] = (),
 ) -> ProbeOutcome:
@@ -306,31 +292,36 @@ async def probe(
     name (RV-S residual 2). Every non-public header is stripped from the
     anonymous replay either way. Read-only unless `include_mutating` and the
     safety gate allow the method.
+
+    `run_context` is REQUIRED (ARC-7): every send goes through its executor, so scope,
+    budget, pins and the gate apply. A caller with no run of its own builds one with
+    `run_context.standalone_context()`. Passing None sends nothing and reports an
+    error outcome. `timeout` is kept for compatibility; the run's timeout applies.
+    An empty `allowed_hosts` fails closed: no scope, no send.
     """
     method = (shape.method if isinstance(shape, CallShape) else shape[0]).upper()
     path = shape.path if isinstance(shape, CallShape) else shape[1]
     url = _build_url(base_url, path, id_fill)
     outcome = ProbeOutcome(method=method, url=url, classification="skipped")
 
-    if not _host_allowed(url, allowed_hosts):
-        outcome.classification = "skipped"
-        outcome.note = f"out of scope: {urlsplit(url).hostname}"
+    if run_context is None:
+        outcome.classification = "error"
+        outcome.note = ("no run context: the probe sends only through a run "
+                        "(build one with run_context.standalone_context())")
         return outcome
 
-    if method not in _SAFE_METHODS:
-        if not include_mutating:
-            outcome.note = f"mutating method {method} not probed (include_mutating is off)"
-            return outcome
-        if run_context is None:
-            gate = gate or get_default_gate()
-            decision = gate.authorize(validator_name="missing_auth_probe", method=method, url=url)
-            if not decision.allowed:
-                outcome.note = f"blocked by safety gate: {decision.reason}"
-                return outcome
+    if not _host_allowed(url, allowed_hosts):
+        outcome.classification = "skipped"
+        outcome.note = (f"out of scope: {urlsplit(url).hostname}" if allowed_hosts
+                        else "no scope configured: nothing is sent (set server.allowed_hosts)")
+        return outcome
+
+    if method not in _SAFE_METHODS and not include_mutating:
+        outcome.note = f"mutating method {method} not probed (include_mutating is off)"
+        return outcome
 
     unauth_headers = _strip_auth(baseline_headers)
-    status, body = await _send(method, url, unauth_headers, timeout,
-                               run_context=run_context)
+    status, body = await _send(method, url, unauth_headers, run_context=run_context)
     if status is None:
         outcome.classification = "error"
         outcome.note = body
@@ -342,7 +333,7 @@ async def probe(
         reason = await _unconfirmed_reason(
             method, url, body, outcome, baseline_headers=baseline_headers,
             expected_protected=expected_protected, protected_baseline=protected_baseline,
-            timeout=timeout, run_context=run_context,
+            run_context=run_context,
             identity_headers=frozenset(h.lower() for h in identity_headers))
         outcome.classification = "unauthenticated_access" if reason else "missing_auth"
         outcome.note = reason
@@ -355,18 +346,16 @@ async def probe(
     if send_garbage_token:
         garb_headers = dict(unauth_headers)
         garb_headers["Authorization"] = _GARBAGE_TOKEN
-        garbage_ref = None
-        if run_context is not None:
-            from harness.run_context import ScopePolicy
-            garbage_ref = "missing-auth:garbage"
-            run_context.sessions.register(
-                garbage_ref, garbage_ref, {"Authorization": _GARBAGE_TOKEN},
-                allowed_origins=[ScopePolicy.origin_of(url)], role="negative-control",
-                ephemeral=True)
-            garb_headers = {k: v for k, v in garb_headers.items()
-                            if k.lower() != "authorization"}
+        from harness.run_context import ScopePolicy
+        garbage_ref = "missing-auth:garbage"
+        run_context.sessions.register(
+            garbage_ref, garbage_ref, {"Authorization": _GARBAGE_TOKEN},
+            allowed_origins=[ScopePolicy.origin_of(url)], role="negative-control",
+            ephemeral=True)
+        garb_headers = {k: v for k, v in garb_headers.items()
+                        if k.lower() != "authorization"}
         g_status, g_body = await _send(
-            method, url, garb_headers, timeout, run_context=run_context,
+            method, url, garb_headers, run_context=run_context,
             session_ref=garbage_ref)
         if g_status is not None:
             outcome.garbage_status = g_status

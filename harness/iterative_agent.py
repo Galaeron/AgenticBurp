@@ -646,7 +646,8 @@ class IterativeAgent:
         # directly-constructed agent with no run_context falls back to a
         # per-send standalone context (owned, closed below), preserving the old
         # behaviour for callers that build an IterativeAgent on their own.
-        _tt, _ctx = transport_for(self._run_context, allowed_hosts=self.allowed_hosts, gate=self.gate)
+        _tt, _ctx = transport_for(self._run_context, allowed_hosts=self.allowed_hosts, gate=self.gate,
+                                  active_mode=True)  # model-chosen requests: an empty scope admits no host
         try:
             await global_throttle.acquire()
             out = await _tt.send_creds(method, url, capability="iterative_agent",

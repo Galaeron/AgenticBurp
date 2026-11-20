@@ -66,7 +66,6 @@ from urllib.parse import urlparse, parse_qs
 
 log = logging.getLogger(__name__)
 
-import httpx
 
 from harness import access_control_gate
 from harness import identity_compare
@@ -532,11 +531,25 @@ class CrossIdentityValidator(Validator):
             if not out.executed:   # out_of_scope / blocked / budget / cancelled -> not reached
                 return _UnsentProbe(0, "", outcome=out.outcome or "not sent")
             return identity_compare.Probe(out.status or 0, out.body or "", artifact_id=out.artifact_id)
+        # ARC-7: no raw client. Without a run the probe sends through a standalone one
+        # (transport_for): scope, budget and the connect-time pin apply, and an empty
+        # scope admits no host.
         from harness import global_throttle
+        from harness.run_context import transport_for
         await global_throttle.acquire()
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False, verify=False) as client:
-            resp = await client.get(url, headers=headers or None)
-        return identity_compare.Probe(resp.status_code, resp.text)
+        _tt, _owned = transport_for(None, allowed_hosts=sorted(self.allowed_hosts),
+                                    active_mode=True, timeout=self.timeout)
+        try:
+            out = await _tt.send_creds("GET", url, capability=self.name,
+                                       headers=headers or None, max_redirects=0)
+        finally:
+            if _owned is not None:
+                await _owned.aclose()
+        if out.outcome == "error":
+            raise RuntimeError(out.error or "probe transport error")
+        if not out.executed:
+            return _UnsentProbe(0, "", outcome=out.outcome or "not sent")
+        return identity_compare.Probe(out.status or 0, out.body or "", artifact_id=out.artifact_id)
 
     def _run_identities(self, host: str) -> list[dict]:
         if self.run_context is None:
