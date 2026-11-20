@@ -120,6 +120,59 @@ jobs:
             pip-audit.json
           if-no-files-found: warn
 
+  # OPS-1: the BLOCKING audit. The job above stays advisory on every trigger. This one
+  # runs only on pushes to main and on v* release tags and FAILS the pipeline on any
+  # known vulnerability in the lock that is not in .github/pip-audit-allowlist.toml.
+  # The allowlist checker (harness.audit_allowlist, unit-tested) fails first on an
+  # expired or malformed entry, so an accepted risk has an owner, a reason and an
+  # expiry. No continue-on-error anywhere in this job: a vulnerability, an expired
+  # entry, or an audit that could not complete (no advisory database) must read as
+  # red, never as green. On a v* tag the offline CycloneDX SBOM is also published as
+  # a run artifact. The workflow itself is unverified until it has run in CI.
+  dependency-audit-blocking:
+    name: Dependency audit (BLOCKING on main and release tags)
+    if: >-
+      github.event_name == 'push'
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Validate the allowlist (fails on an expired or malformed entry)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m harness.audit_allowlist check .github/pip-audit-allowlist.toml
+      - name: Install pip-audit
+        run: python -m pip install pip-audit==2.9.0
+      - name: Audit the lock for known vulnerabilities (blocking)
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          IGNORES="$(python -m harness.audit_allowlist ignore-args .github/pip-audit-allowlist.toml)"
+          # $IGNORES is unquoted on purpose: it is "--ignore-vuln ID ..." and the checker
+          # only emits ids made of letters, digits, '.', '_' and '-'.
+          pip-audit -r harness/requirements.lock --no-deps --disable-pip \
+            --progress-spinner off --desc on \
+            --format json --output pip-audit-blocking.json $IGNORES
+      - name: Emit the CycloneDX SBOM for the release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m harness.supply_chain sbom --out sbom.cdx.json
+      - name: Upload the audit report (always) and the SBOM (tags)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-audit-${{ github.ref_name }}-${{ github.run_id }}
+          path: |
+            pip-audit-blocking.json
+            sbom.cdx.json
+          if-no-files-found: ignore
+
   # P0.10: CPU-only precision/recall plumbing check, nightly (+ on-demand). Distinct
   # from `scored` below -- this NEVER calls a real model and needs no GPU/self-hosted
   # runner, so it runs on every stock windows-latest runner. It proves the SCORING

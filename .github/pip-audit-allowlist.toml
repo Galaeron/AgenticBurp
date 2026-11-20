@@ -1,0 +1,22 @@
+# Reviewed allowlist for the BLOCKING pip-audit gate (OPS-1).
+#
+# The `dependency-audit-blocking` job in .github/workflows/ci.yml audits
+# harness/requirements.lock on pushes to `main` and on `v*` tags and fails on any
+# known vulnerability that is not listed here. Pull requests only run the advisory
+# audit. Validate locally with:
+#
+#     python -m harness.audit_allowlist check
+#
+# An entry accepts ONE known vulnerability for a bounded time. Every field is required
+# except `package`, and the check fails on an unknown key, a duplicate id, or an entry
+# whose `expires` date has passed (`expires` is the last day it is valid), so an
+# accepted risk is re-reviewed or removed, never carried silently.
+#
+#   [[ignore]]
+#   id      = "GHSA-xxxx-xxxx-xxxx"   # id exactly as pip-audit prints it (GHSA-*, CVE-*, PYSEC-*)
+#   package = "example-package"       # optional, for the reviewer
+#   owner   = "github-handle"         # who answers for this acceptance
+#   reason  = "Not reachable: the harness never calls the vulnerable parser; tracked in #123."
+#   expires = 2027-02-01              # TOML date, last valid day; renew only with a fresh review
+#
+# No vulnerability is accepted today.
