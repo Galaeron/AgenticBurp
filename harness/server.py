@@ -1125,11 +1125,48 @@ class _CoordinatorToggles(_BaseModel):
     cloud_reasoning: StrictBool = False
 
 
+from pydantic import model_validator as _model_validator  # noqa: E402  (ARC-15)
+
+
+def _non_finite_marked(value):
+    """ARC-15: NaN/Infinity (which the JSON parser accepts) become a marker string,
+    so the field fails validation with a 422 that can itself be serialized: the
+    default 422 body echoes the input, and a raw NaN there was a 500."""
+    if isinstance(value, float) and (value != value or abs(value) == float("inf")):
+        return "<non-finite number>"
+    if isinstance(value, dict):
+        return {k: _non_finite_marked(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_non_finite_marked(v) for v in value]
+    return value
+
+
+class _RetryBudgetSettings(_BaseModel):
+    # ARC-15: a typed, bounded schema; a malformed policy is a 422, never applied.
+    # Unknown keys are refused. Bounds are owner values (see the b1 HANDOFF).
+    model_config = ConfigDict(extra="forbid")
+    max_retries: int | None = Field(None, ge=0, le=10, strict=True)
+    max_agents: int | None = Field(None, ge=1, le=10, strict=True)
+    # 0 = no per-vulnerability token cap, as in config.yaml and the Burp field.
+    max_tokens_per_vuln: int | None = Field(None, ge=0, le=2_000_000, strict=True)
+    stop_on_found: StrictBool | None = None
+    min_actionable_confidence: float | None = Field(None, ge=0.0, le=1.0, strict=True,
+                                                    allow_inf_nan=False)
+
+
 class SettingsRequest(_BaseModel):
     # Global outbound throttle ceiling (requests/sec; 0 = unlimited). None -> leave as-is.
-    throttle_rps: float | None = None
+    # ARC-15: finite and >= 0 (a negative or NaN rate used to become "unlimited").
+    throttle_rps: float | None = Field(None, ge=0.0, allow_inf_nan=False)
+    # Removing a throttle that is on (throttle_rps 0) must be confirmed explicitly.
+    confirm_unlimited: StrictBool = False
     # Default retry-budget policy overrides (any omitted -> unchanged).
-    retry_budget: dict | None = None
+    retry_budget: _RetryBudgetSettings | None = None
+
+    @_model_validator(mode="before")
+    @classmethod
+    def _mark_non_finite(cls, data):
+        return _non_finite_marked(data)
     # Runtime validator toggles (in-memory only, never persisted): recognized keys
     # are `active_enabled` and `cross_identity` (both bool). Any omitted -> unchanged.
     validators: _ValidatorToggles | None = None
@@ -1144,13 +1181,31 @@ async def update_settings(req: SettingsRequest, authorization: str | None = Head
     """Apply runtime settings from the UI: retune the global throttle and/or the
     default retry-budget policy. Takes effect immediately for subsequent work."""
     _require_auth(authorization)
+    from harness import global_throttle
     changed: dict = {}
+    # ARC-15: turning a live throttle OFF needs confirm_unlimited; refused before
+    # anything in the request is applied. Every change is logged (source
+    # "settings") and copied into the manifest of each run live at the time.
+    removing = (req.throttle_rps is not None and req.throttle_rps == 0
+                and global_throttle.throttle.enabled)
+    if removing and not req.confirm_unlimited:
+        raise HTTPException(status_code=422,
+                            detail="throttle_rps 0 removes the outbound throttle "
+                                   f"({global_throttle.throttle.stats()['rate_per_second']} req/s); "
+                                   "resend with confirm_unlimited: true to remove it")
     if req.throttle_rps is not None:
-        from harness import global_throttle
-        global_throttle.configure(max(0.0, float(req.throttle_rps)), source="settings")
+        global_throttle.configure(float(req.throttle_rps), source="settings",
+                                  detail={"confirmed_unlimited": True} if removing else None)
         changed["throttle"] = global_throttle.throttle.stats()
-    if req.retry_budget:
-        orchestrator.retry_budget_policy = orchestrator.retry_budget_policy.merged_with(req.retry_budget)
+    retry = req.retry_budget.model_dump(exclude_unset=True) if req.retry_budget else {}
+    if retry:
+        no_cap = retry.get("max_tokens_per_vuln") == 0
+        policy = orchestrator.retry_budget_policy.merged_with(
+            {k: v for k, v in retry.items() if not (no_cap and k == "max_tokens_per_vuln")})
+        if no_cap:
+            import dataclasses as _dataclasses
+            policy = _dataclasses.replace(policy, max_tokens_per_vuln=None)
+        orchestrator.retry_budget_policy = policy
         p = orchestrator.retry_budget_policy
         changed["retry_budget"] = {"max_retries": p.max_retries, "max_agents": p.max_agents,
                                    "max_tokens_per_vuln": p.max_tokens_per_vuln}
