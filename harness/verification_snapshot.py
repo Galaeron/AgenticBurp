@@ -86,8 +86,8 @@ def _warn_on_lock_mismatch(root: Path) -> None:
         lock_preflight.log_report(
             lock_preflight.check_lock(root / 'harness' / 'requirements.lock'),
             logging.getLogger(__name__))
-    except Exception:
-        pass
+    except Exception as error:
+        logging.getLogger(__name__).warning('dependency lock check skipped (%s)', error)
 
 
 def preflight(root: Path, *, dependencies: bool = True) -> None:

@@ -106,7 +106,8 @@ class GradleWrapperTests(unittest.TestCase):
         jobs = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]
         job = jobs["burp-extension-build"]
         self.assertEqual(java_job_problems(job), [])
-        self.assertEqual(job["steps"][2]["with"]["java-version"], "17")
+        java = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/setup-java"))
+        self.assertEqual(java["with"]["java-version"], "17")
 
     def test_ci_guard_catches_a_bare_gradle_and_a_missing_validation(self):
         jobs = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]
