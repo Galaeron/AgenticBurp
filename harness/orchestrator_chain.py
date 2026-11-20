@@ -1374,11 +1374,22 @@ class ChainMixin:
                 import harness.engagement as _eng
                 from harness.safety_gate import get_default_gate as _get_gate
                 discovered_paths = [ep.path for ep in rc.endpoints] if rc.endpoints else None
-                feature_caps = await engagement_builder.feature_crawl_captures(
-                    base_url, roles, allowed_hosts=self.allowed_hosts,
-                    submit_forms=_get_gate().config.allow_mutating_replay,
-                    seed_paths=discovered_paths, run_context=run_context, errors=_errors,
-                    **({"per_principal": True} if _per_principal else {}))
+                # ARC-7: the crawl sends only through a run: this one, the enclosing
+                # one, or a standalone one closed here.
+                _fc_run = run_context or _run_context_mod.current_run_context()
+                _fc_owned = None
+                if _fc_run is None:
+                    _fc_owned = _fc_run = _run_context_mod.standalone_context(
+                        self.allowed_hosts, config=self.config, active_mode=True)
+                try:
+                    feature_caps = await engagement_builder.feature_crawl_captures(
+                        base_url, roles, allowed_hosts=self.allowed_hosts,
+                        submit_forms=_get_gate().config.allow_mutating_replay,
+                        seed_paths=discovered_paths, run_context=_fc_run, errors=_errors,
+                        **({"per_principal": True} if _per_principal else {}))
+                finally:
+                    if _fc_owned is not None:
+                        await _fc_owned.aclose()
                 # Make workflow routes and their real request shapes visible to
                 # prioritisation. Content-level model review remains deferred.
                 for ex in feature_caps:
