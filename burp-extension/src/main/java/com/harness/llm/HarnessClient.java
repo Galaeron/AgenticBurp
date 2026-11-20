@@ -593,10 +593,34 @@ public class HarnessClient {
     /** POST /settings -- retune the throttle and/or default retry budget. */
     public com.google.gson.JsonObject updateSettings(Double throttleRps, java.util.Map<String, Object> retryBudget)
             throws HarnessException {
+        return updateSettings(throttleRps, false, retryBudget);
+    }
+
+    /** POST /settings -- as above; `confirmUnlimited` is the explicit confirmation
+     * the harness requires (ARC-15) before a throttle of 0 removes a live throttle. */
+    public com.google.gson.JsonObject updateSettings(Double throttleRps, boolean confirmUnlimited,
+                                                     java.util.Map<String, Object> retryBudget)
+            throws HarnessException {
+        return postJson("/settings", settingsBody(throttleRps, confirmUnlimited, retryBudget),
+                shortTimeout());
+    }
+
+    /** The POST /settings body. A null throttle is left out (unchanged). A throttle
+     * of 0 (unlimited) is sent only together with confirm_unlimited: without the
+     * confirmation it is left out, never sent bare (ARC-15). */
+    public static java.util.Map<String, Object> settingsBody(Double throttleRps, boolean confirmUnlimited,
+                                                             java.util.Map<String, Object> retryBudget) {
         java.util.Map<String, Object> body = new java.util.HashMap<>();
-        if (throttleRps != null) body.put("throttle_rps", throttleRps);
+        if (throttleRps != null && throttleRps == 0.0) {
+            if (confirmUnlimited) {
+                body.put("throttle_rps", 0.0);
+                body.put("confirm_unlimited", Boolean.TRUE);
+            }
+        } else if (throttleRps != null) {
+            body.put("throttle_rps", throttleRps);
+        }
         if (retryBudget != null && !retryBudget.isEmpty()) body.put("retry_budget", retryBudget);
-        return postJson("/settings", body, shortTimeout());
+        return body;
     }
 
     /** POST /settings -- flip the runtime validator toggles the Cross-Identity
