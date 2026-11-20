@@ -187,6 +187,11 @@ An operator's explicit `config.local.yaml` value wins over a profile preset (exc
 ## Quick Start
 
 ```bash
+# 0. Install the tested dependency set (from the repo root, Python 3.14 recommended)
+pip install -r harness/requirements.lock
+pip install -e . --no-deps
+python -m harness.lock_preflight   # warns if installed versions differ from the lock
+
 # 1. Start Ollama
 ollama serve
 
@@ -195,8 +200,8 @@ python -m harness.server
 
 # 3. (Optional) Build and load the Burp extension
 cd burp-extension
-gradle shadowJar
-# Load the JAR in Burp Suite > Extensions
+./gradlew shadowJar     # Windows: gradlew.bat shadowJar; JDK 17-21 on JAVA_HOME
+# Load build/libs/*-all.jar in Burp Suite > Extensions
 ```
 
 ## Testing

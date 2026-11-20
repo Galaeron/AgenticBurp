@@ -12,6 +12,12 @@ harness/.harness_token.lock
 
 # Build output and runtime SQLite DBs (SESSION_4_PLAN.md T0.2)
 *.jar
+# OPS-2: the Gradle wrapper jar is source (pinned by distributionSha256Sum and
+# validated in CI), not build output.
+!burp-extension/gradle/wrapper/gradle-wrapper.jar
+# Gradle build output and per-project cache of the Burp extension build.
+burp-extension/build/
+burp-extension/.gradle/
 harness/*.db
 harness/run-output/
 
