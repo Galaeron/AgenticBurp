@@ -178,9 +178,12 @@ class RunStartRefusalTests(_FreshBreaker, unittest.TestCase):
     def test_analyze_is_refused_before_any_model_call(self):
         orch, fake = self._orchestrator(allow=False)
         inner = AsyncMock(side_effect=AssertionError("the analysis must not start"))
-        with patch.object(orch, "_analyze_inner", inner):
+        with patch.object(orch, "_analyze_inner", inner),                 self.assertLogs("harness.model_egress", "WARNING") as logs:
             with self.assertRaises(OllamaCloudModelRefusedError) as ctx:
                 asyncio.run(orch.analyze(self._exchange()))
+        # Review fix: /analyze withholds exception text, so the operator-facing
+        # reason (with the slot) is logged where the run is refused.
+        self.assertTrue(any("agent_defaults.model" in line for line in logs.output), logs.output)
         self.assertEqual(fake.paths, [], "no request reaches the model server")
         self.assertEqual(orch.ollama.model_cloud_refused_count, 0,
                          "refused at run start, not call by call")

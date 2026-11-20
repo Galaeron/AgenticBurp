@@ -16,10 +16,14 @@ and the authenticated `/health/details`.
 """
 from __future__ import annotations
 
+import logging
+
 from harness.ollama_client import (OllamaCloudModelRefusedError, cloud_refusal_reason,
                                    is_cloud_model, parse_allow_cloud_models)
 
 # Sections whose `model` key names an Ollama model a call is sent to.
+log = logging.getLogger(__name__)
+
 _MODEL_SECTIONS = ("coordinator", "agent_defaults", "critique", "surface_prioritization",
                    "writeups")
 
@@ -117,7 +121,9 @@ def refuse_cloud_models(config: dict | None, agent_models: dict | None = None) -
     if state["refused"]:
         slots = state["cloud_slots"]
         where = "; ".join(f"{row['slot']}={row['model']}" for row in slots)
-        raise OllamaCloudModelRefusedError(
-            f"{cloud_refusal_reason(row['model'] for row in slots)} Slots: {where}.",
-            slots=slots)
+        reason = f"{cloud_refusal_reason(row['model'] for row in slots)} Slots: {where}."
+        # The API layer withholds exception text (safe_error_summary), so the
+        # operator-facing reason is logged here, where the run is refused.
+        log.warning("run refused before any model call: %s", reason)
+        raise OllamaCloudModelRefusedError(reason, slots=slots)
     return state
