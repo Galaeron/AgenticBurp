@@ -1198,9 +1198,11 @@ Executor = TargetTransport
 # The pin sits in the httpcore network backend, so the Host header, TLS SNI and
 # certificate hostname checks stay on the name, and nothing changes for clients that
 # never open a socket (mock transports). ON by default; `security.pin_connect_address:
-# false` is an explicit opt-out. Behind an HTTP(S) proxy (trust_env) the proxy
-# resolves the target, so only the connection to the proxy is pinned. A name whose
-# FIRST answer is private or loopback is accepted -- lab targets do that.
+# false` is an explicit opt-out. ARC-14: target clients never honour HTTP(S)_PROXY /
+# ALL_PROXY from the environment (trust_env=False), so a proxy can never take over
+# resolving the target and bypass the pin; the harness has no configured upstream
+# proxy for target traffic. A name whose FIRST answer is private or loopback is
+# accepted -- lab targets do that.
 # ---------------------------------------------------------------------------
 
 class DestinationBlocked(Exception):
@@ -1298,15 +1300,18 @@ def _pinned_backend(pins: "AddressPins | None"):
 
 def _target_client(*, verify, timeout: float, http2: bool,
                    pins: "AddressPins | None") -> httpx.AsyncClient:
-    """An httpx client for target traffic whose connections honour the run's pins."""
-    transport = httpx.AsyncHTTPTransport(verify=verify, http2=http2)
+    """An httpx client for target traffic whose connections honour the run's pins.
+
+    ARC-14: trust_env=False on the client and its transport, so no environment
+    proxy (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY), .netrc or SSL_CERT_* setting is
+    applied: every send connects to the pinned target address itself."""
+    transport = httpx.AsyncHTTPTransport(verify=verify, http2=http2, trust_env=False)
     backend = _pinned_backend(pins)
     if backend is not None:
         transport._pool._network_backend = backend
-    # verify/http2 are passed to the client too, so environment-proxy mounts use the
-    # same trust as the pinned transport.
     return httpx.AsyncClient(follow_redirects=False, verify=verify, timeout=timeout,
-                             cookies=httpx.Cookies(), http2=http2, transport=transport)
+                             cookies=httpx.Cookies(), http2=http2, transport=transport,
+                             trust_env=False)
 
 
 def _address_pins_from_config(config: dict | None) -> "AddressPins | None":
