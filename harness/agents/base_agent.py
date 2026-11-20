@@ -270,30 +270,37 @@ class BaseAgent(ABC):
         """The sanitized, redacted parts of `exchange` the user prompt shows.
         prompt_budget.fit_agent_prompts builds one per fit and reuses it across
         its rebuilds: sanitizing a large body dominates the cost of a build."""
-        exchange = security.sanitized_exchange(exchange)
-        headers_req = "\n".join(f"{k}: {v}" for k, v in security.redact_headers(exchange.request_headers).items())
-        headers_resp = "\n".join(f"{k}: {v}" for k, v in security.redact_headers(exchange.response_headers).items())
-        headers_req = _neutralize_fence_breakout(headers_req)
-        headers_resp = _neutralize_fence_breakout(headers_resp)
+        raw = exchange
+        exchange = security.sanitized_exchange(raw)       # cached per exchange content
 
-        # PR-9 / R09: header redaction above only withholds secrets carried
-        # in HEADERS. A secret can also ride in the URL's query string
-        # (?token=...) or in a request/response BODY field -- including
-        # nested inside another object -- so redact those by FIELD/PARAM
-        # NAME the same way, before truncation/fencing. This never touches
-        # a non-secret field, so an injection payload elsewhere in the URL
-        # or body (e.g. a SQLi/XSS payload in a "q"/"search" param) still
-        # reaches the model verbatim -- see security.redact_secrets_in_url/
-        # redact_secrets_in_body for the (best-effort, not guaranteed)
-        # secret-name-only scope.
-        return _PromptView(
-            exchange=exchange,
-            url=security.redact_secrets_in_url(exchange.url),
-            headers_req=headers_req,
-            headers_resp=headers_resp,
-            request_body=security.redact_secrets_in_body(exchange.request_body),
-            response_body=security.redact_secrets_in_body(exchange.response_body),
-        )
+        def build() -> dict:
+            headers_req = "\n".join(f"{k}: {v}" for k, v in security.redact_headers(exchange.request_headers).items())
+            headers_resp = "\n".join(f"{k}: {v}" for k, v in security.redact_headers(exchange.response_headers).items())
+            headers_req = _neutralize_fence_breakout(headers_req)
+            headers_resp = _neutralize_fence_breakout(headers_resp)
+
+            # PR-9 / R09: header redaction above only withholds secrets carried
+            # in HEADERS. A secret can also ride in the URL's query string
+            # (?token=...) or in a request/response BODY field -- including
+            # nested inside another object -- so redact those by FIELD/PARAM
+            # NAME the same way, before truncation/fencing. This never touches
+            # a non-secret field, so an injection payload elsewhere in the URL
+            # or body (e.g. a SQLi/XSS payload in a "q"/"search" param) still
+            # reaches the model verbatim -- see security.redact_secrets_in_url/
+            # redact_secrets_in_body for the (best-effort, not guaranteed)
+            # secret-name-only scope.
+            return {
+                "url": security.redact_secrets_in_url(exchange.url),
+                "headers_req": headers_req,
+                "headers_resp": headers_resp,
+                "request_body": security.redact_secrets_in_body(exchange.request_body),
+                "response_body": security.redact_secrets_in_body(exchange.response_body),
+            }
+
+        # TOK-6: the strings above depend only on the exchange's content, not on the
+        # agent, so every agent routed this exchange shares one build.
+        return _PromptView(exchange=exchange,
+                           **security.cached_exchange_view("prompt_view", raw, build))
 
     def _user_prompt(self, exchange: HttpExchange, max_body_chars: int, prior_context: str = "",
                      *, include_knowledge: bool = True, context_fit: bool = False,
