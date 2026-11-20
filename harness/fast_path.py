@@ -27,7 +27,9 @@ from __future__ import annotations
 import re
 import json
 import logging
+from functools import lru_cache
 from typing import Optional
+from urllib.parse import unquote_plus
 
 from harness.models import HttpExchange
 
@@ -38,27 +40,52 @@ log = logging.getLogger("harness.fast_path")
 # Pattern Definitions
 # =============================================================================
 
+# TOK-2: a path pattern names a whole path SEGMENT, never a substring of one.
+# The old patterns were bare substrings searched over the full URL, so `/js`
+# also fired on `/json`, `/me` on `/messages`, `/ai` on `/air`, and a host such
+# as `me.example.com` or a `?next=/admin` value fired the admin/user rows.
+#
+# `_path_re` builds a pattern whose alternatives must each end at a boundary:
+# the end of the path, a non-alphanumeric character ('/', '-', '_', '.'), or a
+# camelCase step (`/resetPassword`, `/fileUpload`). An optional plural ("s" /
+# "es") is allowed (`/user` also matches `/users`). An alternative that itself
+# ends in '/' is already anchored and is left alone. Derived forms that used to
+# match by prefix and are real endpoints (`/management`, `/chatbot`,
+# `/healthz`) are listed as alternatives of their own.
+_PATH_BOUNDARY = r'(?i:e?s)?(?:(?![A-Za-z0-9])|(?<=[a-z])(?=[A-Z]))'
+
+
+def _path_re(*alternatives: str) -> re.Pattern:
+    """Compile whole-segment path alternatives (see the block comment above)."""
+    parts = [f'(?i:{alt})' if alt.endswith('/') else f'(?i:{alt}){_PATH_BOUNDARY}'
+             for alt in alternatives]
+    return re.compile('|'.join(parts))
+
+
 # URL/Path patterns that strongly indicate specific vulnerability classes
 # Format: (compiled_regex, [agent_names])
 _URL_PATTERNS: list[tuple[re.Pattern, list[str]]] = [
     # GraphQL endpoints
-    (re.compile(r'/graphql|/api/graphql|/gql', re.IGNORECASE), ['graphql', 'sqli', 'idor', 'business_logic']),
+    (_path_re('/graphql', '/api/graphql', '/gql'), ['graphql', 'sqli', 'idor', 'business_logic']),
     
     # OAuth / OIDC endpoints
-    (re.compile(r'/oauth|/authorize|/oidc|/openid|/\.well-known/openid-configuration', re.IGNORECASE), ['oauth']),
+    (_path_re('/oauth2?', '/authorize', '/oidc', '/openid', r'/\.well-known/openid-configuration'), ['oauth']),
 
     # WebSocket-shaped paths (common conventions, actual protocol upgrade
     # is confirmed by the Upgrade request header, matched below)
-    (re.compile(r'/ws/|/websocket|/socket\.io|/wss/', re.IGNORECASE), ['websocket']),
+    (_path_re('/ws/', '/websocket', r'/socket\.io', '/wss/'), ['websocket']),
 
     # API endpoints likely to carry create/update bodies or list/paging params
     (re.compile(r'/api/', re.IGNORECASE), ['api_security']),
     
     # AI/LLM endpoints
-    (re.compile(r'/ai|/llm|/chat|/assistant|/completion|/prompt|/agent|/copilot', re.IGNORECASE), ['ai_security', 'ai_llm']),
+    (_path_re('/ai', '/llm', '/chat', '/chatbot', '/assistant', '/completion', '/prompt', '/agent',
+              '/copilot'), ['ai_security', 'ai_llm']),
     
     # Admin/management endpoints - often have auth issues
-    (re.compile(r'/admin|/administrator|/manage|/console|/panel', re.IGNORECASE), 
+    (_path_re('/admin', '/administrator', '/administration', '/manage', '/management', '/manager',
+              '/console', '/panel'),
+
      ['auth', 'idor', 'misconfig']),
     
     # Login/authentication endpoints. Includes sqli: credential fields
@@ -75,15 +102,18 @@ _URL_PATTERNS: list[tuple[re.Pattern, list[str]]] = [
     # brute-force throttling is one of the most classic, universally
     # relevant checks there is here -- rate_limit had zero fast_path
     # entries anywhere in this file.
-    (re.compile(r'/login|/logins|/auth|/authenticate|/signin|/sign_in|/sessions', re.IGNORECASE),
+    (_path_re('/login', '/logins', '/auth', '/authenticate', '/authentication', '/authorization',
+              '/signin', '/sign_in', '/sessions'),
      ['auth', 'business_logic', 'sqli', 'rate_limit']),
     
     # Registration endpoints
-    (re.compile(r'/register|/registration|/signup|/sign_up|/create_account', re.IGNORECASE), 
+    (_path_re('/register', '/registration', '/signup', '/sign_up', '/create_account'),
+
      ['auth', 'business_logic']),
     
     # Password reset endpoints
-    (re.compile(r'/password|/pwd|/reset|/forgot|/recover', re.IGNORECASE), 
+    (_path_re('/password', '/pwd', '/reset', '/forgot', '/recover', '/recovery'),
+
      ['auth', 'business_logic']),
     
     # API endpoints with version
@@ -94,11 +124,12 @@ _URL_PATTERNS: list[tuple[re.Pattern, list[str]]] = [
     # a real Juice Shop /file-upload request -- this URL pattern already
     # matched (hence xss/misconfig/supply_chain firing), but never included
     # the one agent actually built to test file uploads.
-    (re.compile(r'/upload|/uploads|/file|/files|/import|/export', re.IGNORECASE),
+    (_path_re('/upload', '/uploads', '/file', '/files', '/import', '/export'),
      ['xss', 'misconfig', 'supply_chain', 'file_upload']),
     
     # User/profile endpoints
-    (re.compile(r'/user|/users|/profile|/account|/me', re.IGNORECASE), 
+    (_path_re('/user', '/users', '/profile', '/account', '/me'),
+
      ['idor', 'auth', 'misconfig']),
 
     # Order/transaction-shaped endpoints (found missing during the
@@ -117,12 +148,11 @@ _URL_PATTERNS: list[tuple[re.Pattern, list[str]]] = [
     # (`-order`, not `/order`), so idor was never dispatched for it despite
     # /api/Users/<id> and /rest/basket/<id> triggering it correctly in the
     # same run. See "Harness vs. Juice Shop" §06 (dispatch-layer gaps).
-    (re.compile(r'/order|/orders|/track-order|/track_order|/trackorder|'
-                r'/invoice|/invoices|/booking|/bookings|'
-                r'/ticket|/tickets|/transaction|/transactions|'
-                r'/reservation|/reservations|/appointment|/appointments|'
-                r'/basket|/baskets|/cart|/carts',
-                re.IGNORECASE),
+    (_path_re('/order', '/orders', '/track-order', '/track_order', '/trackorder',
+              '/invoice', '/invoices', '/booking', '/bookings',
+              '/ticket', '/tickets', '/transaction', '/transactions',
+              '/reservation', '/reservations', '/appointment', '/appointments',
+              '/basket', '/baskets', '/cart', '/carts'),
      ['idor', 'auth', 'misconfig']),
 
     # Exposed file-store / directory-listing endpoints. Found missing
@@ -133,49 +163,131 @@ _URL_PATTERNS: list[tuple[re.Pattern, list[str]]] = [
     # `/files` static root, or `/backup` store carries no query string and
     # no "sensitive"-looking header, so nothing else fired. See
     # "Harness vs. Juice Shop" §06.
-    (re.compile(r'/ftp(/|$)|/backup|/backups|/dump|/dumps|/filestore|/file-store',
-                re.IGNORECASE),
+    (_path_re('/ftp', '/backup', '/backups', '/dump', '/dumps', '/filestore', '/file-store'),
      ['misconfig', 'recon', 'info_disclosure']),
     
     # Search endpoints
-    (re.compile(r'/search|/find|/query|/lookup', re.IGNORECASE), 
+    (_path_re('/search', '/find', '/query', '/queries', '/lookup'),
+
      ['sqli', 'xss']),
     
     # Config/debug endpoints
-    (re.compile(r'/config|/settings|/debug|/status|/health|/info', re.IGNORECASE), 
+    (_path_re('/config', '/configuration', '/settings', '/debug', '/status', '/health', '/healthz',
+              '/healthcheck', '/info'),
+
      ['misconfig', 'supply_chain']),
     
     # Webhook endpoints
-    (re.compile(r'/webhook|/hooks|/callback|/notify', re.IGNORECASE), 
+    (_path_re('/webhook', '/hooks', '/callback', '/notify'),
+
      ['ssrf', 'misconfig']),
     
     # Proxy endpoints
-    (re.compile(r'/proxy|/forward', re.IGNORECASE), 
+    (_path_re('/proxy', '/forward'),
+
      ['ssrf', 'misconfig']),
     
     # Image/avatar endpoints (common SSRF vectors)
-    (re.compile(r'/image|/img|/avatar|/photo|/picture|/profile_image|/profileImage', re.IGNORECASE), 
+    (_path_re('/image', '/img', '/avatar', '/photo', '/picture', '/profile_image', '/profileImage'),
+
      ['ssrf', 'xss']),
     
     # Static asset endpoints (usually safe, but check for misconfig)
-    (re.compile(r'/static|/assets|/css|/js|/images|/fonts', re.IGNORECASE), 
+    (_path_re('/static', '/assets', '/css', '/js', '/images', '/fonts'),
+
      ['misconfig']),
 ]
 
 # Query parameter patterns
-_QUERY_PARAM_PATTERNS: list[tuple[re.Pattern, list[str]]] = [
-    # ID parameters (IDOR risk)
-    (re.compile(r'id|user_id|account_id|customer_id|order_id|product_id', re.IGNORECASE), 
+#
+# TOK-2: a parameter NAME is matched by whole tokens, never by substring. The
+# old regexes were searched unanchored, so `id` fired on width, hidden, valid,
+# provider, guid and video (IDOR + SQLi dispatched for a CSS width), `do` on
+# domain/download, `key` on keyword/monkey, `order` on border, and so on.
+#
+# A name is split into tokens on camelCase steps, digit runs and every
+# non-alphanumeric character ('_', '-', '.', '[', ']', ...), so `userId`,
+# `user_id`, `filter[user][id]` and `orderID` all yield an `id` token. A rule
+# fires when a token equals one of its trigger words, or when the whole
+# lowercased name / one separator-delimited piece equals one of its explicit
+# COMPOUND names (a run-together lowercase `userid`, `apikey`, `returnurl`
+# that has no boundary to split on). `exact` words ("to", "out", "do") are
+# ambiguous as parts of a longer name (`date_to`, `time_out`, `do_not_track`)
+# and fire only when they are the whole parameter name.
+
+_NON_ALNUM_RE = re.compile(r'[^A-Za-z0-9]+')
+_NAME_TOKEN_RE = re.compile(r'[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+')
+
+
+@lru_cache(maxsize=4096)
+def _param_name_forms(name: str) -> tuple[frozenset[str], str]:
+    """(token-and-piece forms, whole name) of a parameter name, all lowercase.
+
+    The forms are every camelCase/digit token, every separator-delimited piece
+    and the pieces joined back together (`user_id` -> `userid`)."""
+    pieces = [p for p in _NON_ALNUM_RE.split(unquote_plus(name)) if p]
+    forms: set[str] = set()
+    for piece in pieces:
+        forms.add(piece.lower())
+        forms.update(t.lower() for t in _NAME_TOKEN_RE.findall(piece))
+    joined = ''.join(pieces).lower()
+    forms.add(joined)
+    return frozenset(forms), joined
+
+
+class _ParamNameRule:
+    """One query-parameter dispatch row: `search(name)` is True when the name
+    carries one of the row's trigger tokens (see the block comment above)."""
+    __slots__ = ('names', 'exact', 'stems')
+
+    def __init__(self, tokens, compounds=(), exact=(), stems=()):
+        self.names = frozenset(w.lower() for w in (*tokens, *compounds))
+        self.exact = frozenset(w.lower() for w in exact)
+        self.stems = tuple(w.lower() for w in stems)
+
+    def search(self, name: str) -> bool:
+        forms, whole = _param_name_forms(name)
+        if whole in self.exact or not self.names.isdisjoint(forms):
+            return True
+        # `stems` are long, unambiguous words that stay a trigger inside a
+        # run-together lowercase name: `newpassword`, `passwordconfirm`.
+        return any(whole.startswith(w) or whole.endswith(w) for w in self.stems)
+
+
+# Resource nouns whose run-together `<noun>id` is an object reference
+# (`userid`, `orderid`). Written out so each compound is reviewable.
+_ID_NOUNS = (
+    'user', 'account', 'customer', 'order', 'product', 'item', 'basket', 'cart', 'invoice',
+    'ticket', 'booking', 'reservation', 'transaction', 'profile', 'object', 'resource',
+    'entity', 'record', 'doc', 'document', 'file', 'message', 'post', 'comment', 'tenant',
+    'org', 'organization', 'group', 'team', 'project', 'device', 'address', 'card',
+    'payment', 'member', 'employee', 'client', 'patient', 'vehicle', 'thread', 'topic',
+    'article', 'row', 'session',
+)
+
+_QUERY_PARAM_PATTERNS: list[tuple[_ParamNameRule, list[str]]] = [
+    # ID parameters (IDOR risk). `uuid` is a compound, `guid` deliberately is
+    # not (owner decision: see the TOK-2 handoff); the one-letter forms are
+    # the usual short ids (`pid=`, `cid=`, `uid=`).
+    (_ParamNameRule(
+        tokens=('id', 'ids'),
+        compounds=('uuid', 'uid', 'pid', 'cid', 'oid', 'nid', 'tid', 'rid', 'mid', 'gid',
+                   'eid', 'fid', 'sid', 'vid', 'aid', *(f'{n}id' for n in _ID_NOUNS))),
      ['idor', 'sqli']),
-    
+
     # Search/query parameters (injection risk)
-    (re.compile(r'q|query|search|keyword|term|filter', re.IGNORECASE), 
+    (_ParamNameRule(
+        tokens=('q', 'query', 'queries', 'search', 'keyword', 'keywords', 'term', 'terms',
+                'filter', 'filters'),
+        compounds=('searchterm', 'searchquery', 'searchtext', 'searchstring', 'searchkey',
+                   'searchkeyword', 'querystring'),
+        stems=('search',)),
      ['sqli', 'xss']),
-    
+
     # File/path/redirect-target parameters (path traversal, SSRF, open
-    # redirect, header/response-splitting injection). Found missing during
-    # a live audit against a real Juice Shop `/redirect?to=<url>` request
-    # -- the textbook open-redirect shape -- which dispatched neither
+    # redirect, header/response-splitting injection). Found missing during a
+    # live audit against a real Juice Shop `/redirect?to=<url>` request --
+    # the textbook open-redirect shape -- which dispatched neither
     # open_redirect nor header_injection at all (both had ZERO fast_path
     # entries anywhere in this file), and fast_path was confident enough
     # on OTHER grounds (ssrf/misconfig still matched) that the coordinator
@@ -186,24 +298,43 @@ _QUERY_PARAM_PATTERNS: list[tuple[re.Pattern, list[str]]] = [
     # header_injection is bundled at the same trigger because CRLF/
     # response-splitting into a Location header is the classic mechanism
     # BEHIND a redirect endpoint, not a separately-signaled precondition.
-    (re.compile(r'file|path|url|uri|link|redirect|next|target|'
-                r'\bto\b|\bout\b|dest|destination|return|return_to|returnurl|continue|goto|redir|forward',
-                re.IGNORECASE),
+    # `to` and `out` stay whole-name-only: `date_to`/`time_out` are not targets.
+    (_ParamNameRule(
+        tokens=('file', 'files', 'path', 'paths', 'url', 'urls', 'uri', 'link', 'redirect',
+                'next', 'target', 'dest', 'destination', 'return', 'continue', 'goto',
+                'redir', 'forward'),
+        compounds=('returnurl', 'returnto', 'returnpath', 'redirecturl', 'redirecturi',
+                   'redirectto', 'redirectpath', 'nexturl', 'targeturl', 'desturl', 'fileurl',
+                   'imageurl', 'callbackurl', 'backurl', 'filename', 'filepath', 'pathname',
+                   'avatarurl', 'webhookurl', 'photourl', 'avatarpath'),
+        exact=('to', 'out'), stems=('redirect',)),
      ['ssrf', 'misconfig', 'open_redirect', 'header_injection']),
-    
+
     # Authentication tokens (sensitive, but also injection vectors)
-    (re.compile(r'token|api_key|apikey|key|secret|password|credential', re.IGNORECASE), 
+    (_ParamNameRule(
+        tokens=('token', 'tokens', 'key', 'keys', 'secret', 'password', 'credential',
+                'credentials'),
+        compounds=('apikey', 'apitoken', 'authtoken', 'accesstoken', 'refreshtoken',
+                   'sessiontoken', 'csrftoken', 'clientsecret', 'apisecret', 'secretkey',
+                   'accesskey', 'privatekey', 'secretkey'),
+        stems=('password', 'secret', 'token', 'credential')),
      ['auth', 'misconfig']),
-    
+
     # Sort/pagination parameters (business logic)
-    (re.compile(r'sort|order|page|limit|offset|per_page', re.IGNORECASE), 
+    (_ParamNameRule(
+        tokens=('sort', 'order', 'page', 'limit', 'offset'),
+        compounds=('sortby', 'sortorder', 'orderby', 'pagesize', 'pagenum', 'pagenumber',
+                   'perpage', 'pagelimit')),
      ['business_logic', 'sqli']),
-    
+
     # Action/command parameters (command injection). Found missing during
     # a live audit: command_injection had zero fast_path entries anywhere
     # in this file, despite this exact parameter-name shape (cmd/exec/run)
-    # being the textbook precondition for it.
-    (re.compile(r'action|cmd|command|exec|run|do', re.IGNORECASE),
+    # being the textbook precondition for it. `do` is whole-name-only
+    # (`do_not_track`, `todo`, `domain` are not commands).
+    (_ParamNameRule(
+        tokens=('action', 'actions', 'cmd', 'command', 'commands', 'exec', 'execute', 'run'),
+        exact=('do',)),
      ['misconfig', 'business_logic', 'command_injection']),
 ]
 
@@ -423,11 +554,22 @@ _STATUS_PATTERNS: dict[int, list[str]] = {
 # Fast-Path Selection Logic
 # =============================================================================
 
+_URL_AUTHORITY_RE = re.compile(r'^[A-Za-z][A-Za-z0-9+.\-]*://[^/?#]*')
+
+
+def _url_path(url: str) -> str:
+    """The path of `url` (a full URL or a bare path): no scheme, host, query or
+    fragment. A host label or a `?next=/admin` value is not a path segment."""
+    path = _URL_AUTHORITY_RE.sub('', url or '', count=1)
+    return re.split(r'[?#]', path, maxsplit=1)[0]
+
+
 def select_agents_by_url(url: str) -> set[str]:
-    """Select agents based on URL/path patterns."""
+    """Select agents based on URL/path patterns (the path only; segment-bounded)."""
+    path = _url_path(url)
     agents = set()
     for pattern, agent_list in _URL_PATTERNS:
-        if pattern.search(url):
+        if pattern.search(path):
             agents.update(agent_list)
     return agents
 
@@ -448,8 +590,10 @@ def select_agents_by_query_params(query_string: str) -> set[str]:
     if not query_string:
         return agents
 
-    # Extract parameter names from query string
-    params = re.findall(r'([^=&]+)=', query_string)
+    # Extract parameter names from query string. A name starts the string or
+    # follows '&': `redirect=/a?id=1` has ONE parameter (a URL-valued
+    # `redirect`), not a second one named `/a?id`.
+    params = re.findall(r'(?:^|&)([^=&]+)=', query_string)
     if not params:
         return agents
 
