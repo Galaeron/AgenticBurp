@@ -1509,8 +1509,11 @@ async def engagement_run(host: str, req: RunEngagementRequest, authorization: st
     if req.execute:
         # ARC-1: executing fetches and analyzes target pages (ACTIVE_TRAFFIC_WHEN);
         # a plan-only call sends nothing and stays available while passive.
-        _admit_active_traffic()
+        # The operating-profile denial (e.g. passive-only "captured-only") is
+        # checked first: it names the real reason, and arming active mode
+        # cannot lift it.
         _require_target_fetch(req.base_url or '', bulk=True)
+        _admit_active_traffic()
         if not req.base_url:
             raise HTTPException(status_code=400, detail="execute requires base_url")
         return await orchestrator.run_engagement(
