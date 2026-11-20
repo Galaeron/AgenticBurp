@@ -138,12 +138,15 @@ slow serial dispatch does not time out mid-run); it is adjustable at runtime via
 
 ## 6. Building the Burp extension
 
-Needs JDK 17+. The project does not yet ship a Gradle wrapper, so install Gradle
-(8.x) yourself:
+Needs a JDK 17-21 on `JAVA_HOME` (Gradle 8.7 cannot be launched by a newer JDK; the build
+itself compiles and tests with a Java 17 toolchain, so a JDK 17 must be installed). The
+project ships a Gradle wrapper, so no separate Gradle install is needed; the first run
+downloads Gradle 8.7, checked against the checksum pinned in
+`burp-extension/gradle/wrapper/gradle-wrapper.properties`:
 
 ```bash
 cd burp-extension
-gradle shadowJar       # -> build/libs/*.jar
+./gradlew shadowJar    # Windows: gradlew.bat shadowJar -> build/libs/*-all.jar
 ```
 
 Load the JAR in Burp Suite → Extensions → Add. (The Java source compiles and its

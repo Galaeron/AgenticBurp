@@ -248,18 +248,19 @@ jobs:
   # Python tiers -- Java breakage has shipped before because nothing built it per
   # commit.
   #
-  # Rule 3 (no claim above the evidence): this repo's dev host has no JDK (CLAUDE.md
-  # hazard #6) and there is no committed Gradle wrapper, so the build depends on the
-  # Gradle the setup-gradle action provides and has NOT been verified from this
-  # session. Its first per-push CI run is its first-ever execution and may fail; a
-  # failure here means the Java build itself needs fixing (most likely a committed
-  # Gradle wrapper produced on a JDK host to pin the version build.gradle warns
-  # about), not that running it per-commit is wrong.
+  # OPS-2: the build runs through the committed Gradle wrapper (burp-extension/gradlew,
+  # Gradle 8.7, distribution pinned by distributionSha256Sum) and build.gradle declares
+  # a Java 17 toolchain, so the Gradle and JDK versions do not depend on whatever the
+  # runner image ships. The wrapper jar is validated against Gradle's published
+  # checksums before it is executed. The wrapper build was verified offline on a
+  # developer host; this job's own runs are the only evidence about the runner.
   burp-extension-build:
     name: Burp extension build + Java tests (JDK)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate the Gradle wrapper jar against Gradle's published checksums
+        uses: gradle/actions/wrapper-validation@v3
       - uses: actions/setup-java@v4
         with:
           distribution: "temurin"
@@ -267,7 +268,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v3
       - name: Run the Java tests and build the shadow jar
         working-directory: burp-extension
-        run: gradle test shadowJar --no-daemon
+        run: ./gradlew test shadowJar --no-daemon
       - name: Record the built artifact's version/checksum
         working-directory: burp-extension
         shell: bash

@@ -195,8 +195,8 @@ python -m harness.server
 
 # 3. (Optional) Build and load the Burp extension
 cd burp-extension
-gradle shadowJar
-# Load the JAR in Burp Suite > Extensions
+./gradlew shadowJar     # Windows: gradlew.bat shadowJar; JDK 17-21 on JAVA_HOME
+# Load build/libs/*-all.jar in Burp Suite > Extensions
 ```
 
 ## Testing
