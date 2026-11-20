@@ -978,12 +978,12 @@ def bind_confirmation_proof(exchange: HttpExchange, finding: Finding, agent_name
     unconfirmed). This marks confirmed only the UNCONFIRMED rows on the same
     host, method and route (`_normalize_endpoint`: query values dropped, names
     kept, the endpoint the fingerprint keys on) whose class is the proof's own
-    class (the fingerprint's canonical reading) and whose recorded parameter is
-    the proven one, or is unnamed. A row of any other class or another parameter
-    is never touched. When no row matches and none is already confirmed, the
-    proven finding is persisted as its own row. `finding` must carry proof_id and
-    case_id; a finding without them binds nothing. Returns the number of rows
-    bound/added.
+    class (categories.finding_class, the reading the R11-1 class gate uses; EFF-2)
+    and whose recorded parameter is the proven one, or is unnamed. A row of any
+    other class or another parameter is never touched. When no row matches and
+    none is already confirmed, the proven finding is persisted as its own row.
+    `finding` must carry proof_id and case_id; a finding without them binds
+    nothing. Returns the number of rows bound/added.
 
     The coverage drive's proofs were not dispatched for any stored row, so it
     narrows the match (r10: 143 confirmed coverage proofs, AV-EXPOSURE-01 among
@@ -1006,10 +1006,13 @@ def bind_confirmation_proof(exchange: HttpExchange, finding: Finding, agent_name
     if not (finding.confirmed and finding.proof_id and finding.case_id):
         return 0
     from urllib.parse import urlsplit
-    from harness.categories import legacy_canonicalize
+    from harness.categories import finding_class
 
     def _check(cls: str) -> str:
-        return legacy_canonicalize(cls) or (cls or "").lower()
+        # EFF-2: the class reading the R11-1 gate uses, so a proof binds the rows
+        # the gate would let it confirm ("potential_idor" beside "idor"). The
+        # fingerprint keeps legacy_canonicalize; this only picks rows to bind.
+        return finding_class(cls)
 
     def _accepts(cls: str) -> bool:
         try:

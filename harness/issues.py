@@ -30,7 +30,8 @@ from dataclasses import dataclass, field
 from typing import NamedTuple
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-from harness.categories import canonicalize, distinctive_token, grouping_class, is_lead_label
+from harness.categories import (canonicalize, distinctive_token, finding_class,
+                                 is_lead_label)
 from harness.engagement import normalize_path
 from harness import security
 
@@ -590,16 +591,11 @@ def issue_key(finding: dict, *, recorded_policy: bool = True) -> tuple:
 
 
 def issue_class(vulnerability_class: str) -> str:
-    """The class an issue groups on: the canonical class, else a distinctive class
-    token in the label ("Broken Access Control (BOLA) on Workflow Scope" -> idor), else
-    the label variant's class (R11-2: case and separators folded, a "potential_"/lead
-    marker dropped, "exposed_public_metrics_endpoint" -> metrics_exposure; see
-    categories.grouping_class), else the raw lowercased label. Grouping only -- the
-    stored finding fingerprint keeps categories.legacy_canonicalize so suppressions
-    stay valid."""
-    vc = vulnerability_class or ""
-    return (canonicalize(vc) or distinctive_token(vc) or grouping_class(vc)
-            or vc.strip().lower())
+    """The class an issue groups on: categories.finding_class, the one reading the
+    R11-1 class gate and proof binding also use (EFF-2), so an issue groups on the
+    class its proof was bound by. The stored finding fingerprint keeps
+    categories.legacy_canonicalize so suppressions stay valid."""
+    return finding_class(vulnerability_class)
 
 
 from harness.categories import CANONICAL_CATEGORIES as _CANONICAL_CATEGORIES  # noqa: E402
