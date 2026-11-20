@@ -1309,6 +1309,28 @@ class SqlmapValidator(Validator):
                     evidence=verdict_evidence, raw_output=output, command=cmd,
                     control_outcome=NAMED_PARAMETER_UNTESTED, limitation=verdict)
             blips = _blip_note(output)
+            if proc.returncode != 0 and not _PARAMETER_VERDICT_RE.search(output):
+                # EFF-1: sqlmap exited nonzero WITHOUT reaching its own "not
+                # injectable" verdict (a crash, a bad option, a tool error). Nothing
+                # was compared, so this is "we don't know", never a negative. A
+                # nonzero exit that carries the verdict is sqlmap's normal negative
+                # (it exits 1 on "all tested parameters do not appear to be
+                # injectable") and stays not_confirmed below.
+                from harness.control_outcome import CONTROL_NOT_RUN
+                return ValidationResult(
+                    self.name, "inconclusive", finding.vulnerability_class,
+                    confidence=0.0, confirmed=False,
+                    summary=f"sqlmap exited {proc.returncode} without its parameter verdict "
+                            "-- not a negative result",
+                    evidence=verdict_evidence, raw_output=output, command=cmd,
+                    control_outcome=CONTROL_NOT_RUN,
+                    limitation="; ".join(x for x in (
+                        f"sqlmap exit code {proc.returncode} and no tested-parameter verdict",
+                        blips, verdict) if x),
+                )
+            # Not a held control: sqlmap's "not injectable" is the absence of its
+            # oracle signal, so control_outcome stays unset and the confirmation
+            # gate reports the finding UNVERIFIED, not refuted (EFF-1 inventory).
             return ValidationResult(
                 self.name, "not_confirmed", finding.vulnerability_class,
                 confidence=0.2 if proc.returncode == 0 else 0.0,

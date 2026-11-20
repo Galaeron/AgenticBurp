@@ -73,10 +73,10 @@ def param_targets(exchange: HttpExchange) -> list[tuple[str, str]]:
 
 
 # control_outcome markers for a not_confirmed that is NOT a controlled negative for
-# the finding's own case. The confirmation gate only counts "" / "control_held" as
-# refuting, so either marker lands the finding as inconclusive, never refuted.
-NAMED_PARAMETER_UNTESTED = "named_parameter_untested"
-PARTIAL_COVERAGE = "partial_coverage"
+# the finding's own case (defined in harness/control_outcome.py). The confirmation
+# gate counts only "control_held" as refuting (EFF-1), so either marker lands the
+# finding as inconclusive, never refuted; coverage reads them as a case left open.
+from harness.control_outcome import NAMED_PARAMETER_UNTESTED, PARTIAL_COVERAGE  # noqa: E402,F401
 
 _LOCATION_ALIASES = {"query": QUERY, "url": QUERY, "body": BODY, "json": BODY, "form": BODY,
                      "body_json": BODY, "body_form": BODY}

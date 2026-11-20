@@ -40,6 +40,7 @@ from urllib.parse import urlsplit, parse_qsl, urlencode
 import httpx
 
 from harness import global_throttle
+from harness.control_outcome import CONTROL_HELD
 from harness.models import Finding, HttpExchange, request_body_is_placeholder
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
@@ -179,9 +180,12 @@ class SequenceValidator(Validator):
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "mass_assignment", summary=why)
 
-    def _not_confirmed(self, why: str) -> ValidationResult:
+    def _not_confirmed(self, why: str, control_outcome: str = "") -> ValidationResult:
+        # EFF-1: control_outcome stays "" (unknown) unless the caller observed the
+        # defence hold against a reference read (see validate_from_read).
         return ValidationResult(self.name, "not_confirmed", "mass_assignment",
-                                confidence=0.0, confirmed=False, summary=why)
+                                confidence=0.0, confirmed=False, summary=why,
+                                control_outcome=control_outcome)
 
     async def _get_json(self, client, url, headers):
         await global_throttle.acquire()
@@ -460,10 +464,17 @@ class SequenceValidator(Validator):
                         f"read, and persisted across an independent re-read. Snapshot restored "
                         f"and verified.",
                 evidence=evidence).with_artifacts(baseline=snap_resp, attack=wrote)
+        # EFF-1: the control HELD only when the server accepted the write (2xx) and
+        # the independent re-read shows every injected field -- so the read would
+        # have revealed a flip, and it shows the field kept its unprivileged value.
+        # A refused write or a read that omits the field compared nothing.
+        held = (200 <= wrote.status_code < 300 and bool(stored)
+                and all(f in stored for f in cands))
         return self._not_confirmed(
             f"no injected authority field persisted after a {method} built from the read of "
             f"{path} (write HTTP {wrote.status_code}); snapshot restored and verified. "
-            f"{evidence}" + (f" {failure}" if failure else ""))
+            f"{evidence}" + (f" {failure}" if failure else ""),
+            control_outcome=CONTROL_HELD if held else "")
 
 
 def needs_read_body(exchange: HttpExchange) -> bool:

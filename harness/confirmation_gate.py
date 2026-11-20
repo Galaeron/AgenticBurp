@@ -663,9 +663,12 @@ def _controlled_negative_classes(validation_reports: list | None) -> set:
 
 def _controlled_negatives(validation_reports: list | None) -> dict:
     """Case-aware collector (FR-5/F09) of controlled NEGATIVEs: validators that
-    actually ran and returned `not_confirmed` (R08) -- as opposed to a leg that
-    never produced a verdict (skipped / error / disabled / absent), which is NOT
-    evidence of a false positive and must not be labelled as one.
+    actually ran, returned `not_confirmed` (R08) AND observed their control hold
+    (EFF-1: `control_outcome == "control_held"`) -- as opposed to a leg that
+    never produced a verdict (skipped / error / disabled / absent), or one that
+    returned `not_confirmed` with no held control (an empty outcome, a failed
+    control, a tool that did not run). Neither is evidence of a false positive,
+    so neither may be labelled as one: the finding stays UNVERIFIED.
 
     Returns {canonical_class: {(parameter_or_empty, principal_or_empty), ...}}.
     A negative whose `ValidationReport.parameter` is empty (the pre-FR-5
@@ -683,12 +686,12 @@ def _controlled_negatives(validation_reports: list | None) -> dict:
     so a negative recorded for one principal cannot be used to refute a
     finding discovered under a different, resolved principal."""
     from harness.categories import canonicalize
+    from harness.control_outcome import is_controlled_negative
     neg: dict = {}
     for vr in validation_reports or []:
-        status = (getattr(vr, "status", "") or "").lower()
-        confirmed = bool(getattr(vr, "confirmed", False))
-        outcome = (getattr(vr, "control_outcome", "") or "").lower()
-        if status == "not_confirmed" and not confirmed and outcome in ("", "control_held"):
+        if is_controlled_negative(getattr(vr, "status", ""),
+                                  bool(getattr(vr, "confirmed", False)),
+                                  getattr(vr, "control_outcome", "")):
             fc = getattr(vr, "finding_class", "") or ""
             fc_canon = canonicalize(fc) or fc.lower()
             param = getattr(vr, "parameter", "") or ""
@@ -745,7 +748,9 @@ def apply_confirmation_suppression(
     - REFUTED  (live-verified leg AND a real controlled negative for the SAME CASE
       in `validation_reports`): the leg actually ran against this finding's own
       parameter (or a class-level/parameter-less negative -- backward compat for
-      non-parameter-scoped checks) and said no -> likely false positive.
+      non-parameter-scoped checks), said no, AND reported its control held
+      (EFF-1: `control_outcome == "control_held"`) -> likely false positive.
+      A `not_confirmed` with an empty / failed / not-run control is UNVERIFIED.
       severity -> "low", confidence <= 0.35, verdict "unconfirmed_hypothesis",
       prefix "[Hypothesis]". FR-5 (F09): a controlled negative recorded against a
       DIFFERENT parameter of the same class does NOT refute this finding.

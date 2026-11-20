@@ -54,6 +54,7 @@ from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlsplit
 
 from harness.categories import canonicalize
+from harness.control_outcome import covers_case
 from harness.engagement import capture_identity_key, normalize_path
 from harness.orchestrator_helpers import _identity_signature, confirmation_cache_key
 from harness.volatile_params import stable_url
@@ -283,7 +284,7 @@ class ExecutionRegistry:
             return
         one = stored.result
         if (getattr(one, "status", None) == "not_confirmed" and not getattr(one, "confirmed", False)
-                and not getattr(one, "control_outcome", "")):
+                and covers_case(getattr(one, "control_outcome", ""))):
             self._shells[shell_key] = (route, stored)
 
     async def run(self, validator, finding, exchange, *, case_ref, call):
@@ -363,7 +364,7 @@ class ExecutionRegistry:
             return None
         full = stored.result
         if (getattr(full, "status", None) != "not_confirmed" or getattr(full, "confirmed", False)
-                or getattr(full, "control_outcome", "")):
+                or not covers_case(getattr(full, "control_outcome", ""))):
             return None
         covers = getattr(validator, "full_scan_covers", None)
         target = covers(finding, exchange) if callable(covers) else None

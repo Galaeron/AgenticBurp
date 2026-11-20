@@ -362,13 +362,12 @@ class ValidationReport(BaseModel):
     # discovered under a DIFFERENT principal of the same class/parameter.
     # Optional/default-empty for backward compatibility.
     principal_id: str = ""
-    # R2/RA-7: carried from ValidationResult.control_outcome. "inconclusive"
-    # marks a not_confirmed that is NOT a genuine executed negative control
-    # (e.g. cross-identity reached-but-unproven); the suppression gate must not
-    # treat it as a refutation. Empty = legacy validator (not_confirmed is a
-    # negative); "control_held" = genuine held control. "named_parameter_untested"
-    # / "partial_coverage" (validators/injection_targets.py) mark a parameter
-    # leg's negative that did not cover the finding's parameter or every input.
+    # R2/RA-7/EFF-1: carried from ValidationResult.control_outcome (values in
+    # harness/control_outcome.py). Only "control_held" = genuine held control,
+    # which the suppression gate may count as a refutation. Empty (the validator
+    # did not say), "control_failed", "not_run", "inconclusive" and the
+    # "named_parameter_untested" / "partial_coverage" markers
+    # (validators/injection_targets.py) all leave the finding unverified.
     control_outcome: str = ""
     # I04: manual-check guidance carried from ValidationResult (empty if none).
     manual_verification: str = ""
