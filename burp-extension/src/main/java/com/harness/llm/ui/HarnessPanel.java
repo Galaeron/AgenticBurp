@@ -341,9 +341,11 @@ public class HarnessPanel extends JPanel {
                 }
                 if (ar.findings == null || ar.findings.isEmpty()) continue;
                 for (Finding f : ar.findings) {
-                    sb.append(String.format("- **[%s] %s** (severity: %s, confidence: %.2f, confirmed: %s, basis: %s%s)%n",
-                            ar.agent, f.vulnerability_class, f.severity, f.confidence, f.confirmed, f.basis,
-                            f.owasp_category != null ? ", " + f.owasp_category : ""));
+                    // EFF-4: the evidence tier leads; the model score trails, labelled uncalibrated.
+                    sb.append(String.format("- **[%s] %s** -- %s (severity: %s, basis: %s%s; %s)%n",
+                            ar.agent, f.vulnerability_class, FindingPresentation.stateLabel(f), f.severity, f.basis,
+                            f.owasp_category != null ? ", " + f.owasp_category : "",
+                            FindingPresentation.modelScore(f.confidence)));
                     sb.append("  - Summary: ").append(f.summary).append('\n');
                     sb.append("  - Evidence: ").append(f.evidence).append('\n');
                     sb.append("  - Next step: ").append(f.suggested_test).append('\n');
@@ -408,16 +410,17 @@ public class HarnessPanel extends JPanel {
                 continue;
             }
             for (Finding f : ar.findings) {
-                sb.append(String.format("  - [%s] severity=%s confidence=%.2f basis=%s%s%n",
-                        f.vulnerability_class, f.severity, f.confidence, f.basis,
+                // EFF-4: the evidence tier leads; the model score trails, labelled uncalibrated.
+                sb.append(String.format("  - [%s] %s severity=%s basis=%s%s%n",
+                        f.vulnerability_class, FindingPresentation.stateLabel(f), f.severity, f.basis,
                         f.owasp_category != null ? " owasp=" + f.owasp_category : ""));
+                sb.append("    ").append(FindingPresentation.evidenceLine(f)).append('\n');
                 sb.append("    summary: ").append(f.summary).append('\n');
                 sb.append("    evidence: ").append(f.evidence).append('\n');
-                sb.append("    status: ").append(FindingPresentation.stateLabel(f)).append('\n');
-                sb.append("    ").append(FindingPresentation.evidenceLine(f)).append('\n');
                 sb.append("    next step: ").append(f.suggested_test).append('\n');
+                sb.append("    ").append(FindingPresentation.modelScore(f.confidence)).append('\n');
                 if (f.review_verdict != null) {
-                    sb.append(String.format("    reviewed: %s (was %.2f -> %.2f) -- %s%n",
+                    sb.append(String.format(java.util.Locale.ROOT, "    reviewed: %s (model score %.2f -> %.2f) -- %s%n",
                             f.review_verdict,
                             f.original_confidence != null ? f.original_confidence : f.confidence,
                             f.confidence, f.review_note));

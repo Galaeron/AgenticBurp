@@ -2,7 +2,7 @@
 Report Generator
 
 Turns confirmed and unconfirmed findings for a host into a submission
--ready Markdown report: title, severity, confidence/status, affected
+-ready Markdown report: title, status/evidence tier, severity, affected
 endpoint, evidence, reproduction steps, generic remediation guidance,
 and a clearly-separated "Potential Attack Chains" section for anything
 chaining.py produced.
@@ -222,14 +222,11 @@ def _from_store_dict(d: dict) -> ReportFinding:
     )
 
 
-def _confidence_label(confidence: float) -> str:
-    if confidence >= 0.85:
-        return "very likely"
-    if confidence >= 0.6:
-        return "likely"
-    if confidence >= 0.35:
-        return "possible"
-    return "speculative"
+def _model_score(confidence: float) -> str:
+    """EFF-4: numeric confidence as text. It is an uncalibrated model score (the
+    larger of the model's value and a fixed per-validator constant), so it is never
+    worded as a probability or a likelihood; the evidence tier is the signal."""
+    return f"{float(confidence):.2f} (uncalibrated, not a probability)"
 
 
 def _basis_note(basis: str) -> str:
@@ -805,13 +802,13 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
     verification = _VERIFICATION_BADGE.get(f.verification_state, "🧪 CANDIDATE")
     lines.append(f"### {f.vulnerability_class} -- {url}")
     lines.append("")
-    lines.append(f"**Status:** {status} &nbsp;|&nbsp; **Verification:** {verification} "
-                 f"&nbsp;|&nbsp; **Severity:** {_SEVERITY_BADGE.get(f.severity, f.severity)} "
-                 f"&nbsp;|&nbsp; **Confidence:** {f.confidence:.2f} ({_confidence_label(f.confidence)}) "
-                 f"&nbsp;|&nbsp; **Basis:** {f.basis}")
-    lines.append(f"**Evidence maturity:** {f.evidence_maturity} &nbsp;|&nbsp; "
-                 f"**Triage priority:** {f.triage_priority} &nbsp;|&nbsp; "
-                 f"**Impact severity:** {f.impact_severity}")
+    # EFF-4: the evidence tier leads; the model score trails and is never a probability.
+    lines.append(f"**Status:** {status} &nbsp;|&nbsp; **Evidence maturity:** {f.evidence_maturity} "
+                 f"&nbsp;|&nbsp; **Verification:** {verification} "
+                 f"&nbsp;|&nbsp; **Severity:** {_SEVERITY_BADGE.get(f.severity, f.severity)}")
+    lines.append(f"**Triage priority:** {f.triage_priority} &nbsp;|&nbsp; "
+                 f"**Impact severity:** {f.impact_severity} &nbsp;|&nbsp; **Basis:** {f.basis} "
+                 f"&nbsp;|&nbsp; **Model score:** {_model_score(f.confidence)}")
     if f.evidence_maturity == "unverified_no_leg":
         lines.append("_Unverified: no deterministic confirmation leg exists for this class. "
                      "Preserve the captured observation and verify manually; impact and model confidence do not prove it._")
