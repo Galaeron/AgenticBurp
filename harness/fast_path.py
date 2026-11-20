@@ -238,15 +238,20 @@ def _param_name_forms(name: str) -> tuple[frozenset[str], str]:
 class _ParamNameRule:
     """One query-parameter dispatch row: `search(name)` is True when the name
     carries one of the row's trigger tokens (see the block comment above)."""
-    __slots__ = ('names', 'exact')
+    __slots__ = ('names', 'exact', 'stems')
 
-    def __init__(self, tokens, compounds=(), exact=()):
+    def __init__(self, tokens, compounds=(), exact=(), stems=()):
         self.names = frozenset(w.lower() for w in (*tokens, *compounds))
         self.exact = frozenset(w.lower() for w in exact)
+        self.stems = tuple(w.lower() for w in stems)
 
     def search(self, name: str) -> bool:
         forms, whole = _param_name_forms(name)
-        return whole in self.exact or not self.names.isdisjoint(forms)
+        if whole in self.exact or not self.names.isdisjoint(forms):
+            return True
+        # `stems` are long, unambiguous words that stay a trigger inside a
+        # run-together lowercase name: `newpassword`, `passwordconfirm`.
+        return any(whole.startswith(w) or whole.endswith(w) for w in self.stems)
 
 
 # Resource nouns whose run-together `<noun>id` is an object reference
@@ -257,7 +262,7 @@ _ID_NOUNS = (
     'entity', 'record', 'doc', 'document', 'file', 'message', 'post', 'comment', 'tenant',
     'org', 'organization', 'group', 'team', 'project', 'device', 'address', 'card',
     'payment', 'member', 'employee', 'client', 'patient', 'vehicle', 'thread', 'topic',
-    'article', 'row',
+    'article', 'row', 'session',
 )
 
 _QUERY_PARAM_PATTERNS: list[tuple[_ParamNameRule, list[str]]] = [
@@ -267,7 +272,7 @@ _QUERY_PARAM_PATTERNS: list[tuple[_ParamNameRule, list[str]]] = [
     (_ParamNameRule(
         tokens=('id', 'ids'),
         compounds=('uuid', 'uid', 'pid', 'cid', 'oid', 'nid', 'tid', 'rid', 'mid', 'gid',
-                   'eid', 'fid', *(f'{n}id' for n in _ID_NOUNS))),
+                   'eid', 'fid', 'sid', 'vid', 'aid', *(f'{n}id' for n in _ID_NOUNS))),
      ['idor', 'sqli']),
 
     # Search/query parameters (injection risk)
@@ -275,7 +280,8 @@ _QUERY_PARAM_PATTERNS: list[tuple[_ParamNameRule, list[str]]] = [
         tokens=('q', 'query', 'queries', 'search', 'keyword', 'keywords', 'term', 'terms',
                 'filter', 'filters'),
         compounds=('searchterm', 'searchquery', 'searchtext', 'searchstring', 'searchkey',
-                   'searchkeyword', 'querystring')),
+                   'searchkeyword', 'querystring'),
+        stems=('search',)),
      ['sqli', 'xss']),
 
     # File/path/redirect-target parameters (path traversal, SSRF, open
@@ -299,8 +305,9 @@ _QUERY_PARAM_PATTERNS: list[tuple[_ParamNameRule, list[str]]] = [
                 'redir', 'forward'),
         compounds=('returnurl', 'returnto', 'returnpath', 'redirecturl', 'redirecturi',
                    'redirectto', 'redirectpath', 'nexturl', 'targeturl', 'desturl', 'fileurl',
-                   'imageurl', 'callbackurl', 'backurl', 'filename', 'filepath', 'pathname'),
-        exact=('to', 'out')),
+                   'imageurl', 'callbackurl', 'backurl', 'filename', 'filepath', 'pathname',
+                   'avatarurl', 'webhookurl', 'photourl', 'avatarpath'),
+        exact=('to', 'out'), stems=('redirect',)),
      ['ssrf', 'misconfig', 'open_redirect', 'header_injection']),
 
     # Authentication tokens (sensitive, but also injection vectors)
@@ -308,7 +315,9 @@ _QUERY_PARAM_PATTERNS: list[tuple[_ParamNameRule, list[str]]] = [
         tokens=('token', 'tokens', 'key', 'keys', 'secret', 'password', 'credential',
                 'credentials'),
         compounds=('apikey', 'apitoken', 'authtoken', 'accesstoken', 'refreshtoken',
-                   'sessiontoken', 'csrftoken', 'clientsecret', 'apisecret', 'secretkey')),
+                   'sessiontoken', 'csrftoken', 'clientsecret', 'apisecret', 'secretkey',
+                   'accesskey', 'privatekey', 'secretkey'),
+        stems=('password', 'secret', 'token', 'credential')),
      ['auth', 'misconfig']),
 
     # Sort/pagination parameters (business logic)
