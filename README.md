@@ -12,8 +12,9 @@ A Burp Suite copilot that uses locally-hosted LLMs to analyze captured HTTP traf
 > **Out of the box it is passive and deliberately quiet:** active testing,
 > autonomous discovery and the cloud seams are OFF and no scope is set, so it
 > only reviews the exact traffic you send it with a small local model. If it
-> "finds almost nothing," that is why — check `GET /health` first (it reports
-> whether Ollama is reachable and the model is pulled), then enable active
+> "finds almost nothing," that is why — check `GET /health/details` first (with
+> the pairing token; it reports whether Ollama is reachable and the model is
+> pulled), then enable active
 > testing on a scoped host per the user manual.
 
 ## How It Works

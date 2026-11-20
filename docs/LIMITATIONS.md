@@ -104,16 +104,16 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
 
 ## Model backend & data
 
-- **[fixed] Silent model failure.** `/health` now probes Ollama and reports
-  `degraded` with specifics; `/analyze` sets `degraded`, lists `agent_errors`,
+- **[fixed] Silent model failure.** `/health/details` (authenticated) probes
+  Ollama and reports `degraded` with specifics; `/analyze` sets `degraded`, lists `agent_errors`,
   and warns in the summary when every agent failed. (Previously `/health` said
   "ok" with no model and failures hid in per-agent `raw_error`.)
 - **[fixed] Ten agents silently pinned the default model.** Redundant per-agent
   `model: qwen3:8b` pins removed; startup now warns on a shadowing override and
-  `/health` exposes `agent_models`.
+  `/health/details` exposes `agent_models`.
 - **[open] Model-outage circuit breaker lingers ~60 s.** After 3 failures the
   shared breaker opens for 60 s before a half-open retry, so a model you just
-  restarted still fails until the window elapses. `/health` now lets you confirm
+  restarted still fails until the window elapses. `/health/details` lets you confirm
   recovery; tuning the window is a follow-up.
 - **[mitigated] Prompts larger than a small `num_ctx`.** Ollama truncates an
   oversized prompt from the start (where the agent's instructions are) with no
@@ -186,8 +186,10 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
   proof record is an integrity gap), but the pattern is widespread.
 - **[open] Safety routing partly policed by source-grep tests** rather than the
   design forcing all traffic through the gate.
-- **[by-design, minor] `/health` and `/telemetry` need no auth** (DNS-rebinding
-  protection applies; the other ~47 routes require the token).
+- **[by-design, minor] `/health` needs no auth** (DNS-rebinding protection
+  applies). It is liveness only (ARC-8): no outbound request and no model or
+  agent names. Readiness, the agent/model map and the model egress state are at
+  the authenticated `/health/details`; the other routes require the token.
 
 ## What is solid
 

@@ -93,11 +93,24 @@ ollama:
   #   reasoning included. A reply that reaches it is discarded and counted as
   #   output_capped, so a model stuck repeating itself fails fast instead of
   #   running to timeout_seconds.
+  #
+  # SEC-1: a model named *-cloud or *:cloud runs on Ollama's cloud, so exchange
+  # content in its prompts leaves this machine. With this false, such a model in
+  # any slot (coordinator.model, coordinator.cloud_model while cloud_primary or
+  # cloud_reasoning is on, agent_defaults.model, agents.<name>.model,
+  # critique.model, surface_prioritization.model, writeups.model) refuses the run
+  # before its first model call, and every call to one is refused unsent. Set it
+  # true only in config.local.yaml, for an engagement that permits the egress;
+  # the run manifest and GET /health/details record it under model_egress.
+  allow_cloud_models: false
 
 # Context-window budget for agent and critique prompts (harness/prompt_budget.py).
-# The context is `ollama.num_ctx` when set, else `model_context_tokens` below;
-# with neither (the default, and right for cloud models) prompts go out
-# unchanged. With a context, an oversized prompt is fitted to it minus
+# TOK-4: the context is the window the model's server reports before each
+# prompt (llama-server GET /props n_ctx, Ollama GET /api/ps for a loaded model,
+# POST /api/show for a cloud model), capped by `ollama.num_ctx` when set, else
+# by `model_context_tokens` below. With none of those known, prompts are fitted
+# to `unknown_context_tokens` (capped by the model's trained maximum), never
+# sent unfitted. An oversized prompt is fitted to the context minus
 # `answer_tokens`: methodology notes, inapplicable shared rules, specialty
 # sections the exchange does not match, prior findings, then body text and
 # specialty text are cut in that order, each cut marked in the prompt and listed
@@ -106,6 +119,8 @@ ollama:
 prompt_budget:
   model_context_tokens: null
   answer_tokens: 1024
+  # Ollama's default context on 0.40.13 (a model not loaded yet loads at it).
+  unknown_context_tokens: 4096
 
 # How many specialist agents are allowed to run concurrently against
 # Ollama through one AgentManager. The application orchestrator shares that
@@ -699,7 +714,7 @@ agent_defaults:
 # that agent behind on the old one. These agents therefore set only `enabled`
 # and inherit the default model; the harness logs each agent's resolved model
 # at startup, warns when an override shadows the default, and exposes the full
-# agent->model map at GET /health so you can verify what actually runs. Add a
+# agent->model map at GET /health/details so you can verify what actually runs. Add a
 # `model:` here ONLY when it must genuinely differ from the default.
 agents:
   sqli:
@@ -846,7 +861,7 @@ server:
   # /telemetry, /test-plans/{plan_id}, GET /settings) require the same
   # effective bearer token already required on mutations (server.auth_token/
   # HARNESS_BEARER_TOKEN if configured, else the ephemeral RB-1 token).
-  # /health stays open either way, for pairing/liveness.
+  # /health (liveness only) stays open either way; /health/details needs the token.
   #
   # SAFE DEFAULT: false. Shipping true here would break the Burp extension's
   # existing unauthenticated reads until its Java side is updated to send the

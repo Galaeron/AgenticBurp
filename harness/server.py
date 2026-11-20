@@ -22,6 +22,7 @@ from harness.models import (AnalysisRequest, AnalysisResponse, ValidationSubmiss
 import harness.identity as identity_mod
 from harness.orchestrator import Orchestrator
 from harness.orchestrator_confirm import ProbeScopeRefused
+from harness.ollama_client import OllamaCloudModelRefusedError
 
 logging.basicConfig(level=logging.INFO)
 security.install_privacy_log_filters()
@@ -440,16 +441,52 @@ async def run_provenance(authorization: str | None = Header(default=None)):
 
 @app.get("/health")
 async def health():
-    """Liveness AND readiness. `status` is "ok" only when the LLM backend is
-    actually usable: previously this returned "ok" without ever contacting
-    Ollama, so a server with no `ollama serve` / no pulled model still looked
-    healthy and every analysis silently fell back to deterministic-only output
-    ("it ran and found almost nothing"). Now it probes Ollama and reports
-    "degraded" when it is unreachable or a configured LOCAL model is not pulled,
-    with `ollama` carrying the detail. Cloud model tags (…-cloud) are not pulled
-    locally and are excluded from the missing-model check."""
-    from harness import coordinator
-    probe = await orchestrator.ollama.health_check()
+    """ARC-8: liveness only. Unauthenticated, so it makes no outbound request
+    (no model-server probe) and names no model or agent: {"status": "ok"}
+    whenever this process serves requests. Readiness (model server reachable,
+    configured local models pulled), the agent and model names and the model
+    egress state are at the authenticated GET /health/details."""
+    return {"status": "ok"}
+
+
+# ARC-8: how long GET /health/details reuses its model-server probe, so a
+# client polling it does not send a request to the model server per call.
+_HEALTH_PROBE_TTL_SECONDS = 10.0
+_health_probe_cache: dict = {}
+
+
+async def _cached_backend_probe() -> tuple[dict, float]:
+    """(orchestrator.ollama.health_check() result, its age in seconds), probed
+    again when older than _HEALTH_PROBE_TTL_SECONDS or the client changed."""
+    import time
+    client = orchestrator.ollama
+    cached = _health_probe_cache.get("probe")
+    now = time.monotonic()
+    if cached and cached[2] is client and now - cached[1] < _HEALTH_PROBE_TTL_SECONDS:
+        return cached[0], round(now - cached[1], 3)
+    probe = await client.health_check()
+    # Only a reachable probe is reused: an operator who just started the model
+    # server sees it on the next call, not after the TTL.
+    if probe.get("reachable"):
+        _health_probe_cache["probe"] = (probe, time.monotonic(), client)
+    else:
+        _health_probe_cache.pop("probe", None)
+    return probe, 0.0
+
+
+@app.get("/health/details")
+async def health_details(authorization: str | None = Header(default=None)):
+    """Readiness, authenticated (ARC-8). `status` is "ok" only when the LLM
+    backend is usable: reachable, with every configured LOCAL model pulled
+    (cloud model tags are not pulled locally and are excluded); "degraded"
+    otherwise, with `ollama` carrying the detail. The backend probe is cached
+    for _HEALTH_PROBE_TTL_SECONDS (`probe_age_seconds`). `model_egress` is
+    SEC-1's record: which slots hold cloud models and whether
+    ollama.allow_cloud_models opted in."""
+    _require_read_auth(authorization)
+    from harness import coordinator, model_egress
+    from harness.ollama_client import is_cloud_model
+    probe, probe_age = await _cached_backend_probe()
     present = set(probe.get("models") or [])
 
     def _is_present(model: str) -> bool:
@@ -463,7 +500,7 @@ async def health():
     crit = (config.get("critique") or {}).get("model")
     if crit:
         configured.add(crit)
-    local_models = sorted(m for m in configured if m and not m.endswith("-cloud"))
+    local_models = sorted(m for m in configured if m and not is_cloud_model(m))
     missing = [m for m in local_models if not _is_present(m)]
 
     reachable = bool(probe.get("reachable"))
@@ -492,7 +529,10 @@ async def health():
         "agent_models": {name: a.model
                          for name, a in sorted(orchestrator.agent_manager.agents.items())},
         "ollama": ollama_detail,
+        "probe_age_seconds": probe_age,
         "coordinator_fail_opens": coordinator.fail_open_stats(),
+        "model_egress": model_egress.egress_state(
+            config, model_egress.agent_models_of(orchestrator.agent_manager)),
     }
 
 
@@ -652,6 +692,13 @@ async def validation_result(submission: ValidationSubmission, authorization: str
     return response
 
 
+def _cloud_run_refused(e: OllamaCloudModelRefusedError) -> HTTPException:
+    """SEC-1: a run refused for a cloud model without ollama.allow_cloud_models
+    is a config conflict the operator fixes, not a server fault: 409 carrying
+    the refusal reason (config slot and model names, never exchange content)."""
+    return HTTPException(status_code=409, detail=str(e))
+
+
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze(req: AnalysisRequest, authorization: str | None = Header(default=None)):
     _require_auth(authorization)
@@ -668,6 +715,8 @@ async def analyze(req: AnalysisRequest, authorization: str | None = Header(defau
             partition["observation_attribution"] = attribution
         return await orchestrator.analyze(req.exchange, req.force_agents, req.attempt_rediscovery,
                                           **partition)
+    except OllamaCloudModelRefusedError as e:
+        raise _cloud_run_refused(e)
     except Exception as e:
         log.error("Unhandled error during analysis: %s", security.safe_error_summary(e))
         return JSONResponse(status_code=500, content={"error": security.safe_error_summary(e)})
@@ -1920,6 +1969,12 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     a job_id to poll. The job is cancellable. This is the single API entry to
     investigate_engagement (R18)."""
     _require_auth(authorization)
+    try:  # SEC-1: refuse before a job exists, so the client sees why (409)
+        from harness import model_egress
+        model_egress.refuse_cloud_models(
+            orchestrator.config, model_egress.agent_models_of(orchestrator.agent_manager))
+    except OllamaCloudModelRefusedError as e:
+        raise _cloud_run_refused(e)
     _require_target_fetch(req.base_url, bulk=True)
     if not req.base_url:
         raise HTTPException(status_code=400, detail="base_url is required")

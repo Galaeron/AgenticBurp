@@ -143,6 +143,7 @@ public class HarnessClient {
     }
 
     private volatile String lastHealthCheckError = null;
+    private volatile String lastReadinessNote = null;
 
     private static HarnessException failed(String kind, String message) {
         return new HarnessException(kind, message);
@@ -261,8 +262,19 @@ public class HarnessClient {
         }
     }
 
-    /** Liveness alone does not prove permission to analyze or read results. */
+    /** ARC-8: what the authenticated GET /health/details said after the most
+     * recent successful connectionCheck(): null when the model backend is
+     * ready and nothing leaves the host, else a short note (backend degraded,
+     * cloud model egress on or refused, readiness unavailable). */
+    public String getLastReadinessNote() {
+        return lastReadinessNote;
+    }
+
+    /** Liveness alone does not prove permission to analyze or read results.
+     * GET /health is liveness only (ARC-8); once pairing is authenticated,
+     * readiness is read from GET /health/details into getLastReadinessNote(). */
     public boolean connectionCheck() {
+        lastReadinessNote = null;
         if (!healthCheck()) return false;
         try {
             com.google.gson.JsonObject pairing = getJson("/pairing/check", Duration.ofSeconds(5));
@@ -271,6 +283,7 @@ public class HarnessClient {
                 return false;
             }
             lastHealthCheckError = null;
+            lastReadinessNote = readinessNote();
             return true;
         } catch (HarnessException | IllegalArgumentException e) {
             lastHealthCheckError = e.getMessage();
@@ -281,19 +294,58 @@ public class HarnessClient {
         }
     }
 
+    /** Readiness from GET /health/details as a UI note (null when ready). It
+     * never fails the connection check: liveness and pairing already passed.
+     * Server-supplied names are not echoed, only counts and fixed wording. */
+    private String readinessNote() {
+        try {
+            com.google.gson.JsonObject details = getJson("/health/details", Duration.ofSeconds(5));
+            List<String> notes = new java.util.ArrayList<>();
+            if (!stringField(details, "status") || !"ok".equals(details.get("status").getAsString())) {
+                com.google.gson.JsonObject backend = details.has("ollama") && details.get("ollama").isJsonObject()
+                        ? details.getAsJsonObject("ollama") : new com.google.gson.JsonObject();
+                int missing = backend.has("missing_models") && backend.get("missing_models").isJsonArray()
+                        ? backend.getAsJsonArray("missing_models").size() : 0;
+                notes.add(!trueField(backend, "reachable") ? "model backend unreachable"
+                        : missing > 0 ? missing + " configured model(s) not pulled"
+                        : "model backend degraded");
+            }
+            if (details.has("model_egress") && details.get("model_egress").isJsonObject()) {
+                com.google.gson.JsonObject egress = details.getAsJsonObject("model_egress");
+                if (trueField(egress, "egress")) {
+                    notes.add("cloud model egress enabled (ollama.allow_cloud_models)");
+                }
+                if (trueField(egress, "refused")) {
+                    notes.add("a configured cloud model will be refused (ollama.allow_cloud_models is off)");
+                }
+            }
+            return notes.isEmpty() ? null : "Not ready: " + String.join("; ", notes) + " -- see GET /health/details";
+        } catch (HarnessException e) {
+            return "Readiness unavailable: " + e.getMessage();
+        } catch (RuntimeException malformed) {
+            return "Readiness unavailable: the /health/details response was malformed.";
+        }
+    }
+
+    private static boolean trueField(com.google.gson.JsonObject object, String field) {
+        return object.has(field) && object.get(field).isJsonPrimitive()
+                && object.get(field).getAsJsonPrimitive().isBoolean() && object.get(field).getAsBoolean();
+    }
+
     private static void requireAuthenticatedResponse(HttpResponse<String> response) throws HarnessException {
         if (response.statusCode() == 401) {
             throw httpFailure(401);
         }
     }
 
-    /** GET /health returns {"agents": [...]}. Returns the live enabled agent
-     * names, or an empty list on any error -- so the "choose agents" menu can
-     * offer exactly what this harness actually runs instead of a hardcoded
-     * list that drifts out of sync. */
+    /** GET /health/details (authenticated, ARC-8) returns {"agents": [...]}.
+     * Returns the live enabled agent names, or an empty list on any error
+     * (including before pairing) -- so the "choose agents" menu can offer
+     * exactly what this harness actually runs instead of a hardcoded list
+     * that drifts out of sync. */
     public List<String> listAgentNames() {
         try {
-            HttpRequest req = newRequestBuilder("/health", Duration.ofSeconds(5)).GET().build();
+            HttpRequest req = newRequestBuilder("/health/details", Duration.ofSeconds(5)).GET().build();
             HttpResponse<String> resp = sendBounded(req);
             if (resp.statusCode() != 200) return List.of();
             com.google.gson.JsonObject obj = responseObject(resp.body());

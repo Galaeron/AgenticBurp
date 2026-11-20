@@ -34,7 +34,12 @@ public class LlmHarnessExtension implements BurpExtension {
             String token = panel.consumeBearerTokenInput();
             if (!token.isBlank()) client.setBearerToken(token);
             return client.connectionCheck();
-        }, client::getLastHealthCheckError, analysisTracker);
+        }, () -> {
+            // ARC-8: the failure reason, or after a successful check the
+            // readiness note from GET /health/details (null when ready).
+            String error = client.getLastHealthCheckError();
+            return error != null ? error : client.getLastReadinessNote();
+        }, analysisTracker);
         panel.setTokenClearHandler(() -> client.setBearerToken(null));
 
         ValidationExecutor validationExecutor = new ValidationExecutor(api, client);

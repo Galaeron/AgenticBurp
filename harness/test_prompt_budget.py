@@ -111,10 +111,16 @@ def _sent(system: str, user: str) -> int:
 
 
 class _RecordingOllama:
-    """Silent model that records every prompt it is sent, with its model_stage."""
+    """Silent model that records every prompt it is sent, with its model_stage.
+    `window` is the context window its server reports (TOK-4); None = unknown."""
 
-    def __init__(self):
+    def __init__(self, window=None):
         self.calls: list[dict] = []
+        self.window = window
+
+    async def discovered_context_window(self, model):
+        return {"window": self.window, "source": "props" if self.window else None,
+                "model_max": None}
 
     def _record(self, kwargs):
         self.calls.append({"stage": _MODEL_STAGE.get(), "system": kwargs["system_prompt"],
@@ -301,8 +307,8 @@ class FitFaultTest(unittest.TestCase):
 
 
 class CritiquePromptFitTest(unittest.TestCase):
-    def _critique(self, config):
-        stub = _RecordingOllama()
+    def _critique(self, config, window=None):
+        stub = _RecordingOllama(window)
         pipeline = AnalysisPipeline(agent_manager=None, effort_budget=None, store=store,
                                     config=config, ollama_client=stub)
         findings = [Finding(vulnerability_class="info_disclosure", confidence=0.9,
@@ -328,8 +334,18 @@ class CritiquePromptFitTest(unittest.TestCase):
         self.assertEqual(outcome.prompt_fit["elided"][0]["part"], "finding_evidence")
         self.assertEqual(outcome.prompt_fit["elided"][0]["findings"], 12)
 
-    def test_without_budget_critique_listing_is_whole(self):
+    def test_unknown_window_still_fits_the_listing(self):
+        # TOK-4: no window configured or reported: fitted to the fallback,
+        # never sent whole.
         call, outcome = self._critique({"critique": {"enabled": True}})
+        self.assertLessEqual(_sent(call["system"], call["user"]), _budget(4096).prompt_tokens)
+        self.assertIn(_MARK, call["user"])
+        self.assertEqual(outcome.prompt_fit["source"],
+                         "fallback:prompt_budget.unknown_context_tokens")
+
+    def test_reported_large_window_leaves_the_listing_whole(self):
+        # NEGATIVE CONTROL: a server reporting a large window gets the whole listing.
+        call, outcome = self._critique({"critique": {"enabled": True}}, window=131072)
         self.assertNotIn(_MARK, call["user"])
         self.assertIn("finding 11: " + _EVIDENCE[:2511], call["user"])
         self.assertIsNone(outcome.prompt_fit)
@@ -363,11 +379,11 @@ class CaptureReviewElisionTest(unittest.TestCase):
         self._dir = tempfile.mkdtemp(prefix="prompt_budget_review_", dir=_TMP)
         cache.init_cache(db_path=os.path.join(self._dir, "cache.db"))
 
-    def _review(self, num_ctx, max_body_chars=None):
+    def _review(self, num_ctx, max_body_chars=None, window=None):
         from harness.orchestrator import Orchestrator, review_captured_exchanges
         coordinator.reset_fail_open_stats()
         orch = Orchestrator(_review_config(num_ctx, max_body_chars))
-        stub = _RecordingOllama()
+        stub = _RecordingOllama(window)
         orch.ollama = stub
         for agent in orch.agent_manager.agents.values():
             agent.ollama = stub
@@ -408,7 +424,9 @@ class CaptureReviewElisionTest(unittest.TestCase):
     def test_large_capture_is_fitted_and_reported_elided_at_4096(self):
         orch, stats, agent_calls = self._review(4096)
         budget = _budget(4096)
-        self.assertTrue(all(a.prompt_budget == budget for a in orch.agent_manager.agents.values()))
+        self.assertTrue(all(isinstance(a.prompt_budget, prompt_budget.DiscoveredBudget)
+                            and a.prompt_budget.configured == budget
+                            for a in orch.agent_manager.agents.values()))
         self._check_elided(stats, agent_calls, budget, small_whole=False)
         self.assertTrue(any(_MARK in c["user"] for c in agent_calls))
 
@@ -426,9 +444,16 @@ class CaptureReviewElisionTest(unittest.TestCase):
             self._check_elided(stats, agent_calls, _budget(4096), small_whole=False)
         self.assertEqual(stats["elided"], [])
 
-    def test_control_no_budget_reports_nothing_and_sends_whole_prompts(self):
+    def test_unknown_window_falls_back_and_fits(self):
+        # TOK-4: no num_ctx and no reported window: fitted to the 4096 fallback.
         orch, stats, agent_calls = self._review(None)
-        self.assertTrue(all(a.prompt_budget is None for a in orch.agent_manager.agents.values()))
+        self.assertTrue(all(a.prompt_budget.configured is None
+                            for a in orch.agent_manager.agents.values()))
+        self._check_elided(stats, agent_calls, _budget(4096), small_whole=False)
+
+    def test_control_large_reported_window_sends_whole_prompts(self):
+        # NEGATIVE CONTROL: a server reporting a large window gets whole prompts.
+        _, stats, agent_calls = self._review(None, window=131072)
         self.assertEqual(stats["reviewed"], 2)
         self.assertEqual(stats["elided"], [])
         self.assertFalse(any(_MARK in c["system"] + c["user"] for c in agent_calls))

@@ -80,10 +80,15 @@ public class HarnessPanel extends JPanel {
                 statusLabel.setForeground(Color.RED);
                 return;
             }
-            statusLabel.setText(ok ? "Authenticated" : "Connection failed");
-            statusLabel.setForeground(ok ? new Color(0, 128, 0) : Color.RED);
+            // ARC-8: on success the supplier carries the readiness note from
+            // GET /health/details (null when ready); orange when it says why
+            // the paired harness is not ready, so "Authenticated" is not read
+            // as "the model backend works".
             String reason = lastConnectionError.get();
-            statusLabel.setToolTipText(ok || reason == null ? null : reason);
+            boolean notReady = ok && reason != null;
+            statusLabel.setText(!ok ? "Connection failed" : notReady ? "Authenticated (not ready)" : "Authenticated");
+            statusLabel.setForeground(!ok ? Color.RED : notReady ? new Color(204, 102, 0) : new Color(0, 128, 0));
+            statusLabel.setToolTipText(reason);
         });
         topBar.add(testBtn);
         topBar.add(statusLabel);
