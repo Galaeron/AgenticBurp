@@ -20,20 +20,39 @@ HEAD cannot silently reuse a previous run's evidence.
 
 ## Dependencies
 
-CI installs `harness/requirements.lock` on Windows/Python 3.14. For a smaller
-local environment, install the core/dev extras and Flask for loopback fixtures:
+CI installs the lock on Windows/Python 3.14. Reproduce that environment with:
+
+```sh
+python -m pip install -r harness/requirements.lock
+python -m pip install -e . --no-deps
+python -m playwright install chromium   # real-browser tests
+python -m harness.lock_preflight        # warns when installed versions differ from the lock
+```
+
+The server runs the same lock check at startup (warning log) and serves it in the
+authenticated `GET /health/details` as `dependency_lock`. It only warns: a package that
+is not installed is reported as missing, an installed package at another version as a
+mismatch.
+
+For a smaller local environment the `dev` extra declares everything the suite imports
+beyond the core dependencies (pytest, Flask, cryptography, brotli, mitmproxy, Playwright):
 
 ```sh
 python -m venv .venv
 # Activate the environment, then:
-python -m pip install -e ".[dev]" Flask==3.1.3
+python -m pip install -e ".[dev]"
+python -m playwright install chromium
 ```
 
-Full discovery also imports the optional proxy tests, which require
-`mitmproxy==12.3.1`. Browser fixture checks require Playwright and Chromium; CI's
-full job installs `playwright==1.63.0` and its Chromium. `test_browser_experiments`
-fails without them, and the guarded browser tests skip. Missing dependencies must be reported as errors/skips;
-never stub them merely to turn the suite green.
+`test_dev_extra_and_testing_doc` scans the test files' imports and fails when a third-party module
+is not provided by the core dependencies or the `dev` extra, and when an exact pin in
+`pyproject.toml` differs from the lock. That is a static check: a clean-virtualenv install
+of the extra followed by `harness.suite full` has not been run.
+
+Full discovery imports the proxy tests, which need `mitmproxy==12.3.1`, and
+`test_browser_experiments` fails without Playwright and Chromium (the guarded browser
+tests skip). Missing dependencies must be reported as errors/skips; never stub them
+merely to turn the suite green.
 
 Python 3.12 caveat: mitmproxy 12.2.3 declares typing-extensions <=4.14, while the
 current core requires newer versions. The 2026-09-19 local audit restored
@@ -70,11 +89,23 @@ path enforces that contract.
 
 ## CI and live evidence
 
-Fast CI runs smoke, native and evaluation tiers plus the requirement-evidence gate.
-Nightly/manual CI runs full unittest discovery, native and evaluation tiers. The
-CPU precision job uses a stubbed model. The scored job uses `--from-cache` and
-therefore reports historical re-scoring, not a fresh run. The Java job is a
-separate manual boundary. A skipped/unavailable job is not a pass.
+Read from `.github/workflows/ci.yml`. Smoke is a local fast subset; CI does not run it.
+No job below has been run by the change that wrote this section: a workflow is only
+verified by its own runs.
+
+| Job | Runs on | What it runs | What a pass establishes |
+|---|---|---|---|
+| `full` | every push and pull request, the nightly schedule (07:00 UTC) and manual dispatch; windows-latest, Python 3.14 | `pip install -r harness/requirements.lock`, Playwright 1.63.0 and Chromium; full unittest discovery (`python -m unittest discover -t . -s harness -p "test_*.py"`), `harness.suite native`, the requirement-coverage gate (`harness.coverage_manifest --check`), then `harness.suite evaluation` | Every commit is judged by the whole suite on a clean checkout, not a subset |
+| `burp-extension-build` | every push and pull request; ubuntu-latest, JDK 17 | `./gradlew test shadowJar` from `burp-extension/` (Gradle 8.7 wrapper, distribution checksum pinned, Java 17 toolchain), after validating the wrapper jar | The Java sources compile and their unit tests pass; loading the jar into Burp is not exercised |
+| `dependency-audit` | every trigger; ubuntu-latest | CycloneDX SBOM, base-image digest report, ffuf wordlist hashes, and `pip-audit` on the lock | Advisory only: the `pip-audit` step has `continue-on-error`, so a published CVE never fails a pull request |
+| `dependency-audit-blocking` | pushes to `main` and `v*` tags only | `python -m harness.audit_allowlist check`, then `pip-audit` on the lock ignoring only the ids in `.github/pip-audit-allowlist.toml`; on a tag it also emits the SBOM artifact | Fails on any known vulnerability that is not allowlisted, and on an allowlist entry that is expired or lacks an owner, reason or expiry date |
+| `nightly-precision` | schedule and manual dispatch only; windows-latest | Score-math self-test and a CPU-only, model-stubbed corpus run that writes `SCORECARD.md` | The scoring plumbing is wired end to end; it says nothing about model accuracy |
+| `scored` | schedule, manual dispatch, or a pull request labelled `run-scored`; needs a `[self-hosted, gpu]` runner | `testing/score.py --from-cache` with recall >= 0.80 and precision >= 0.50 | A re-score of a cached fixture (historical), not a fresh run. Without the runner it does not run |
+| `scored-status` | always | Reads the `scored` result | One of `historical`, `failed` or `not_run`; a skipped or cancelled `scored` is `not_run` and never reads as a pass |
+
+A skipped or unavailable job is not a pass. The allowlist file has one `[[ignore]]` table
+per accepted vulnerability, each with `id`, `owner`, `reason` and an `expires` date;
+`python -m harness.audit_allowlist check` validates it locally.
 
 For real-model/target evaluation, record the checkout and dirty state, config,
 corpus, fresh cache, model, run ID, completion/health and supporting artifacts.
