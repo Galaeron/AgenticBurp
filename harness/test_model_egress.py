@@ -210,6 +210,73 @@ class RunStartRefusalTests(_FreshBreaker, unittest.TestCase):
         build.assert_not_called()
 
 
+class ServerRefusalTests(_FreshBreaker, unittest.TestCase):
+    """SEC-1 at the API: the default config with a cloud model in a slot gets
+    409 with the refusal reason from /analyze and /engagement/{host}/investigate,
+    never a generic 500, and no request reaches the model server."""
+
+    def setUp(self):
+        super().setUp()
+        import importlib
+        from fastapi.testclient import TestClient
+        from harness import store
+        import harness.server as server_module
+        tmp = tempfile.mkdtemp(prefix="model_egress_server_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.addCleanup(setattr, store, "_DB_PATH", store._DB_PATH)
+        store._DB_PATH = Path(tmp) / "state.db"
+        importlib.reload(server_module)
+        self.server = server_module
+        server_module.config["runs"] = {"output_dir": tmp, "cache_namespace": "test-isolated"}
+        server_module.orchestrator.allowed_hosts = ["shop.test"]
+        self.fake = FakeOllama(prompt_eval_count=10)
+        _install(self, self.fake)
+        self.client = TestClient(server_module.app, base_url="http://localhost",
+                                 headers={"Authorization": f"Bearer {server_module._mutation_token()}"})
+        self.assertFalse(server_module.orchestrator.config["ollama"].get("allow_cloud_models"),
+                         "the shipped default refuses cloud models")
+
+    def _cloud_slot(self):
+        return patch.dict(self.server.orchestrator.config["agent_defaults"], {"model": CLOUD})
+
+    def _assert_refused(self, resp):
+        self.assertEqual(resp.status_code, 409, resp.text)
+        detail = resp.json()["detail"]
+        self.assertIn("agent_defaults.model", detail)
+        self.assertIn(CLOUD, detail)
+        self.assertEqual(self.fake.paths, [], "no request reaches the model server")
+
+    def test_analyze_cloud_slot_is_409_with_the_reason(self):
+        # Negative control: before this mapping the route returned 500 with
+        # only the exception type name.
+        orch = self.server.orchestrator
+        inner = AsyncMock(side_effect=AssertionError("the analysis must not start"))
+        exchange = HttpExchange(url="http://shop.test/api/items?id=1", method="GET",
+                                response_status=200, response_body='{"id": 1}')
+        with self._cloud_slot(), patch.object(orch, "_analyze_inner", inner):
+            resp = self.client.post("/analyze", json={"exchange": exchange.model_dump()})
+        self._assert_refused(resp)
+        inner.assert_not_called()
+
+    def test_investigate_cloud_slot_is_409_before_a_job_exists(self):
+        orch = self.server.orchestrator
+        run = AsyncMock(return_value={"summary": {}})
+        body = {"base_url": "http://shop.test:5002", "roles": []}
+        with self._cloud_slot(), patch.object(orch, "investigate_engagement", run):
+            resp = self.client.post("/engagement/shop.test/investigate", json=body)
+        self._assert_refused(resp)
+        run.assert_not_called()
+        self.assertEqual(self.client.get("/engagement/shop.test/investigate").json().get("jobs", []), [])
+
+    def test_control_local_slots_are_admitted(self):
+        # Control: without a cloud slot the same request is admitted (200).
+        run = AsyncMock(return_value={"summary": {}})
+        with patch.object(self.server.orchestrator, "investigate_engagement", run):
+            resp = self.client.post("/engagement/shop.test/investigate",
+                                    json={"base_url": "http://shop.test:5002", "roles": []})
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+
 class ManifestTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="model_egress_manifest_")
