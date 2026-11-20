@@ -225,6 +225,20 @@ class OllamaDiscoveryTests(_FreshBreaker, unittest.IsolatedAsyncioTestCase):
         await prompt_budget.for_run(_config()).resolve(client, "gpt-oss:120b-cloud")
         self.assertEqual(stub.count("POST", "/api/show"), 1, "cached per model")
 
+    async def test_configured_budget_is_capped_by_the_model_maximum(self):
+        # Review fix: prompt_budget.model_context_tokens without num_ctx, on an
+        # unloaded model that reports only its trained maximum: the maximum
+        # wins when smaller. Control: a larger maximum keeps the configured budget.
+        stub = StubLlamaServer(show={"tiny:1b": 2048, "qwen3:8b": 40960})
+        _install(self, stub)
+        cfg = _config()
+        cfg.setdefault("prompt_budget", {})["model_context_tokens"] = 8192
+        client = _client(cfg)
+        budget = await prompt_budget.for_run(cfg).resolve(client, "tiny:1b")
+        self.assertEqual((budget.context_tokens, budget.source), (2048, "discovered:model_max"))
+        budget = await prompt_budget.for_run(cfg).resolve(client, "qwen3:8b")
+        self.assertEqual(budget.context_tokens, 8192)
+
     def test_invalid_fallback_is_a_config_fault(self):
         for bad in (0, -1, "4096", True, 2.5):
             with self.subTest(bad=bad), self.assertRaises(ValueError):

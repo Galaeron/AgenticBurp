@@ -166,13 +166,15 @@ class DiscoveredBudget:
         window = _positive_int(info.get("window"))
         source = info.get("source") if isinstance(info.get("source"), str) else "server"
         configured = self.configured
+        model_max = _positive_int(info.get("model_max"))
         if configured is not None:
             if window and window < configured.context_tokens:
                 return PromptBudget(window, configured.answer_tokens, f"discovered:{source}")
+            if not window and model_max and model_max < configured.context_tokens:
+                return PromptBudget(model_max, configured.answer_tokens, "discovered:model_max")
             return configured
         if window:
             return PromptBudget(window, self.answer_tokens, f"discovered:{source}")
-        model_max = _positive_int(info.get("model_max"))
         fallback = min(self.fallback_tokens, model_max) if model_max else self.fallback_tokens
         if (str(model), fallback) not in _fallback_warned:
             _fallback_warned.add((str(model), fallback))
