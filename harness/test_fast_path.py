@@ -8,6 +8,7 @@ These tests verify:
 4. Pattern matching is accurate
 5. Stats tracking works
 """
+import re
 import unittest
 from harness.models import HttpExchange, AgentReport, Finding
 from harness.fast_path import (
@@ -985,6 +986,109 @@ class TestFastPathSelector(unittest.TestCase):
         
         stats = self.selector.get_stats()
         self.assertEqual(stats['fast_path_hits'], 0)
+
+
+# TOK-2 ------------------------------------------------------------------
+# The ids/paths the audit measured, as the OLD unanchored regexes saw them. The
+# controls below run these against the old patterns to prove the table can fail.
+_LEGACY_ID_PARAM_RE = re.compile(r'id|user_id|account_id|customer_id|order_id|product_id', re.IGNORECASE)
+_LEGACY_STATIC_URL_RE = re.compile(r'/static|/assets|/css|/js|/images|/fonts', re.IGNORECASE)
+
+# (parameter name, agent that only its row dispatches, should it be dispatched)
+_PARAM_ROWS = [
+    # true positives: every shape of an id
+    ("id", "idor", True), ("ID", "idor", True), ("userId", "idor", True),
+    ("user_id", "idor", True), ("account_id", "idor", True), ("orderID", "idor", True),
+    ("uuid", "idor", True), ("userid", "idor", True), ("customer-id", "idor", True),
+    ("filter[id]", "idor", True), ("filter%5Bid%5D", "idor", True),
+    ("items[0][id]", "idor", True), ("product.id", "idor", True), ("id2", "idor", True),
+    ("pid", "idor", True),
+    # false positives the audit named: `id` is only a substring
+    ("width", "idor", False), ("hidden", "idor", False), ("valid", "idor", False),
+    ("provider", "idor", False), ("guid", "idor", False), ("video", "idor", False),
+    ("android", "idor", False), ("liquid", "idor", False),
+    # the other rows used to fire on substrings too
+    ("redirect_to", "open_redirect", True), ("to", "open_redirect", True),
+    ("date_to", "open_redirect", False), ("profile", "open_redirect", False),
+    ("curl", "open_redirect", False), ("blink", "open_redirect", False),
+    ("api_key", "auth", True), ("apikey", "auth", True), ("keyword", "auth", False),
+    ("monkey", "auth", False),
+    ("do", "command_injection", True), ("cmd", "command_injection", True),
+    ("domain", "command_injection", False), ("do_not_track", "command_injection", False),
+    ("download", "command_injection", False), ("runtime", "command_injection", False),
+    ("order_by", "business_logic", True), ("pageSize", "business_logic", True),
+    ("border", "business_logic", False), ("homepage", "business_logic", False),
+]
+
+# (path, agent that only its row dispatches, should it be dispatched)
+_PATH_ROWS = [
+    ("/js/", "misconfig", True), ("/js", "misconfig", True), ("/static/js/app.js", "misconfig", True),
+    ("/api/v1/users/12", "idor", True), ("/api/v1/users/12", "api_security", True),
+    ("/users", "idor", True), ("/Users/1", "idor", True), ("/me", "idor", True),
+    ("/account-settings", "idor", True), ("/resetPassword", "business_logic", True),
+    ("/rest/chatbot/respond", "ai_llm", True), ("/management/health", "auth", True),
+    ("/oauth2/authorize", "oauth", True),
+    # false positives: a prefix of a longer word, a host label, a query value
+    ("/json", "misconfig", False), ("/JSON", "misconfig", False), ("/jsonp/x", "misconfig", False),
+    ("/messages", "idor", False), ("/media/1", "idor", False), ("/username", "idor", False),
+    ("/air/1", "ai_llm", False), ("/aid", "ai_llm", False),
+    ("/cartridge", "idor", False), ("/authors", "business_logic", False),
+    ("http://me.example.com/x", "idor", False),
+    ("http://api-admin.example.com/index", "auth", False),
+    ("/index?next=/admin", "auth", False),
+]
+
+
+class TestTokenBoundaryMatching(unittest.TestCase):
+    """TOK-2: parameter names match by token, paths by segment."""
+
+    def test_parameter_name_table(self):
+        for name, agent, expected in _PARAM_ROWS:
+            with self.subTest(param=name, agent=agent):
+                agents = select_agents_by_query_params(f"{name}=1")
+                self.assertEqual(agent in agents, expected, f"{name!r}: {sorted(agents)}")
+
+    def test_path_table(self):
+        for path, agent, expected in _PATH_ROWS:
+            with self.subTest(path=path, agent=agent):
+                agents = select_agents_by_url(path)
+                self.assertEqual(agent in agents, expected, f"{path!r}: {sorted(agents)}")
+
+    def test_old_regex_control_overdispatches_every_false_positive_row(self):
+        """Negative control: the table's false-positive rows are real. The old
+        unanchored patterns match each of them, so reverting to a substring
+        match fails test_parameter_name_table / test_path_table."""
+        for word in ("width", "hidden", "valid", "provider", "guid", "video"):
+            self.assertTrue(_LEGACY_ID_PARAM_RE.search(word), word)
+        self.assertTrue(_LEGACY_STATIC_URL_RE.search("/json"))
+        # ...and the new rule rejects all of them
+        for word in ("width", "hidden", "valid", "provider", "guid", "video"):
+            self.assertNotIn("idor", select_agents_by_query_params(f"{word}=1"))
+        self.assertNotIn("misconfig", select_agents_by_url("/json"))
+
+    def test_forcing_the_substring_rule_back_fails_the_table(self):
+        """The same control through the real call path: swap the id row for the
+        old regex and the false-positive rows dispatch idor again."""
+        from unittest import mock
+        legacy = [(_LEGACY_ID_PARAM_RE, ["idor", "sqli"])]
+        with mock.patch("harness.fast_path._QUERY_PARAM_PATTERNS", legacy):
+            self.assertIn("idor", select_agents_by_query_params("width=1"))
+            self.assertIn("idor", select_agents_by_query_params("video=1"))
+
+    def test_caller_level_selection_no_longer_dispatches_idor_for_width(self):
+        exchange = HttpExchange(
+            url="https://example.com/render?width=300&hidden=1&provider=x&video=2",
+            method="GET", request_headers={}, request_body="", response_status=200,
+            response_headers={}, response_body="")
+        agents, _reason = select_fast_path_agents(exchange, {"idor", "sqli", "xss", "anomaly"})
+        self.assertNotIn("idor", agents)
+        self.assertIn("sqli", agents)  # the any-parameter floor is unchanged
+
+    def test_value_text_is_not_a_parameter_name(self):
+        """`redirect=/a?id=1` is one URL-valued parameter, not a second `id`."""
+        agents = select_agents_by_query_params("redirect=/a?id=1")
+        self.assertIn("open_redirect", agents)
+        self.assertNotIn("idor", agents)
 
 
 if __name__ == "__main__":
