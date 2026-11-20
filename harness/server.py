@@ -425,7 +425,12 @@ async def _cached_backend_probe() -> tuple[dict, float]:
     if cached and cached[2] is client and now - cached[1] < _HEALTH_PROBE_TTL_SECONDS:
         return cached[0], round(now - cached[1], 3)
     probe = await client.health_check()
-    _health_probe_cache["probe"] = (probe, time.monotonic(), client)
+    # Only a reachable probe is reused: an operator who just started the model
+    # server sees it on the next call, not after the TTL.
+    if probe.get("reachable"):
+        _health_probe_cache["probe"] = (probe, time.monotonic(), client)
+    else:
+        _health_probe_cache.pop("probe", None)
     return probe, 0.0
 
 

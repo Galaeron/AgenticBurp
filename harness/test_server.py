@@ -122,6 +122,18 @@ class SuppressionEndpointTests(unittest.TestCase):
             server_module._HEALTH_PROBE_TTL_SECONDS = original
         self.assertEqual(len(calls), 2)
 
+    def test_health_details_does_not_cache_an_unreachable_probe(self):
+        # Review fix: a down backend is re-probed on every call, so starting
+        # the model server shows up at once. Control: the reachable case above
+        # is cached (1 probe for 2 calls).
+        calls = self._stub_ollama_health(reachable=False, models=[])
+        self.client.get("/health/details")
+        self.client.get("/health/details")
+        self.assertEqual(len(calls), 2)
+        calls = self._stub_ollama_health(reachable=True, models=[])
+        self.assertEqual(self.client.get("/health/details").json()["ollama"]["reachable"], True)
+        self.assertEqual(len(calls), 1)
+
     def test_health_details_carries_the_model_egress_state(self):
         from harness import model_egress
         import harness.server as server_module
