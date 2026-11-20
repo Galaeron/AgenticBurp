@@ -29,6 +29,25 @@ def _fallback_result_binds(result, routed) -> bool:
     return tested_class == fallback_label
 
 
+class ProbeScopeRefused(PermissionError):
+    """ARC-2: a standalone active probe was refused for scope. Its message names
+    only the host and the configured scope, so a route may return it verbatim."""
+
+
+def _require_standalone_probe_scope(url: str, allowed_hosts) -> None:
+    """ARC-2: a standalone probe (no owning run) sends requests the model chooses,
+    so it needs an explicit scope that covers the probed exchange. Unlike passive
+    review, an empty allowed_hosts refuses here instead of admitting any host."""
+    from harness import scope_lock
+    if scope_lock.host_in_scope(url, allowed_hosts, active_mode=True):
+        return
+    if not scope_lock.configured_entries(allowed_hosts):
+        raise ProbeScopeRefused(
+            "active probe refused: no server.allowed_hosts configured; a standalone "
+            "probe sends model-chosen requests and fails closed without an explicit scope")
+    raise ProbeScopeRefused("active probe refused: " + scope_lock.out_of_scope_reason(url, allowed_hosts))
+
+
 class ConfirmMixin:
     async def get_run_derived_live_markers(self):
         """P0-2: the run-derived confirmation-trust-tier override.
@@ -168,12 +187,16 @@ class ConfirmMixin:
         probe_ctx = run_context
         _ia_cfg = (self.config or {}).get("iterative_agent", {}) or {}
         if probe_ctx is None:
+            # ARC-2: no owning run means no run scope to inherit; refuse before
+            # building the context or calling the model.
+            _require_standalone_probe_scope(exchange.url, self.allowed_hosts)
             _cfg_max = _ia_cfg.get("max_requests")
             ceiling = effective_budget * 2 + 10 if _cfg_max is None else _cfg_max
             if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
                 raise ValueError("iterative_agent.max_requests must be a nonnegative integer")
             owned_ctx = standalone_context(self.allowed_hosts, config=self.config,
-                                           gate=get_default_gate(), max_requests=ceiling)
+                                           gate=get_default_gate(), active_mode=True,
+                                           max_requests=ceiling)
             probe_ctx = owned_ctx
         async def experiment_handoff(action):
             return await self._handoff_experiment(action, probe_ctx)

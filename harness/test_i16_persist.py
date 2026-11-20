@@ -200,7 +200,9 @@ class SavedDeclarationsReachTheChainTests(rvs._ChainCase, unittest.TestCase):  #
         self.server = fx.server
         self.server.orchestrator.allowed_hosts = ["captured.example"]
         self.server.orchestrator.config = self.server.config
-        self.server.orchestrator.validator_registry = SimpleNamespace(active_enabled=False)
+        # ARC-1: /investigate needs the master switch; the bridge below is the only
+        # double, and it runs the chain on RV-S's own loopback.
+        self.server.orchestrator.validator_registry = SimpleNamespace(active_enabled=True)
         self.server.orchestrator.agent_manager.agents = {}
         self.server.config["runs"] = {"output_dir": fx.tmp.name}
         self.client = fx.client
