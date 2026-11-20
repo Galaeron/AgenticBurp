@@ -1,4 +1,9 @@
-"""SC-12: durable WorkItem queue behind the existing engagement graph.
+"""EXPERIMENTAL -- not enforced. No production code imports this module (ARC-10):
+it is exercised only by its own tests, so nothing in a run depends on it and it
+enforces nothing. Whether to wire it in, move it to harness/experimental/ or delete it is an
+owner decision; harness.test_experimental_modules keeps this marker honest.
+
+SC-12: durable WorkItem queue behind the existing engagement graph.
 
 A ``WorkItem`` is one bounded unit of proposed/pending work in the pipeline's
 lifecycle -- a detection candidate, a planned bounded probe, an execution, an
@@ -31,6 +36,9 @@ yet, so importing or constructing it sends no traffic and changes no verdict.
 API and Burp UI are meant to be adapters over it (SC-12), added later.
 """
 from __future__ import annotations
+
+# ARC-10: no production importer; see the docstring.
+EXPERIMENTAL = True
 
 import hashlib
 import json

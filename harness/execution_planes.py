@@ -1,4 +1,9 @@
 """
+EXPERIMENTAL -- not enforced. No production code imports this module (ARC-10):
+it is exercised only by its own tests, so nothing in a run depends on it and it
+enforces nothing. Whether to wire it in, move it to harness/experimental/ or delete it is an
+owner decision; harness.test_experimental_modules keeps this marker honest.
+
 Execution-plane capability-ownership matrix (RB-6, LOOP half).
 
 AgenticBurp has TWO active-traffic execution planes that can each independently
@@ -56,6 +61,9 @@ OWNER/JDK half of RB-6. This module changes no execution behavior in either
 plane.
 """
 from __future__ import annotations
+
+# ARC-10: no production importer; see the docstring.
+EXPERIMENTAL = True
 
 from dataclasses import dataclass, field
 

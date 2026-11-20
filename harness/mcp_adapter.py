@@ -1,4 +1,9 @@
-"""Read-only MCP adapter (P2.1).
+"""EXPERIMENTAL -- not enforced. No production code imports this module (ARC-10):
+it is exercised only by its own tests, so nothing in a run depends on it and it
+enforces nothing. Whether to wire it in, move it to harness/experimental/ or delete it is an
+owner decision; harness.test_experimental_modules keeps this marker honest.
+
+Read-only MCP adapter (P2.1).
 
 Exposes this harness's RESULT (issue exports), COVERAGE (engagement
 summary), and PROVENANCE (run manifests) data as read-only, MCP-resource-
@@ -22,6 +27,9 @@ is otherwise valid -- this is what stops tenant A from reading tenant B's
 data through a leaked/misconfigured token scope.
 """
 from __future__ import annotations
+
+# ARC-10: no production importer; see the docstring.
+EXPERIMENTAL = True
 
 import json
 from dataclasses import dataclass
