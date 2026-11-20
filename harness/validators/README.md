@@ -44,8 +44,10 @@ redirect) choose injection points with `injection_targets.select_targets`:
   request) is reported as `control_outcome="named_parameter_untested"`;
 - an unnamed finding whose inputs exceed the cap is `"partial_coverage"`.
 
-The confirmation gate counts only `""` / `"control_held"` negatives as
-controlled, so either marker leaves the finding inconclusive, not refuted.
+The confirmation gate counts only `"control_held"` negatives as controlled
+(EFF-1, `harness/control_outcome.py`), so either marker -- like an empty
+outcome -- leaves the finding inconclusive, not refuted. The per-validator
+control decisions are in `docs/CONTROL_OUTCOME_INVENTORY.md`.
 The engagement `_confirm` path carries the parameter, and the within-run
 confirmation cache keys on it. The sqlmap, SSRF, XXE and XSS legs do not use
 it yet.

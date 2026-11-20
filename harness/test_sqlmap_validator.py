@@ -495,6 +495,12 @@ class AuthRequestDetectionTests(unittest.TestCase):
             self.assertFalse(_looks_like_auth_request(ex), url)
 
 
+# sqlmap's real negative ending: it exits 1 with this verdict (EFF-1). A nonzero
+# exit WITHOUT it is a tool error, which the validator reports as inconclusive.
+_SQLMAP_NEGATIVE = ("[CRITICAL] all tested parameters do not appear to be injectable. "
+                    "Try to increase values for '--level'/'--risk' options")
+
+
 class _FakeProc:
     def __init__(self, returncode=1, stdout="", stderr=""):
         self.returncode = returncode
@@ -628,7 +634,7 @@ class SqlmapLoginDiscriminationTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(login.db.close)   # the fixture's in-memory table
         v = SqlmapValidator(binary="sqlmap")
         with patch("harness.tool_runner.run_process",
-                   return_value=_FakeProc(returncode=1, stdout="not vulnerable")), \
+                   return_value=_FakeProc(returncode=1, stdout=_SQLMAP_NEGATIVE)), \
              patch("httpx.AsyncClient.request", new_callable=AsyncMock, side_effect=login.request):
             return await v.validate(_finding(), exchange or _login_exchange())
 
@@ -766,3 +772,49 @@ class SqlmapVerdictEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.confirmed)
         self.assertEqual(result.limitation, "")
         self.assertNotIn("sqlmap verdict:", result.evidence)
+
+class SqlmapNonzeroExitTests(unittest.IsolatedAsyncioTestCase):
+    """EFF-1: a sqlmap that exits nonzero without its own tested-parameter verdict
+    (a crash, a bad option, a tool error) compared nothing, so it is inconclusive,
+    never a negative. sqlmap's normal negative also exits 1 but carries the verdict;
+    it stays not_confirmed, with no held control, so the gate does not refute it."""
+
+    URL = "http://localhost/api/products?id=1"
+
+    def setUp(self):
+        reset_default_gate()
+        get_default_gate({"active_enabled": True, "allowed_hosts": ["localhost"]})
+
+    def tearDown(self):
+        reset_default_gate()
+
+    async def _run(self, proc):
+        same = httpx.Response(200, content=b"same", request=httpx.Request("GET", self.URL))
+        with patch("harness.tool_runner.run_process", return_value=proc), \
+             patch("httpx.AsyncClient.request", new_callable=AsyncMock, return_value=same):
+            return await SqlmapValidator(binary="sqlmap").validate(
+                _finding(), HttpExchange(url=self.URL, method="GET", response_status=200))
+
+    @staticmethod
+    def _gate(result):
+        from harness.confirmation_gate import apply_confirmation_suppression
+        from harness.models import AgentReport, ValidationReport
+        finding = _finding()
+        report = AgentReport(agent="sqli", model="synthetic", findings=[finding])
+        apply_confirmation_suppression([report], [ValidationReport(
+            validator=result.validator, status=result.status, finding_class="sqli",
+            confirmed=result.confirmed, control_outcome=result.control_outcome)])
+        return finding
+
+    async def test_nonzero_exit_without_a_verdict_is_inconclusive(self):
+        result = await self._run(_FakeProc(returncode=2, stdout="[CRITICAL] unrecognized option"))
+        self.assertEqual((result.status, result.control_outcome), ("inconclusive", "not_run"))
+        self.assertFalse(result.confirmed)
+        self.assertIn("not a negative result", result.summary)
+        self.assertEqual(self._gate(result).review_verdict, "inconclusive_unverified")
+
+    async def test_control_nonzero_exit_with_the_verdict_stays_not_confirmed(self):
+        result = await self._run(_FakeProc(returncode=1, stdout=_SQLMAP_NEGATIVE))
+        self.assertEqual((result.status, result.control_outcome), ("not_confirmed", ""))
+        # Absence of sqlmap's signal is not a held control: unverified, not refuted.
+        self.assertEqual(self._gate(result).review_verdict, "inconclusive_unverified")

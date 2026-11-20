@@ -2186,6 +2186,9 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
          # report and the Burp tab can show status at a glance rather than a raw
          # confidence number.
          "lifecycle_state": confirmation_gate.lifecycle_state(bool(confirmed), rv),
+         # EFF-5: why a LEAD is LEAD (refuted / untested / rejected / environment),
+         # "" otherwise -- a refuted finding and an untested one are not the same.
+         "lead_reason": confirmation_gate.lead_reason(bool(confirmed), rv),
          "parameter_location": ploc or "", "parameter_name": pname or "",
          # Finding dedup: False only for a row written before finding_inputs existed
          # (no side row, no proof record) -- issues.issue_key then keeps
@@ -2264,6 +2267,7 @@ def _resolve_confirmation_proofs(results: list[dict]) -> None:
             r["proof_status"] = "unavailable"
             r["confirmed"] = False
             r["lifecycle_state"] = confirmation_gate.lifecycle_state(False, r["review_verdict"])
+            r["lead_reason"] = confirmation_gate.lead_reason(False, r["review_verdict"])
             r["oracle_verified"] = False
             r["verification_state"] = "candidate"
 

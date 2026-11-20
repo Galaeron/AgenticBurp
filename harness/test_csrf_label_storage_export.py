@@ -207,7 +207,7 @@ class CsrfLabelStorageExportTests(unittest.TestCase):
         self.assertIn("SUSPECTED (unconfirmed)", block)
         self.assertIn("CANDIDATE (not oracle-verified)", block)
         self.assertRegex(block, r"\*\*Severity:\*\* \S+ LOW\b")
-        self.assertLessEqual(float(re.search(r"\*\*Confidence:\*\* ([0-9.]+)", block).group(1)), 0.3)
+        self.assertLessEqual(float(re.search(r"\*\*Model score:\*\* ([0-9.]+)", block).group(1)), 0.3)
         self.assertIn("**Triage priority:** manual_verification", block)
         self.assertIn("**Evidence maturity:** unverified", block)
         description = next(line for line in block.splitlines() if line.startswith("**Description:**"))

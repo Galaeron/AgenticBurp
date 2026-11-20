@@ -12,16 +12,18 @@ def _finding(vc, severity="high", confidence=0.85, confirmed=False):
                    basis="derived", confirmed=confirmed)
 
 
-def _neg(finding_class, validator="v", parameter="", principal=""):
-    """A ValidationReport representing a REAL controlled negative: a leg ran and
-    returned not_confirmed. This is what earns a REFUTED verdict (R08).
+def _neg(finding_class, validator="v", parameter="", principal="", control_outcome="control_held"):
+    """A ValidationReport representing a REAL controlled negative: a leg ran,
+    returned not_confirmed AND observed its control hold (EFF-1: only
+    control_outcome="control_held" counts). This is what earns a REFUTED verdict (R08).
     FR-5 (F09): `parameter` binds the negative to a specific case; the default
     ("") is a class-level negative, preserved for backward compatibility.
     SC-3: `principal` binds the negative to the principal it ran under, so it
     can't refute a finding discovered under a different, resolved principal."""
     return ValidationReport(validator=validator, status="not_confirmed",
                             finding_class=finding_class, confirmed=False,
-                            parameter=parameter, principal_id=principal)
+                            parameter=parameter, principal_id=principal,
+                            control_outcome=control_outcome)
 
 
 def _finding_param(vc, parameter_name, severity="high", confidence=0.85, confirmed=False,

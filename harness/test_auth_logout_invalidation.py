@@ -179,6 +179,8 @@ class LogoutInvalidationCallerTests(EvidenceCase, _Base):
         self.assertFalse(any(r.confirmed for r in reports), _verdicts(reports))
         self.assertEqual([r.status for r in reports], ["not_confirmed"], _verdicts(reports))
         self.assertIn("Session invalidated on logout", reports[0].summary)
+        # EFF-1: seen authenticated before the logout, denied after -> a held control.
+        self.assertEqual(reports[0].control_outcome, "control_held")
         self.assertEqual(1, len(app.logout_sends()))
         self.assertNotEqual(_OPERATOR, app.logout_sends()[0]["sid"])
 

@@ -11,6 +11,7 @@
 | Choose tests and interpret their evidence | [TESTING.md](TESTING.md) |
 | Do the live/owner work after the loop reports `LOOP_DONE` | [OWNER_RUNBOOK.md](OWNER_RUNBOOK.md) — turnkey steps + offline-verified instruments for the 4 live priorities |
 | Why a confirmation verdict was retired | [ORACLE_RETIREMENTS.md](../ORACLE_RETIREMENTS.md) |
+| Which validator negatives count as a held control (refute a finding) | [CONTROL_OUTCOME_INVENTORY.md](CONTROL_OUTCOME_INVENTORY.md) |
 | Historical leg qualification evidence | [LEG_VERIFICATION.md](../LEG_VERIFICATION.md), [LEG_DECISIONS.md](../LEG_DECISIONS.md) |
 | Test/doc consolidation evidence and mapping | [rationalization audit](../reviews/2026-09-19/rationalisation/REVIEW.md) |
 | Configure the optional safety proxy | [PROXY_SETUP.md](../PROXY_SETUP.md) |

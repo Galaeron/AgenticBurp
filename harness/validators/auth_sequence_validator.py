@@ -51,6 +51,7 @@ from urllib.parse import urlsplit, parse_qsl
 import httpx
 
 from harness import global_throttle
+from harness.control_outcome import CONTROL_HELD
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
@@ -571,8 +572,10 @@ class AuthSequenceValidator(Validator):
     def _skip(self, why: str, fc="broken_authentication") -> ValidationResult:
         return ValidationResult(self.name, "skipped", fc, summary=why)
 
-    def _not(self, why: str, fc) -> ValidationResult:
-        return ValidationResult(self.name, "not_confirmed", fc, confidence=0.0, confirmed=False, summary=why)
+    def _not(self, why: str, fc, control_outcome: str = "") -> ValidationResult:
+        # EFF-1: "" (unknown) unless the caller observed the defence hold.
+        return ValidationResult(self.name, "not_confirmed", fc, confidence=0.0, confirmed=False,
+                                summary=why, control_outcome=control_outcome)
 
     def applies(self, finding: Finding, exchange: HttpExchange) -> bool:
         if not super().applies(finding, exchange):
@@ -751,7 +754,10 @@ class AuthSequenceValidator(Validator):
         # Pre-auth cookies that survive login: re-issued unchanged, or not replaced.
         fixed = {n: v for n, v in pre_cookies.items() if post_cookies.get(n, v) == v}
         if not fixed:
-            return self._not("session id rotated on login (no fixation)", fc)
+            # EFF-1: a held control only when a pre-login id existed and a login that
+            # succeeded replaced it; with no pre-login cookie nothing was rotated.
+            return self._not("session id rotated on login (no fixation)", fc,
+                             CONTROL_HELD if pre_cookies and resp.status_code < 400 else "")
         names = ", ".join(sorted(fixed))
         if resp.status_code >= 400:
             return self._candidate(
@@ -914,10 +920,10 @@ class AuthSequenceValidator(Validator):
         fc = "session_timeout"
         steps: list[dict] = []
 
-        def done(status, summary, evidence="", confidence=0.0):
+        def done(status, summary, evidence="", confidence=0.0, control_outcome=""):
             return ValidationResult(
                 self.name, status, fc, confidence=confidence, confirmed=status == "confirmed",
-                summary=summary, evidence=evidence or summary,
+                summary=summary, evidence=evidence or summary, control_outcome=control_outcome,
                 raw_output=json.dumps({"check": "logout_invalidation", "steps": steps}))
 
         method = (exchange.method or "").upper()
@@ -1019,9 +1025,12 @@ class AuthSequenceValidator(Validator):
         denial_c = _anonymous_denial(after.status_code, after.text or "",
                                      after.headers.get("location") or "")
         if denial_c:
+            # EFF-1: held -- the same session was seen authenticated before the
+            # logout (the positive control above) and denied after it.
             return done("not_confirmed",
                         f"Session invalidated on logout: after {lo_method} {urlsplit(lo_url).path} the "
-                        f"pre-logout {names} is denied ({denial_c}).")
+                        f"pre-logout {names} is denied ({denial_c}).",
+                        control_outcome=CONTROL_HELD)
         return done("inconclusive",
                     f"Logout invalidation unproven: after {lo_method} {urlsplit(lo_url).path} the replay "
                     f"of {urlsplit(page).path} answered HTTP {after.status_code}, which neither shows the "
@@ -1150,9 +1159,12 @@ class AuthSequenceValidator(Validator):
                 confidence=0.9).with_artifacts(baseline=read, attack=after, controls=[anon])
         revoked = _token_denial(after, identifiers)
         if revoked:
+            # EFF-1: held -- the token read the account before the logout and is
+            # denied after it.
             return done("not_confirmed",
                         f"Token revoked on logout: after {lo_method} {lo_path} the pre-logout bearer "
-                        f"token is denied at {path} ({revoked}).")
+                        f"token is denied at {path} ({revoked}).",
+                        control_outcome=CONTROL_HELD)
         return done("inconclusive",
                     f"Logout invalidation unproven: after {lo_method} {lo_path} the replay of {path} "
                     f"answered HTTP {after.status_code}, which neither shows the account nor denies "
@@ -1346,7 +1358,10 @@ class AuthSequenceValidator(Validator):
                 summary=f"Weak password policy confirmed: '{_WEAK_PASSWORD}' accepted at {urlsplit(exchange.url).path}.",
                 evidence=f"Registering with password '{_WEAK_PASSWORD}' returned HTTP {resp.status_code} with no "
                          f"strength/complexity rejection -- the endpoint enforces no meaningful password policy.")
-        return self._not(f"weak password rejected or not accepted (HTTP {resp.status_code})", fc)
+        # EFF-1: held only when the policy rejection itself was observed; a bare
+        # non-2xx without a policy message may be a broken request.
+        return self._not(f"weak password rejected or not accepted (HTTP {resp.status_code})", fc,
+                         CONTROL_HELD if rejected else "")
 
     # --- username enumeration -------------------------------------------------
     async def _check_username_enum(self, exchange, new_lookup_leg: bool = False
@@ -1489,8 +1504,11 @@ class AuthSequenceValidator(Validator):
                         f"non-existent one's proves nothing.",
                 evidence="Register an identity whose token names its account and re-run.")
         if query is not None:
+            # EFF-1: held when the account known to exist got a successful answer
+            # that matched a non-existent one's (a uniform response observed).
             return self._not(
                 f"an existing account ({known_as}) and a non-existent one produced indistinguishable "
                 f"responses at {where} (no enumeration for that account; an account lacking the "
-                f"looked-up data answers like a missing one)", fc)
+                f"looked-up data answers like a missing one)", fc,
+                CONTROL_HELD if 200 <= vstatus < 300 else "")
         return self._not("valid and invalid usernames produced indistinguishable responses (no enumeration)", fc)

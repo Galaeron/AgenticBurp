@@ -4,7 +4,9 @@ from pathlib import Path
 
 from harness import store
 from harness.models import HttpExchange, Finding
-from harness.report_generator import generate_markdown_report, generate_report_for_host, _confidence_label, _basis_note
+import re
+
+from harness.report_generator import generate_markdown_report, generate_report_for_host, _model_score, _basis_note
 
 
 def sample(url="https://example.com/api/x", vulnerability_class="sqli", severity="critical",
@@ -17,11 +19,12 @@ def sample(url="https://example.com/api/x", vulnerability_class="sqli", severity
 
 
 class TestConfidenceAndBasisLabels(unittest.TestCase):
-    def test_confidence_labels_are_ordered_correctly(self):
-        self.assertEqual(_confidence_label(0.95), "very likely")
-        self.assertEqual(_confidence_label(0.7), "likely")
-        self.assertEqual(_confidence_label(0.4), "possible")
-        self.assertEqual(_confidence_label(0.1), "speculative")
+    def test_model_score_is_not_worded_as_a_probability(self):
+        # EFF-4: confidence is uncalibrated, so it never reads as a likelihood.
+        for score in (0.95, 0.7, 0.4, 0.1):
+            text = _model_score(score)
+            self.assertEqual(text, f"{score:.2f} (uncalibrated, not a probability)")
+            self.assertNotRegex(text, r"(?i)likely|possible|speculative|%")
 
     def test_derived_basis_has_no_warning_note(self):
         self.assertEqual(_basis_note("derived"), "Derived directly from what's visible in the captured traffic.")
@@ -29,6 +32,41 @@ class TestConfidenceAndBasisLabels(unittest.TestCase):
     def test_assumed_and_recalled_have_warning_language(self):
         self.assertIn("confirm", _basis_note("assumed").lower())
         self.assertIn("confirm", _basis_note("recalled").lower())
+
+
+
+class TestEvidenceTierIsThePrimarySignal(unittest.TestCase):
+    """EFF-4 (S): each finding's status block leads with the evidence tier and shows
+    confidence only as an uncalibrated model score, never as a probability."""
+
+    _PROBABILITY = re.compile(r"(?i)\d(?:\.\d+)?\s*\((?:very likely|likely|possible|speculative)\)"
+                              r"|\d+(?:\.\d+)?\s*%\s*(?:likely|probab|confiden|chance)"
+                              r"|\*\*Confidence:\*\*")
+
+    def _status_lines(self, report):
+        lines = report.splitlines()
+        return [(line, lines[i + 1]) for i, line in enumerate(lines) if line.startswith("**Status:**")]
+
+    def test_report_leads_with_the_tier_and_never_shows_a_probability(self):
+        report = generate_markdown_report("example.com", [
+            sample(url="https://example.com/a", confidence=0.95, confirmed=True),
+            sample(url="https://example.com/b", confidence=0.9, confirmed=False),
+            sample(url="https://example.com/c", vulnerability_class="xss", confidence=0.4)])
+        self.assertIsNone(self._PROBABILITY.search(report), self._PROBABILITY.findall(report))
+        status = self._status_lines(report)
+        self.assertEqual(len(status), 3, report)
+        for head, detail in status:
+            self.assertLess(head.index("**Status:**"), head.index("**Evidence maturity:**"))
+            self.assertNotIn("Model score", head)
+            self.assertRegex(detail, r"\*\*Model score:\*\* \d\.\d\d \(uncalibrated, not a probability\)$")
+
+    def test_control_a_high_score_does_not_lift_the_evidence_tier(self):
+        report = generate_markdown_report("example.com", [
+            sample(url="https://example.com/a", confidence=0.99, confirmed=False),
+            sample(url="https://example.com/b", confidence=0.2, confirmed=True)])
+        heads = {("CONFIRMED" in head): head for head, _ in self._status_lines(report)}
+        self.assertIn("**Evidence maturity:** unverified", heads[False])
+        self.assertIn("**Evidence maturity:** confirmed", heads[True])
 
 
 class TestReportStructure(unittest.TestCase):

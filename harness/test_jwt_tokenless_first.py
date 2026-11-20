@@ -212,6 +212,9 @@ class TokenlessFirstTests(unittest.TestCase):
         self.assertEqual(result.status, "not_confirmed", result.summary)
         self.assertEqual(target.total, 3 + _FORGERY_PROBES,
                          "tokenless + replay + garbage + the forgery probes")
+        # EFF-1: the captured token's replay was seen accepted while every forgery
+        # was rejected -> a held control.
+        self.assertEqual(result.control_outcome, "control_held")
 
     def test_public_vs_private_negative_control_fails_if_everything_is_the_same(self):
         # The skip must hinge on the comparison: were any two substantive answers
@@ -245,6 +248,9 @@ class TokenlessFirstTests(unittest.TestCase):
         self.assertEqual(target.counts[""], 1)
         self.assertEqual(target.total, 2 + _FORGERY_PROBES)   # tokenless + garbage + forgeries
         self.assertIn(f"probes sent: {2 + _FORGERY_PROBES}", result.evidence)
+        # EFF-1 control: no replay of the captured token was observed accepted, so
+        # the rejections may be a route that rejects every token -- not held.
+        self.assertEqual(result.control_outcome, "")
 
     def test_forged_token_accepted_where_garbage_is_rejected_is_confirmed(self):
         # The forgery leg still confirms behind a tokenless-denied route.

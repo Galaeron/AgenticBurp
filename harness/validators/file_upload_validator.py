@@ -39,6 +39,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from harness import global_throttle, upload_files
+from harness.control_outcome import CONTROL_HELD
 from harness.models import Finding, HttpExchange
 from harness.safety_gate import GatedAsyncClient, get_default_gate, SafetyGateBlocked
 from .base import Validator, ValidationResult
@@ -454,8 +455,12 @@ class FileUploadValidator(Validator):
                             f"context (content-type: {content_type}).",
                     evidence=f"Uploaded {filename} (text/html) -> stored at {upload_url}. Retrieved and "
                              f"found our marker, served as {content_type} (no attachment disposition).")
+            # EFF-1: held -- the stored copy WAS served back (our marker found), and
+            # the defence (an inert content type or an attachment disposition) was
+            # observed on that very copy.
             return ValidationResult(
                 self.name, "not_confirmed", "file_upload", confidence=0.4, confirmed=False,
+                control_outcome=CONTROL_HELD,
                 summary=f"OBSERVATION (not confirmed): the .html upload was stored and served, but as "
                         f"content-type {content_type!r}"
                         f"{' (attachment)' if 'attachment' in disposition else ''} -- not an active "
