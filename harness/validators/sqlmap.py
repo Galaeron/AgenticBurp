@@ -11,6 +11,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import httpx
 
+from harness.control_outcome import CONTROL_NOT_RUN
 from harness.models import Finding, HttpExchange, TestPlan
 from harness.planner import exchange_fingerprint, plan_key_fingerprint
 from harness.categories import canonicalize
@@ -1316,7 +1317,6 @@ class SqlmapValidator(Validator):
                 # nonzero exit that carries the verdict is sqlmap's normal negative
                 # (it exits 1 on "all tested parameters do not appear to be
                 # injectable") and stays not_confirmed below.
-                from harness.control_outcome import CONTROL_NOT_RUN
                 return ValidationResult(
                     self.name, "inconclusive", finding.vulnerability_class,
                     confidence=0.0, confirmed=False,
