@@ -334,5 +334,75 @@ class CrossIdentityConsumesSelfOwnershipTests(unittest.TestCase):
         self.assertFalse(r.confirmed)
 
 
+
+class ClassifierPayloadFitTests(unittest.TestCase):
+    """TOK-7: the route classifier's input is cut structurally to its cap, so the
+    model always receives a complete JSON document."""
+
+    @staticmethod
+    def _wide_body(card):
+        # The own-object pointer first, then a response shape far over the cap.
+        doc = {"card": {"ref": card}}
+        doc.update({f"section_{i:02d}": {f"field_{j:02d}": {f"leaf_{k}": k for k in range(5)}
+                                          for j in range(30)} for i in range(30)})
+        return json.dumps(doc)
+
+    def _classify_through_the_model(self, body_for):
+        from harness.self_ownership import ollama_route_classifier
+        prompts = []
+
+        class Ollama:
+            async def chat_json(self, model, system, user, temperature=0.0):
+                prompts.append(user)
+                json.loads(user)       # a cut document is a model-side parse failure
+                return AgentRouteClassificationTests.GOOD
+        so = _observed()
+        for pid, card in ((ALICE, 101), (BOB, 102)):
+            so.observe(source="transport", principal_id=pid, method="GET", url=f"{APP}/api/cards/mine",
+                       status=200, response_body=body_for(card))
+        recorded = asyncio.run(so.classify_pending(ollama_route_classifier(Ollama(), "local-model")))
+        return so, recorded, prompts
+
+    def test_oversized_shape_is_pruned_to_valid_json_and_still_classifies(self):
+        from harness.self_ownership import CLASSIFIER_INPUT_CHARS
+        so, recorded, prompts = self._classify_through_the_model(self._wide_body)
+        self.assertEqual(len(prompts), 1)
+        sent = json.loads(prompts[0])
+        self.assertLessEqual(len(prompts[0]), CLASSIFIER_INPUT_CHARS)
+        self.assertEqual((sent["method"], sent["route"]), ("GET", "/api/cards/mine"))
+        self.assertTrue(sent["response_shape_truncated"])
+        self.assertEqual(sent["response_shape"]["card"], {"ref": "int"})
+        self.assertEqual(len(recorded), 2)
+        self.assertIsNotNone(so.fact_for(APP + "/api/cards/101"))
+
+    def test_control_the_old_slice_is_not_json(self):
+        # NEGATIVE CONTROL: the pre-TOK-7 `json.dumps(payload)[:6000]` of the
+        # same payload is an unterminated document.
+        from harness.self_ownership import _skeleton
+        payload = {"method": "GET", "route": "/api/cards/mine",
+                   "response_shape": _skeleton(json.loads(self._wide_body(101)))}
+        self.assertGreater(len(json.dumps(payload)), 6000)
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(json.dumps(payload)[:6000])
+
+    def test_payload_under_the_cap_is_sent_unchanged(self):
+        from harness.self_ownership import _skeleton
+        _so, _recorded, prompts = self._classify_through_the_model(
+            lambda card: json.dumps({"card": {"ref": card, "currency": "EUR"}}))
+        self.assertEqual(prompts, [json.dumps({"method": "GET", "route": "/api/cards/mine",
+                                               "response_shape": _skeleton({"card": {"ref": 1, "currency": "x"}})})])
+
+    def test_any_payload_fits(self):
+        from harness.self_ownership import fit_classifier_payload
+        huge_route = "/api/" + "é" * 5000
+        for payload in ({"method": "GET", "route": "/x", "response_shape": ["dict"] * 3},
+                        {"method": "GET", "route": huge_route, "response_shape": {"a": "int"}},
+                        {"method": "GET", "route": "/x",
+                         "response_shape": {f"k{i}" * 30: "str" for i in range(400)}}):
+            text = fit_classifier_payload(payload, limit=300)
+            self.assertLessEqual(len(text), 300)
+            self.assertIsInstance(json.loads(text), dict)
+
+
 if __name__ == "__main__":
     unittest.main()
