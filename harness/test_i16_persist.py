@@ -22,6 +22,7 @@ P8  store: additive versioned side table, legacy DB unchanged, rollback, version
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import shutil
 import sqlite3
@@ -220,7 +221,12 @@ class SavedDeclarationsReachTheChainTests(rvs._ChainCase, unittest.TestCase):  #
 
         async def bridge(base_url, roles, **kwargs):
             declared = {k: kwargs[k] for k in ("protected_paths", "owners") if k in kwargs}
-            return {"summary": {}, "findings_q3": await asyncio.to_thread(chain, declared)}
+            # The route's run (scoped to captured.example) is ambient here, and
+            # to_thread would copy it into the worker. The double's chain targets
+            # RV-S's loopback, so it runs in a fresh context: the probe's ambient-run
+            # lookup (ARC-7) must not pick up the route's run for another target.
+            return {"summary": {}, "findings_q3": await asyncio.to_thread(
+                contextvars.Context().run, chain, declared)}
         self.server.orchestrator.investigate_engagement = bridge
 
     def _findings(self, **extra) -> list[dict]:
