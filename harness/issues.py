@@ -689,6 +689,207 @@ def apply_merge_overrides(issues: list[Issue], merges: dict[str, str]) -> list[I
 
 
 # --------------------------------------------------------------------------- #
+# Root causes (EFF-3)
+# --------------------------------------------------------------------------- #
+# r11 reported "117 unique" vulnerabilities against about 16-18 root causes: one CSP
+# issue had 135 records, and 15 groups were a proof of one class filed under another.
+# Three counts, each with its unit (ISSUE_UNITS), are reported side by side:
+# occurrences (records), issues (issue_key groups) and root causes (root_cause_key).
+
+ROOT_CAUSE_VERSION = 1
+
+# The class a confirming mechanism (proof_records.validator, confirmed_by_leg) proves,
+# primary first. A confirmed record whose label reads as one of these classes keeps
+# it; any other label is a wrong-class duplicate and takes the primary class. A
+# mechanism not listed here leaves the label's class as it is.
+ROOT_CAUSE_MECHANISMS: dict[str, tuple[str, ...]] = {
+    # Injection legs.
+    "sqlmap": ("sqli",), "nosql": ("nosql",), "command_injection": ("command_injection",),
+    "ssti": ("ssti",), "xxe": ("xxe",), "ssrf": ("ssrf",), "path_traversal": ("path_traversal",),
+    "filter_bypass_validator": ("path_traversal",), "open_redirect": ("open_redirect",),
+    "file_upload": ("file_upload",), "header_injection_validator": ("header_injection",),
+    "browser_xss": ("xss",), "stored_xss": ("xss",), "dom_xss": ("dom_xss",),
+    "deserialization_validator": ("deserialization",),
+    "deserialization_oob": ("deserialization",),
+    "http_request_smuggling_validator": ("http_request_smuggling",),
+    "web_cache_poisoning_validator": ("web_cache_poisoning",),
+    # Access control and business rules.
+    "cross_identity": ("idor", "bfla"), "idor_read": ("idor",),
+    "write_integrity": ("business_logic", "idor", "bfla", "api_security"),
+    "client_trust": ("business_logic",), "business_flow": ("business_logic",),
+    "csrf": ("csrf",), "rate_limit": ("rate_limit",), "verb_tamper": ("misconfig",),
+    "race_condition_validator": ("race_condition", "toctou"), "toctou": ("toctou",),
+    # Session and token policy.
+    "jwt_forge": ("jwt",), "password_change_session": ("session_after_password_change",),
+    "auth_sequence": ("auth", "session_fixation", "session_timeout", "session_expiry"),
+    "reset_token": ("reset_token",), "oauth_validator": ("oauth",),
+    "websocket_validator": ("websocket",),
+    # Exposure.
+    "api_security_validator": ("api_security",),
+    "metrics_exposure_validator": ("metrics_exposure",),
+    "sensitive_file_validator": ("info_disclosure",),
+    "listing_exposure_validator": ("info_disclosure",),
+    "content_exposure_validator": ("info_disclosure",),
+    "well_known_validator": ("recon",), "recon_validator": ("recon",),
+    "subdomain_takeover_validator": ("subdomain_takeover",),
+    # Header and configuration legs.
+    "csp_validator": ("csp",), "security_headers_validator": ("missing_headers",),
+    "cors_validator": ("cors",), "crypto_validator": ("crypto",),
+    "verbose_error_validator": ("verbose_error",), "error_handling_validator": ("verbose_error",),
+}
+
+# Root-cause classes that are one host's header or configuration policy. The names are
+# scanner_overlap.SCANNER_OVERLAP_CLASSES (framing folded into csp, as the taxonomy
+# files it; JWT header hygiene goes to the session-token rule) plus transport and TLS.
+_CONFIG_ROOT_CLASSES = frozenset({"csp", "cors", "missing_headers", "cookie_flags",
+                                  "verbose_error", "server_banner", "insecure_transport",
+                                  "crypto"})
+_OVERLAP_ROOT_CLASS = {"clickjacking": "csp", "jwt_header": "jwt"}
+# One host's session-token or session-lifetime policy.
+_SESSION_ROOT_CLASSES = frozenset({"jwt", "session_fixation", "session_timeout",
+                                   "session_expiry", "session_after_password_change"})
+# Object- and function-level authorization.
+_ACCESS_ROOT_CLASSES = frozenset({"idor", "bfla"})
+# api_security_validator's wording (validators/api_security_validator._probe_exposure)
+# for credential material inside the caller's session token, against a credential
+# field in the response body. Only the token reading is a host-wide root cause.
+_TOKEN_CLAIM_MARK = "accepts a session token whose payload carries"
+_RESPONSE_FIELD_MARK = "unmasked credential field"
+# cross_identity_validator's proof summaries name the identity that crossed into the
+# case principal's object: the second principal of an access-control pair, which no
+# record field carries (captured_principal_id is the case principal's own capture).
+_CROSSING_PRINCIPAL_RES = (re.compile(r"^Cross-identity \(([^)]+)\):"),
+                           re.compile(r"^Broken object-level write authorization: ['\"]([^'\"]+)['\"]"))
+
+ISSUE_UNITS = {
+    "occurrences": "finding records: every stored or in-run row, repeats included",
+    "issues": "issue groups by issues.issue_key: host, endpoint family, method, class, "
+              "affected input and read/write boundary",
+    "root_causes": "root-cause groups by issues.root_cause_key: one per host policy, "
+                   "injectable parameter, authorization check or endpoint flaw",
+}
+
+
+def _confirming_mechanism(finding: dict) -> str:
+    """The mechanism that confirmed the record, or "" when it is not confirmed."""
+    if not finding.get("confirmed"):
+        return ""
+    for key in ("validator", "confirmed_by_leg", "confirmation_method"):
+        value = finding.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return ""
+
+
+def root_cause_class(finding: dict) -> str:
+    """The class a record counts under for root causes: what its confirming mechanism
+    proved (ROOT_CAUSE_MECHANISMS), else the label's class (issue_class), else, for an
+    unconfirmed or unlisted record, the scanner-overlap reading of a header or
+    configuration label ("Missing HSTS header" -> missing_headers)."""
+    label = issue_class(finding.get("vulnerability_class", "") or "")
+    proven = ROOT_CAUSE_MECHANISMS.get(_confirming_mechanism(finding))
+    if proven:
+        return label if label in proven else proven[0]
+    if label in _CONFIG_ROOT_CLASSES or label in _SESSION_ROOT_CLASSES:
+        return label
+    from harness import scanner_overlap
+    overlap = scanner_overlap.overlap_class(finding)
+    if overlap:
+        return _OVERLAP_ROOT_CLASS.get(overlap, overlap)
+    return label
+
+
+def _principal_pair(finding: dict, observed: str) -> tuple[str, ...]:
+    """The sorted principals of an access-control record (see root_cause_key)."""
+    names = {str(finding.get("principal_id") or "").strip()}
+    for pattern in _CROSSING_PRINCIPAL_RES:
+        match = pattern.match(observed.strip())
+        if match:
+            names.add(match.group(1).strip())
+    return tuple(sorted(n for n in names if n))
+
+
+def root_cause_key(finding: dict) -> tuple | None:
+    """The root-cause grouping key (EFF-3), or None for a chain hypothesis.
+
+    Every key starts with the host (scheme://host:port, lower case) and a rule name.
+    The class is root_cause_class: a confirmed record takes the class its mechanism
+    proved, so a wrong-class duplicate (an sqli label on a well-known observation)
+    adds no root cause of its own. Rules, first match wins:
+
+    | Rule          | Classes                                              | Key after host   |
+    |---------------|------------------------------------------------------|------------------|
+    | `dependency`  | known-vulnerable- / recently-published-dependency:*  | component        |
+    | `config`      | csp (framing), cors, missing_headers, cookie_flags,  | class            |
+    |               | verbose_error, server_banner, insecure_transport,    |                  |
+    |               | crypto                                               |                  |
+    | `session`     | jwt, session_fixation / _timeout / _expiry,          | class            |
+    |               | session_after_password_change; an api_security       |                  |
+    |               | proof of a secret in the session token only          |                  |
+    | `injection`   | sqli, nosql, xss, dom_xss, command_injection, ssti,  | endpoint         |
+    |               | path_traversal, xxe, header_injection, open_redirect,| template,        |
+    |               | ssrf, file_upload, deserialization                   | input, class     |
+    | `access`      | idor, bfla                                           | endpoint         |
+    |               |                                                      | template,        |
+    |               |                                                      | principal pair   |
+    | `endpoint`    | everything else                                      | endpoint         |
+    |               |                                                      | template, class  |
+
+    - The endpoint template is engagement.normalize_path (object ids to {id}, no
+      query, no trailing slash) folded to lower case: /Metrics and /metrics are one
+      route on a case-insensitive router. The method is not part of it.
+    - The input is the record's parameter_location:parameter_name; "" (none
+      recorded) groups only with other unattributed records of that class there.
+    - The principal pair is unordered: the record's principal_id and the identity a
+      cross_identity proof names as crossing into that principal's object. A reading
+      B's object and B reading A's are one missing check. A record that names one
+      principal keys on that one; captured_principal_id is not a second principal.
+    - Unlike issue_key, a header policy groups per host and class whatever its value
+      or route, and an unknown input adds no per-record disambiguator.
+    - A class the taxonomy does not read (free text) keeps its label: two different
+      unread labels on one route stay two root causes."""
+    vc = finding.get("vulnerability_class", "") or ""
+    if vc.startswith("potential-attack-chain:"):
+        return None
+    url = finding.get("url", "") or ""
+    host = _host_of(url).lower()
+    if _is_dependency_class(vc):
+        return (host, "dependency", canonicalize(vc) or vc.strip().lower())
+    cls = root_cause_class(finding)
+    if cls in _CONFIG_ROOT_CLASSES:
+        return (host, "config", cls)
+    observed = str(finding.get("proof_observed_result") or finding.get("observed_result") or "")
+    if cls in _SESSION_ROOT_CLASSES or (
+            cls == "api_security" and _TOKEN_CLAIM_MARK in observed
+            and _RESPONSE_FIELD_MARK not in observed):
+        return (host, "session", cls)
+    template = normalize_path(url).lower() if url else ""
+    if cls in _INPUT_BEARING_CLASSES:
+        return (host, "injection", template, _affected_input(finding), cls)
+    if cls in _ACCESS_ROOT_CLASSES:
+        return (host, "access", template, _principal_pair(finding, observed))
+    return (host, "endpoint", template, cls)
+
+
+def root_cause_id_for(key: tuple) -> str:
+    """Deterministic, run-independent id for a root-cause key."""
+    return _short("root-cause", ROOT_CAUSE_VERSION, *key)
+
+
+def count_units(findings: list[dict]) -> dict:
+    """The three counts over the same records, each with its unit (ISSUE_UNITS):
+    occurrences, issues (issue_key groups, before operator merge overrides) and root
+    causes (root_cause_key groups). Chain hypotheses are not counted, as in
+    group_findings_into_issues."""
+    rows = [f for f in findings
+            if not (f.get("vulnerability_class", "") or "").startswith("potential-attack-chain:")]
+    return {"occurrences": len(rows),
+            "issues": len({issue_key(f) for f in rows}),
+            "root_causes": len({root_cause_key(f) for f in rows}),
+            "units": dict(ISSUE_UNITS)}
+
+
+# --------------------------------------------------------------------------- #
 # Export -- reproducible, secret-free
 # --------------------------------------------------------------------------- #
 

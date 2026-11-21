@@ -557,6 +557,9 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
                  f"**{len(chains)} potential attack chain(s)**{_leads_note}{_appendix_note}.")
     lines.append("")
     lines.append(_lifecycle_line(confirmed + tool_reported + unconfirmed + leads_bucket))
+    lines.append("")
+    lines.append(_units_line([raw for raw, _ in individual_pairs],
+                             [raw for raw, f in individual_pairs if f.confirmed and not f.tool_reported]))
     if collapsed_count:
         lines.append("")
         lines.append(f"*{collapsed_count} duplicate finding(s) were collapsed* -- the same class proven or "
@@ -771,6 +774,19 @@ def _lifecycle_line(findings: "list[ReportFinding]") -> str:
                       if by_reason[key])
     return (f"Lifecycle: **{counts['CONFIRMED']} CONFIRMED**, **{counts['SUSPECTED']} SUSPECTED**, "
             f"**{counts['LEAD']} LEAD**" + (f" ({split})" if split else "") + ".")
+
+
+def _units_line(records: list[dict], confirmed: list[dict]) -> str:
+    """The headline's three counts, each with its unit (EFF-3, issues.ISSUE_UNITS):
+    records, issue_key groups and root_cause_key groups, before any section routing
+    or duplicate collapse, plus the root causes a confirmed record shows."""
+    from harness.issues import count_units
+    every, proven = count_units(records), count_units(confirmed)
+    return (f"Counts: **{every['occurrences']} occurrence(s)** (finding records), "
+            f"**{every['issues']} issue(s)** (issue-key groups), "
+            f"**{every['root_causes']} root cause(s)** (root-cause groups); "
+            f"**{proven['root_causes']} root cause(s) with a confirmed record**.")
+
 
 # Oracle-verification badge (precision item #2): VERIFIED means an oracle
 # reproduced it N-of-N with a clean negative control; CANDIDATE means it did not

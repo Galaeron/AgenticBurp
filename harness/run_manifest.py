@@ -151,7 +151,7 @@ class RunManifest:
         instrumentation = result.get("instrumentation") or {}
         if error:
             errors.append({"phase": "job", "error": error})
-        from harness.assessment_health import assessment_health
+        from harness.assessment_health import assessment_health, headline_counts
         health = assessment_health(result.get("coverage"), errors,
                                    stopped_on_confirmation=result.get("stopped_on_confirmation", False))
         self.data.update({"finished_at": time.time(), "completion_status": status,
@@ -164,7 +164,8 @@ class RunManifest:
                           "confirmed_issue_refs": redact(result.get("confirmed_issue_refs", [])),
                           "confirmed_issues_unit": "proof_bound_cases",
                           "issue_accounting": redact(result.get("issue_accounting")),
-                          "confirmed_vulnerabilities": (result.get("issue_accounting") or {}).get("counts", {}).get("vulnerabilities"),
+                          # EFF-3: the per-case groups and their root causes, each beside its unit.
+                          **headline_counts(result.get("issue_accounting")),
                           "worklist_summary": redact(result.get("worklist_summary")),
                           # R01/R07: the auditable executed-vs-inferred coverage
                           # breakdown (coverage_summary.summarize_coverage's

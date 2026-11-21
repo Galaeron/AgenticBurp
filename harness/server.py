@@ -2318,6 +2318,8 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             # Use the persisted, proof-resolved projection of this run and the
             # attempts it resumed. Raw model flags and repeated validator records
             # are not issue counts.
+            from harness.assessment_health import headline_counts
+            from harness.issues import count_units
             attempts = job["attempt_run_ids"]
             rows = _attempt_findings(req.base_url, attempts)
             proven, accounting = _attempt_accounting(attempts, [*rows, *job["result"].get("findings", [])])
@@ -2325,12 +2327,15 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             job["result"]["confirmed_issues"] = len(proven)
             job["result"]["confirmed_issue_refs"] = proven
             job['result']['issue_accounting'] = accounting
-            job['result']['confirmed_vulnerabilities'] = accounting['counts']['vulnerabilities']
+            # EFF-3: the per-case vulnerability groups and their root causes, each
+            # beside its unit; the records' three counts in finding_summary.
+            job['result'].update(headline_counts(accounting))
             job['result']['confirmed_issues_unit'] = 'proof_bound_cases'
             job["result"]["finding_summary"] = {
                 "records": len(rows), "proof_bound_confirmed_cases": len(proven),
                 "unproven_records": sum(not (r.get("confirmed") and r.get("proof_status") == "resolved") for r in rows),
-                "scoreboard_mapping": "not supplied", "issue_counts": accounting['counts']}
+                "scoreboard_mapping": "not supplied", "issue_counts": accounting['counts'],
+                "issue_units": count_units(rows)}
             job["status"] = "done"
             _finish_manifest("done", result=job["result"])
         except asyncio.CancelledError:
@@ -2345,11 +2350,12 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             # r9's last attempt was cancelled and reported no count at all. The
             # accounting is best effort here: it must never hide the cancel.
             try:
+                from harness.assessment_health import headline_counts
                 proven, accounting = _attempt_accounting(attempts, job['result']['findings'])
                 job['result'].update(
                     confirmed_issues=len(proven), confirmed_issue_refs=proven,
                     issue_accounting=accounting, confirmed_issues_unit='proof_bound_cases',
-                    confirmed_vulnerabilities=accounting['counts']['vulnerabilities'])
+                    **headline_counts(accounting))
             except Exception as exc:
                 job['result']['accounting_error'] = type(exc).__name__
                 log.warning("cancelled job %s: issue accounting failed (%s)", job_id, type(exc).__name__)
