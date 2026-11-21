@@ -378,6 +378,27 @@ class ValidationSubmission(BaseModel):
     context_tags: list[str] = Field(default_factory=list)
 
 
+# ARC-4: the statuses an execution plane may report over POST /validation-results.
+# The in-process harness path (orchestrator_confirm) still builds the base
+# ValidationSubmission with its validators' own status words; only the HTTP
+# boundary is closed, so an unknown status from the plane is a 422, never stored.
+PlaneResultStatus = Literal["confirmed", "supported", "rejected", "not_confirmed",
+                            "inconclusive", "invalid", "error"]
+
+
+class PlaneValidationSubmission(ValidationSubmission):
+    """A result from the Burp execution plane. `dispatch_nonce` is the single-use
+    value POST /test-plans/{plan_id}/dispatch issued for this run of the plan."""
+    status: PlaneResultStatus
+    dispatch_nonce: str = Field(default="", max_length=128)
+
+
+class PlanDispatchRequest(BaseModel):
+    """POST /test-plans/{plan_id}/dispatch: the exchange binding the plane holds
+    for the plan, checked against the stored plan before a nonce is issued."""
+    source_exchange_hash: str = Field(default="", max_length=128)
+
+
 class ValidationReport(BaseModel):
     validator: str
     status: str

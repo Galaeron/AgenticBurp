@@ -12,6 +12,7 @@ import burp.api.montoya.http.message.responses.HttpResponse;
 import burp.api.montoya.internal.MontoyaObjectFactory;
 import burp.api.montoya.internal.ObjectFactoryLocator;
 import burp.api.montoya.logging.Logging;
+import com.harness.llm.logic.PlanePolicy;
 import com.harness.llm.model.AnalysisModels.TestPlan;
 import com.harness.llm.model.AnalysisModels.ValidationSubmission;
 
@@ -45,8 +46,32 @@ final class FakeMontoya {
         static Reply of(int status, String body) { return new Reply(status, body, Map.of()); }
     }
 
-    /** One completed execute() call: the single submission, the panel outcome and every request sent. */
-    record Run(ValidationSubmission submission, String outcome, String outcomeDetail, List<HttpRequest> sent) {
+    /** The nonce every fake dispatch issues. */
+    static final String NONCE = "fake-dispatch-nonce-0001";
+
+    /** What the fake harness answers to POST /test-plans/{id}/dispatch (ARC-4). */
+    interface Dispatcher {
+        HarnessClient.PlaneDispatch dispatch(String planId, String sourceExchangeHash) throws HarnessClient.HarnessException;
+    }
+
+    /** A dispatch under the given live policy; a fresh PlanePolicy (and send count) per run. */
+    static Dispatcher policy(boolean activeEnabled, boolean allowMutatingReplay, int requestBudget) {
+        return (planId, hash) -> new HarnessClient.PlaneDispatch(NONCE,
+                new PlanePolicy(activeEnabled, allowMutatingReplay, requestBudget));
+    }
+
+    /** What the fake harness answers to POST /validation-results (ARC-12): accept, or throw a refusal. */
+    interface Submitter {
+        void submit(ValidationSubmission submission) throws HarnessClient.HarnessException;
+    }
+
+    /** Active and mutating replay on, no budget: every arm runs as it did before ARC-4. */
+    static Dispatcher permissive() { return policy(true, true, PlanePolicy.NO_BUDGET); }
+
+    /** One completed execute() call: the single submission (null when none), the panel outcome,
+     * every request sent, and how many submissions there were. */
+    record Run(ValidationSubmission submission, String outcome, String outcomeDetail, List<HttpRequest> sent,
+               int submissions) {
         boolean confirmed() { return submission.confirmed; }
         String status() { return submission.status; }
     }
@@ -184,6 +209,24 @@ final class FakeMontoya {
      */
     static Run execute(String capability, HttpRequest request, Reply capturedReply,
                        Function<HttpRequest, Reply> responder) throws Exception {
+        Run run = executeUnder(permissive(), capability, request, capturedReply, responder);
+        if (run.submissions() != 1) throw new AssertionError("expected one submission, got " + run.submissions());
+        if ("error".equals(run.status())) throw new AssertionError("executor errored: " + run.submission().summary);
+        return run;
+    }
+
+    /**
+     * As execute(), with the harness's dispatch answered by `dispatcher`. Any
+     * outcome is returned, including an error or no submission at all.
+     */
+    static Run executeUnder(Dispatcher dispatcher, String capability, HttpRequest request, Reply capturedReply,
+                            Function<HttpRequest, Reply> responder) throws Exception {
+        return executeUnder(dispatcher, submission -> { }, capability, request, capturedReply, responder);
+    }
+
+    /** As executeUnder(), with the harness's answer to the submission given by `submitter`. */
+    static Run executeUnder(Dispatcher dispatcher, Submitter submitter, String capability, HttpRequest request,
+                            Reply capturedReply, Function<HttpRequest, Reply> responder) throws Exception {
         List<HttpRequest> sent = new CopyOnWriteArrayList<>();
         List<ValidationSubmission> submissions = new CopyOnWriteArrayList<>();
         Http http = proxy(Http.class, (m, a) -> {
@@ -199,7 +242,13 @@ final class FakeMontoya {
             default -> throw new UnsupportedOperationException("MontoyaApi." + m);
         });
         HarnessClient client = new HarnessClient("http://127.0.0.1:8000", 1) {
-            @Override public void submitValidationResult(ValidationSubmission submission) { submissions.add(submission); }
+            @Override public void submitValidationResult(ValidationSubmission submission) throws HarnessException {
+                submissions.add(submission);
+                submitter.submit(submission);
+            }
+            @Override public PlaneDispatch dispatchPlan(String planId, String sourceExchangeHash) throws HarnessException {
+                return dispatcher.dispatch(planId, sourceExchangeHash);
+            }
         };
         ValidationExecutor executor = new ValidationExecutor(api, client);
         HttpRequestResponse source = exchange(request, capturedReply);
@@ -214,9 +263,7 @@ final class FakeMontoya {
         String[] outcome = new String[2];
         executor.execute(plan, (status, detail) -> { outcome[0] = status; outcome[1] = detail; done.countDown(); });
         if (!done.await(30, TimeUnit.SECONDS)) throw new AssertionError("executor did not complete within 30s");
-        if (submissions.size() != 1) throw new AssertionError("expected one submission, got " + submissions.size());
-        ValidationSubmission submission = submissions.get(0);
-        if ("error".equals(submission.status)) throw new AssertionError("executor errored: " + submission.summary);
-        return new Run(submission, outcome[0], outcome[1], new ArrayList<>(sent));
+        ValidationSubmission submission = submissions.isEmpty() ? null : submissions.get(0);
+        return new Run(submission, outcome[0], outcome[1], new ArrayList<>(sent), submissions.size());
     }
 }

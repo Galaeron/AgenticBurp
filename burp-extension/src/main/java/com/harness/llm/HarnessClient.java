@@ -36,7 +36,10 @@ public class HarnessClient {
         public HarnessException(String message) { super(message); }
         public HarnessException(String message, Throwable cause) { super(message, cause); }
         private String failureKind = "unspecified";
+        private String refusalReason;
         public String getFailureKind() { return failureKind; }
+        /** ARC-12: the harness's refusal code for a dispatch or result it refused, or null. */
+        public String getRefusalReason() { return refusalReason; }
         private HarnessException(String kind, String message) { super(message); failureKind = kind; }
     }
 
@@ -149,7 +152,7 @@ public class HarnessClient {
         return new HarnessException(kind, message);
     }
 
-    private static HarnessException httpFailure(int status) {
+    static HarnessException httpFailure(int status) {
         String kind = status == 401 ? "authentication" : status == 429 ? "throttled"
                 : status >= 500 ? "server_error" : "http_error";
         String instruction = status == 401 ? " Enter the credential for this service and reconnect; an ephemeral credential changes after restart."
@@ -368,8 +371,120 @@ public class HarnessClient {
                 .build();
         HttpResponse<String> resp = sendBounded(req);
         requireAuthenticatedResponse(resp);
-        if (resp.statusCode() != 200) throw httpFailure(resp.statusCode());
+        if (resp.statusCode() != 200) throw planeFailure(resp, "result");
         responseObject(resp.body());
+    }
+
+    /**
+     * ARC-12: the refusal codes the harness returns from the plan dispatch and
+     * result routes, with what each means to the analyst. Only a listed code
+     * is surfaced; any other body is withheld like every upstream detail.
+     */
+    static final java.util.Map<String, String> PLANE_REFUSALS = java.util.Map.ofEntries(
+            java.util.Map.entry("unknown_plan", "the harness has no such plan"),
+            java.util.Map.entry("not_dispatched", "the plan was not dispatched to Burp"),
+            java.util.Map.entry("dispatch_nonce_required", "the result carried no dispatch nonce"),
+            java.util.Map.entry("dispatch_nonce_mismatch", "a newer dispatch of this plan superseded this run"),
+            java.util.Map.entry("duplicate_submission", "this run's result was already recorded"),
+            java.util.Map.entry("plan_terminal", "the plan already holds a verdict"),
+            java.util.Map.entry("wrong_execution_plane", "the plan does not run on the Burp plane"),
+            java.util.Map.entry("binding_mismatch", "the source request does not match the plan"),
+            java.util.Map.entry("executor_mismatch", "the executor does not match the plan's capability"),
+            java.util.Map.entry("capability_cannot_confirm", "this capability may record evidence but not a confirmation"),
+            java.util.Map.entry("confirmed_status_invalid", "a confirmed result must have status confirmed"));
+
+    /** The failure for a non-200 reply from a plane route: its refusal code when the body names a known one. */
+    static HarnessException planeFailure(HttpResponse<String> resp, String what) {
+        int status = resp.statusCode();
+        String reason = null;
+        if (status == 404 || status == 409 || status == 422) {
+            try {
+                var detail = responseObject(resp.body()).get("detail");
+                var code = detail != null && detail.isJsonObject() ? detail.getAsJsonObject().get("reason") : null;
+                if (code != null && code.isJsonPrimitive() && code.getAsJsonPrimitive().isString()
+                        && PLANE_REFUSALS.containsKey(code.getAsString())) {
+                    reason = code.getAsString();
+                }
+            } catch (HarnessException unreadable) {
+                reason = null;
+            }
+        }
+        return reason == null ? httpFailure(status) : refused(what, reason, status);
+    }
+
+    /** A refusal of `what` ("dispatch" or "result") the harness named with a known code. */
+    static HarnessException refused(String what, String reason, int status) {
+        if (!PLANE_REFUSALS.containsKey(reason)) throw new IllegalArgumentException("unknown refusal code");
+        HarnessException refused = failed("refused", "Harness refused the " + what + ": " + reason
+                + " (" + PLANE_REFUSALS.get(reason) + "; HTTP " + status + ").");
+        refused.refusalReason = reason;
+        return refused;
+    }
+
+    /** ARC-4: one dispatch of a plan to this plane -- its nonce and live policy. */
+    public static final class PlaneDispatch {
+        public final String nonce;
+        public final com.harness.llm.logic.PlanePolicy policy;
+        public PlaneDispatch(String nonce, com.harness.llm.logic.PlanePolicy policy) {
+            this.nonce = nonce;
+            this.policy = policy;
+        }
+    }
+
+    private static final java.util.regex.Pattern DISPATCH_NONCE = java.util.regex.Pattern.compile("[A-Za-z0-9_-]{16,128}");
+
+    /**
+     * ARC-4: POST /test-plans/{plan_id}/dispatch before a plan runs. Returns the
+     * single-use nonce the result must carry and the live policy to run it
+     * under. Fails closed: a reply without a usable nonce is an error, a
+     * missing or non-boolean policy flag reads as off, and a missing or
+     * malformed request_budget as zero sends; only an explicit null budget
+     * means no ceiling (as runs.max_requests unset does on the harness).
+     */
+    public PlaneDispatch dispatchPlan(String planId, String sourceExchangeHash) throws HarnessException {
+        if (planId == null || planId.isBlank()) throw failed("invalid_request", "No plan id to dispatch.");
+        String path = "/test-plans/" + URLEncoder.encode(planId, StandardCharsets.UTF_8).replace("+", "%20") + "/dispatch";
+        HttpRequest req = newRequestBuilder(path, shortTimeout())
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(java.util.Map.of("source_exchange_hash",
+                        sourceExchangeHash == null ? "" : sourceExchangeHash))))
+                .build();
+        HttpResponse<String> resp = sendBounded(req);
+        requireAuthenticatedResponse(resp);
+        if (resp.statusCode() != 200) {
+            HarnessException failure = planeFailure(resp, "dispatch");
+            if (resp.statusCode() == 404 && failure.getRefusalReason() == null) {
+                // No route at all: a harness from before the dispatch protocol (ARC-4).
+                failure = failed("http_error", failure.getMessage()
+                        + " The harness may predate plan dispatch; update it to match this extension.");
+            }
+            throw failure;
+        }
+        return parseDispatch(responseObject(resp.body()));
+    }
+
+    static PlaneDispatch parseDispatch(com.google.gson.JsonObject reply) throws HarnessException {
+        var nonce = reply.get("dispatch_nonce");
+        if (nonce == null || !nonce.isJsonPrimitive() || !nonce.getAsJsonPrimitive().isString()
+                || !DISPATCH_NONCE.matcher(nonce.getAsString()).matches()) {
+            throw failed("malformed", "Harness dispatch carried no usable nonce; nothing was sent.");
+        }
+        var policyEl = reply.get("policy");
+        var policy = policyEl != null && policyEl.isJsonObject() ? policyEl.getAsJsonObject() : new com.google.gson.JsonObject();
+        int budget = 0;
+        var budgetEl = reply.get("request_budget");
+        if (budgetEl != null && budgetEl.isJsonNull()) {
+            budget = com.harness.llm.logic.PlanePolicy.NO_BUDGET;
+        } else if (budgetEl != null && budgetEl.isJsonPrimitive() && budgetEl.getAsJsonPrimitive().isNumber()) {
+            try {
+                long value = budgetEl.getAsBigDecimal().longValueExact();
+                budget = value < 0 ? 0 : (int) Math.min(value, Integer.MAX_VALUE);
+            } catch (ArithmeticException fractional) {
+                budget = 0;
+            }
+        }
+        return new PlaneDispatch(nonce.getAsString(), new com.harness.llm.logic.PlanePolicy(
+                trueField(policy, "active_enabled"), trueField(policy, "allow_mutating_replay"), budget));
     }
 
     public synchronized void setBearerToken(String token) {
