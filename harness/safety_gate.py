@@ -38,9 +38,11 @@ things MORE restrictive than these ceilings, never less.
 """
 
 from __future__ import annotations
+import collections
 import contextvars
 import logging
 import re
+import threading
 import time
 import urllib.parse
 from contextlib import contextmanager
@@ -603,3 +605,42 @@ def reset_default_gate() -> None:
     don't leak state into each other."""
     global _default_gate
     _default_gate = None
+
+
+def ambient_gate() -> "SafetyGate | None":
+    """ARC-11: the gate an enclosing invocation installed (push_gate/gate_scope), or
+    None. Unlike get_default_gate() it never falls back to the process-wide gate."""
+    return _gate_ctx.get()
+
+
+# ARC-11: validators.active_enabled as last set, and every change to it (the
+# /settings toggle, a registry rebuilt from config), so a run manifest records the
+# value a run started under and any flip made while it was live.
+_ACTIVE_ENABLED_MAX_CHANGES = 200
+_active_enabled_lock = threading.Lock()
+_active_enabled_state: dict = {"active_enabled": None, "set_by": None, "at": None}
+_active_enabled_changes: collections.deque = collections.deque(maxlen=_ACTIVE_ENABLED_MAX_CHANGES)
+
+
+def record_active_enabled(value: bool, *, source: str) -> None:
+    """Note validators.active_enabled = `value`, set by `source`; a change from the
+    previous value is logged with its time."""
+    value, now = bool(value), time.time()
+    with _active_enabled_lock:
+        previous = _active_enabled_state["active_enabled"]
+        _active_enabled_state.update(active_enabled=value, set_by=source, at=now)
+        if previous is not None and previous != value:
+            _active_enabled_changes.append({"at": now, "source": source,
+                                            "active_enabled": value, "previous": previous})
+
+
+def active_enabled_state() -> dict:
+    """The live active_enabled value and who set it last."""
+    with _active_enabled_lock:
+        return dict(_active_enabled_state)
+
+
+def active_enabled_changes(since: float | None = None) -> list[dict]:
+    """Logged active_enabled changes (oldest first), those at or after `since`."""
+    with _active_enabled_lock:
+        return [dict(e) for e in _active_enabled_changes if since is None or e["at"] >= since]

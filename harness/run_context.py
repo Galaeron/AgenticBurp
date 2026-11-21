@@ -66,6 +66,36 @@ _REDIRECT_TO_GET = frozenset({301, 302, 303})
 # narrower rule, kept only as a deprecated alias for tests that import it; nothing in
 # this module consults it.
 _CREDENTIAL_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization"})
+# ARC-6: request headers the HTTP client derives from the request itself. Host comes
+# from the URL; the hop-by-hop set (RFC 9110 7.6.1, plus every Proxy-* name) and the
+# framing pair are computed for the bytes actually sent. A caller-supplied copy is
+# dropped here (a replayed exchange's `Connection: keep-alive` loses nothing) and
+# refused outright when a model proposes one (iterative_agent). Names match
+# case-insensitively after surrounding whitespace is stripped.
+_HOP_BY_HOP_HEADERS = frozenset({"connection", "keep-alive", "te", "trailer", "trailers",
+                                 "upgrade"})
+_FRAMING_HEADERS = frozenset({"content-length", "transfer-encoding"})
+TRANSPORT_CONTROLLED_HEADERS = frozenset({"host"}) | _HOP_BY_HOP_HEADERS | _FRAMING_HEADERS
+
+
+def is_transport_controlled_header(name) -> bool:
+    """True for a header name only the transport may set (ARC-6)."""
+    n = str(name or "").strip().lower()
+    return n in TRANSPORT_CONTROLLED_HEADERS or n.startswith("proxy-")
+
+
+def _drop_transport_controlled(headers: dict, *, allow_framing: bool) -> dict:
+    """`headers` without the transport-controlled names. `allow_framing` (one call's
+    explicit opt-in, see TargetTransport.send) keeps the framing and connection
+    headers a desync probe must send as written; Host and Proxy-* go regardless."""
+    kept = {}
+    for k, v in headers.items():
+        n = str(k or "").strip().lower()
+        if allow_framing and n in (_HOP_BY_HOP_HEADERS | _FRAMING_HEADERS):
+            kept[k] = v
+        elif not is_transport_controlled_header(n):
+            kept[k] = v
+    return kept
 # Interval clock for session rechecks and route-circuit cooldowns (a name, so tests
 # can advance it without sleeping).
 _clock = time.monotonic
@@ -686,15 +716,18 @@ class TargetTransport:
                    session_ref: str | None = None, headers: dict | None = None,
                    body: str | None = None, case_ref: str = "",
                    max_redirects: int = 5,
-                   allow_cancelled_cleanup: bool = False) -> "ExecutionOutcome":
+                   allow_cancelled_cleanup: bool = False,
+                   allow_framing_headers: bool = False) -> "ExecutionOutcome":
         """Convenience wrapper over execute() for a single (method, url) send, so a
         raw `httpx` call site can migrate to the transport in one line. Pass
-        max_redirects=0 to match a raw client's follow_redirects=False."""
+        max_redirects=0 to match a raw client's follow_redirects=False.
+        `allow_framing_headers` is execute()'s per-call opt-in (ARC-6)."""
         return await self.execute(
             TypedRequest(method=(method or "GET").upper(), url=url,
                          headers=dict(headers or {}), body=body),
             capability=capability, session_ref=session_ref, case_ref=case_ref,
-            max_redirects=max_redirects, allow_cancelled_cleanup=allow_cancelled_cleanup)
+            max_redirects=max_redirects, allow_cancelled_cleanup=allow_cancelled_cleanup,
+            allow_framing_headers=allow_framing_headers)
 
     async def send_creds(self, method: str, url: str, *, capability: str,
                          headers: dict | None = None, body: str | None = None,
@@ -825,14 +858,22 @@ class TargetTransport:
     async def execute(self, request: TypedRequest, *, capability: str,
                       session_ref: str | None = None, case_ref: str = "",
                       max_redirects: int = 5,
-                      allow_cancelled_cleanup: bool = False) -> ExecutionOutcome:
+                      allow_cancelled_cleanup: bool = False,
+                      allow_framing_headers: bool = False) -> ExecutionOutcome:
         """Send one request through scope + gate + budget, following redirects
         MANUALLY so every hop is re-checked. Captures an artifact on every path,
         including blocks and errors. HU-5: every outcome is then offered to the
-        run's change log and handoff (bookkeeping only; it sends nothing)."""
+        run's change log and handoff (bookkeeping only; it sends nothing).
+
+        ARC-6: Host, hop-by-hop, Proxy-* and framing headers are dropped from what
+        is sent. `allow_framing_headers=True` is a per-call opt-in, for a validator
+        that must write Content-Length / Transfer-Encoding / Connection itself (the
+        request-smuggling probe); it never admits Host or Proxy-*. send_creds() --
+        the model-driven agent's path -- does not take it."""
         outcome = await self._execute(request, capability=capability, session_ref=session_ref,
                                       case_ref=case_ref, max_redirects=max_redirects,
-                                      allow_cancelled_cleanup=allow_cancelled_cleanup)
+                                      allow_cancelled_cleanup=allow_cancelled_cleanup,
+                                      allow_framing_headers=allow_framing_headers)
         from harness import run_handoff
         run_handoff.observe_execution(self.ctx, request, outcome, capability=capability,
                                       case_ref=current_case_ref() or case_ref)
@@ -841,7 +882,8 @@ class TargetTransport:
     async def _execute(self, request: TypedRequest, *, capability: str,
                        session_ref: str | None = None, case_ref: str = "",
                        max_redirects: int = 5,
-                       allow_cancelled_cleanup: bool = False) -> ExecutionOutcome:
+                       allow_cancelled_cleanup: bool = False,
+                       allow_framing_headers: bool = False) -> ExecutionOutcome:
         ctx = self.ctx
         # R16 accounting and the record's finding_ref: the caller's own case_ref,
         # never ambient. The record's case: the enclosing case_scope, if any.
@@ -958,6 +1000,8 @@ class TargetTransport:
             if session and credential_destination:
                 for k, v in session.headers.items():
                     send_headers.setdefault(k, v)
+            send_headers = _drop_transport_controlled(send_headers,
+                                                      allow_framing=allow_framing_headers)
             use_http2 = bool((ctx.config.get("transport", {}) or {}).get("http2", False))
             client = (session.client(ctx.timeout, http2=use_http2,
                                      trust_policy=ctx.tls_policy, destination=url,

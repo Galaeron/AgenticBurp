@@ -127,7 +127,7 @@ class _RecordingAgent:
 
     def __init__(self, ollama, model, allowed_hosts, *, max_steps=250, run_context=None,
                  experiment_handoff=None, experiment_catalog=None, model_error_retries=1,
-                 deadline=None):
+                 deadline=None, history_window=None):
         type(self).last_run_context = run_context
         type(self).last_experiment_handoff = experiment_handoff
         type(self).last_model_error_retries = model_error_retries

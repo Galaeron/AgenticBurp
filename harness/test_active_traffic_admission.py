@@ -399,9 +399,15 @@ class ActiveProbeEmptyScopeTests(_AdmissionFixture):
         return self.client.post("/active-probe", json={
             "exchange": self.exchange(), "hypothesis": "idor on report id", "specialty": "idor"})
 
-    def _layers(self, *, route=True, orchestrator=True, active_default=True):
+    def _layers(self, *, route=True, orchestrator=True, active_default=True, probe_gate=True):
         from harness import orchestrator_confirm
         patches = []
+        if not probe_gate:
+            # ARC-11: the pre-fix gate -- the process-wide default, seeded from
+            # server.allowed_hosts at startup -- instead of the probe's own gate,
+            # which is scoped to the orchestrator's (here empty) hosts.
+            patches.append(patch.object(orchestrator_confirm.ConfirmMixin, "_standalone_probe_gate",
+                                        lambda self: safety_gate.get_default_gate()))
         if not route:
             patches.append(patch.object(self.server, "_require_active_scope", lambda *a, **k: None))
         if not orchestrator:
@@ -452,8 +458,20 @@ class ActiveProbeEmptyScopeTests(_AdmissionFixture):
         self.assertIn("out of scope", reason)
         self.assertEqual(self.site.requests, [])
 
-    def test_negative_control_old_default_sends_to_the_unscoped_host(self):
+    def test_per_call_probe_gate_alone_blocks_the_send(self):
+        """ARC-11: the standalone probe's own gate is scoped to the orchestrator's
+        hosts, so with every other layer off the empty scope still sends nothing."""
         response = self._run(route=False, orchestrator=False, active_default=False)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.agent_sends), 1)
+        status, reason = self.agent_sends[0]
+        self.assertIsNone(status)
+        self.assertIn("out of scope", reason)
+        self.assertEqual(self.site.requests, [])
+
+    def test_negative_control_old_default_sends_to_the_unscoped_host(self):
+        response = self._run(route=False, orchestrator=False, active_default=False,
+                             probe_gate=False)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.agent_sends[0][0], 200)
         self.assertIn("/api/report", self.site.paths())

@@ -565,9 +565,12 @@ class HttpRequestSmugglingValidator(Validator):
         try:
             if self.run_context is not None:
                 from harness.run_context import TypedRequest
+                # ARC-6: the probe writes CL/TE/Connection on purpose; the
+                # transport drops them for every caller that has not opted in.
                 outcome = await self.run_context.executor().execute(
                     TypedRequest(method, url, headers=headers, body=body or None),
-                    capability=self.get_name(), max_redirects=self.max_redirects)
+                    capability=self.get_name(), max_redirects=self.max_redirects,
+                    allow_framing_headers=True)
                 if not outcome.ok:
                     if failures is not None:
                         failures.outcome(SendFailures.label(method, url), outcome)

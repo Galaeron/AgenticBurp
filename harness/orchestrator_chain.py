@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import threading
 import time
 import uuid
 
@@ -654,52 +655,79 @@ class ChainMixin:
         if not fresh:
             return
 
-        # Guard 3: per-host session cap.
-        if self._escalation_counts.get(host, 0) >= self.engagement_max_escalations:
+        # Guard 3: per-host session cap. ARC-11: the slot is RESERVED here, before
+        # the first await, so concurrent escalations of one host cannot all pass
+        # the check and then all count; it is given back if no crawl lands.
+        if not self._reserve_escalation(host):
             log.info("engagement auto-escalate: per-host cap (%d) reached for %s -- skipping",
                      self.engagement_max_escalations, host)
             return
-
-        # Guard 2: verify each credential actually grants access before crawling.
-        verified: list = []
-        for cap in fresh:
-            if await self._credential_grants_access(source_url, cap.get("headers", {}),
-                                                    run_context=run_context):
-                verified.append(cap)
-            else:
-                log.info("engagement auto-escalate: learned credential did not verify -- discarding")
-        if not verified:
-            return
-
-        roles = [role_crawl.RoleSession(role="anonymous", headers={})]
-        for cap in verified:
-            roles.append(role_crawl.RoleSession(role="derived", headers=cap.get("headers", {})))
-        session_refs = None
-        if run_context is not None:
-            from harness.run_context import ScopePolicy
-            session_refs = []
-            for index, role in enumerate(roles):
-                ref = f"auto-escalate:{index}:{role.principal_id()}"
-                run_context.sessions.register(
-                    ref, role.principal_id(), dict(role.headers or {}),
-                    allowed_origins=[ScopePolicy.origin_of(origin)], role=role.role)
-                session_refs.append(ref)
+        landed = False
         try:
-            result = await role_crawl.crawl_roles(
-                origin, roles, allowed_hosts=self.allowed_hosts, max_pages=20, max_endpoints=80,
-                run_context=run_context, session_refs=session_refs)
-            st.ingest_role_crawl(result.to_dict())
+            # Guard 2: verify each credential actually grants access before crawling.
+            verified: list = []
+            for cap in fresh:
+                if await self._credential_grants_access(source_url, cap.get("headers", {}),
+                                                        run_context=run_context):
+                    verified.append(cap)
+                else:
+                    log.info("engagement auto-escalate: learned credential did not verify -- discarding")
+            if not verified:
+                return
+
+            roles = [role_crawl.RoleSession(role="anonymous", headers={})]
             for cap in verified:
-                st.resolve_action("recrawl_as_derived",
-                                  f"derived:{cap.get('kind', 'cred')}@{engagement.normalize_path(source_url)}")
-            self._escalation_counts[host] = self._escalation_counts.get(host, 0) + 1
-            log.info("engagement auto-escalate: re-crawled %s as derived identity, +%d endpoints (host total %d)",
-                     origin, len(result.endpoints), self._escalation_counts[host])
-        except Exception as e:
-            log.warning("engagement auto-escalate failed: %s", e)
+                roles.append(role_crawl.RoleSession(role="derived", headers=cap.get("headers", {})))
+            session_refs = None
+            if run_context is not None:
+                from harness.run_context import ScopePolicy
+                session_refs = []
+                for index, role in enumerate(roles):
+                    ref = f"auto-escalate:{index}:{role.principal_id()}"
+                    run_context.sessions.register(
+                        ref, role.principal_id(), dict(role.headers or {}),
+                        allowed_origins=[ScopePolicy.origin_of(origin)], role=role.role)
+                    session_refs.append(ref)
+            try:
+                result = await role_crawl.crawl_roles(
+                    origin, roles, allowed_hosts=self.allowed_hosts, max_pages=20, max_endpoints=80,
+                    run_context=run_context, session_refs=session_refs)
+                st.ingest_role_crawl(result.to_dict())
+                for cap in verified:
+                    st.resolve_action("recrawl_as_derived",
+                                      f"derived:{cap.get('kind', 'cred')}@{engagement.normalize_path(source_url)}")
+                landed = True   # the reserved slot is kept
+                log.info("engagement auto-escalate: re-crawled %s as derived identity, +%d endpoints (host total %d)",
+                         origin, len(result.endpoints), self._escalation_counts.get(host, 0))
+            except Exception as e:
+                log.warning("engagement auto-escalate failed: %s", e)
+            finally:
+                for ref in session_refs or ():
+                    await run_context.sessions.unregister(ref)
         finally:
-            for ref in session_refs or ():
-                await run_context.sessions.unregister(ref)
+            if not landed:   # unverified, failed or cancelled: the slot goes back
+                self._release_escalation(host)
+
+    def _escalation_lock(self) -> threading.Lock:
+        # On the instance, not the counts dict (tests replace that dict).
+        return self.__dict__.setdefault("_escalation_counts_lock", threading.Lock())
+
+    def _reserve_escalation(self, host: str) -> bool:
+        """ARC-11: take one of `host`'s auto-escalation slots, or False when the
+        cap (engagement_max_escalations) is reached. Check and count are one step."""
+        with self._escalation_lock():
+            used = self._escalation_counts.get(host, 0)
+            if used >= self.engagement_max_escalations:
+                return False
+            self._escalation_counts[host] = used + 1
+            return True
+
+    def _release_escalation(self, host: str) -> None:
+        """ARC-11: give back a reserved slot whose escalation crawled nothing."""
+        with self._escalation_lock():
+            used = self._escalation_counts.get(host, 0)
+            if used > 0:
+                self._escalation_counts[host] = used - 1
 
     async def _credential_grants_access(self, url: str, headers: dict, *,
                                         run_context=None) -> bool:
