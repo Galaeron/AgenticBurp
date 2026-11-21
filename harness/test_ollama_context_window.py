@@ -84,16 +84,25 @@ def _install(testcase, fake: FakeOllama) -> None:
 
 class _FreshBreaker:
     """A fresh shared breaker registry per test, so a test's failures cannot open
-    the breaker another test (or this one's assertion) reads."""
+    the breaker another test (or this one's assertion) reads. Also a fresh
+    rate-limiter registry: every OllamaClient shares the process-wide "ollama"
+    token limiter (a 10-call burst, then about one call per 6 s), so calls made
+    by earlier tests would otherwise pace this test's calls past
+    run_context_preflight's 5 s timeout, which cancels the engagement's call."""
 
     def setUp(self):
         import harness.circuit_breaker as cb_module
+        import harness.rate_limiter as rl_module
         self._original_registry = cb_module._registry
+        self._original_limiters = rl_module._registry
         cb_module._registry = None
+        rl_module._registry = None
 
     def tearDown(self):
         import harness.circuit_breaker as cb_module
+        import harness.rate_limiter as rl_module
         cb_module._registry = self._original_registry
+        rl_module._registry = self._original_limiters
 
 
 class ContextOverflowRuleTests(unittest.TestCase):
