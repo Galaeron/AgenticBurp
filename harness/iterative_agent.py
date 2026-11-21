@@ -46,7 +46,9 @@ from harness.models import Finding, HttpExchange, request_body_is_placeholder, s
 from harness.ollama_client import OllamaInvalidJSONError, OllamaTransientError
 from harness.safety_gate import get_default_gate
 from harness.security import SECRET_HEADER_NAMES  # the one classifier behind redact_headers
+from harness.security import is_identity_credential_header
 from harness.run_context import transport_for  # W-16: the single TargetTransport
+from harness.run_context import is_transport_controlled_header  # ARC-6
 # Reuse the exact, tested mutation helpers the sqlmap validator already uses --
 # same bounded "change one param value on the captured request" envelope.
 from harness.validators.sqlmap import (
@@ -132,6 +134,31 @@ def _excerpt(text: object, limit: int = _VALUE_EXCERPT_CHARS) -> str:
     """One-line, whitespace-collapsed excerpt of at most `limit` characters."""
     flat = re.sub(r"\s+", " ", str(text)).strip()
     return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
+# ARC-6: a header name is an RFC 9110 token. Anything else (a colon, a space, a
+# line break) could carry a second header past the deny rules below, so it is
+# refused rather than sent.
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+
+
+def _set_header_denial(name: str, value: str) -> str | None:
+    """Why a model's set_header must not be sent (ARC-6), or None. `name` is
+    already stripped. The transport owns Host, the hop-by-hop and Proxy-* names
+    and the framing pair; credentials that say who is calling (Authorization,
+    Cookie, X-API-Key ...) come only from the run's sessions. A request-binding
+    token (X-CSRF-Token, Idempotency-Key) stays a knob the model may turn."""
+    if not _HEADER_NAME_RE.match(name):
+        return f"set_header name {_excerpt(name, 40)!r} is not a valid header name"
+    if any(c in value for c in "\r\n\x00"):
+        return "set_header value must not contain CR, LF or NUL"
+    if is_transport_controlled_header(name):
+        return (f"set_header {name!r} refused: Host, hop-by-hop, Proxy-* and framing "
+                "headers are set by the transport")
+    if is_identity_credential_header(name):
+        return (f"set_header {name!r} refused: credential headers come only from the "
+                "run's sessions, never from an action")
+    return None
 
 
 def _header_value_view(name: object, value: object) -> str:
@@ -486,7 +513,9 @@ Each turn, respond with ONLY a JSON object choosing exactly one action:
         missing keys are created. In a JSON body (body or json) `value` may be any JSON value
         (-1, true, null, {{...}}, [...]) and keeps its type; query, path and form values are strings.
   {{"action":"set_header","name":"<header>","value":"<value>","thought":"<one line>"}}
-     -- resend with a request header set/overridden.
+     -- resend with a request header set/overridden. Host, Content-Length, Transfer-Encoding,
+        Connection and other hop-by-hop or Proxy-* headers, and credentials (Authorization,
+        Cookie, API keys) are refused: the harness sets those.
   {{"action":"reset","thought":"<one line>"}}
      -- go back to the captured request (sends nothing). Edits otherwise ACCUMULATE: each mutate or
         set_header applies to the request your earlier steps built. Add "reset":true to a mutate or
@@ -567,6 +596,12 @@ class IterativeAgent:
             name, value = action.get("name"), action.get("value")
             if not isinstance(name, str) or not isinstance(value, str):
                 return None, "set_header requires string name/value"
+            name = name.strip()
+            denial = _set_header_denial(name, value)
+            if denial:
+                return None, denial
+            for existing in [k for k in headers if str(k).strip().lower() == name.lower()]:
+                del headers[existing]   # one header per name, whatever its case
             headers[name] = value
             return (method, url, headers, body), None
 
@@ -813,8 +848,10 @@ class IterativeAgent:
                     on_step(step_obj)
                 except Exception as e:  # a broken UI callback must never kill the run
                     log.debug("on_step callback raised: %s", e)
+        # ARC-6: the captured request's Host, hop-by-hop, Proxy-* and framing
+        # headers belong to the transport (which drops them anyway).
         captured_headers = {k: v for k, v in (exchange.request_headers or {}).items()
-                            if k.lower() not in ("host", "content-length")}
+                            if not is_transport_controlled_header(k)}
         captured_headers.setdefault("User-Agent", "harness-iterative-agent/1.0")
         captured_request = (exchange.url, exchange.request_body or "")
         # Every edit persists: each step applies to the request the earlier steps
@@ -1000,13 +1037,14 @@ class IterativeAgent:
 
             self._last_response_headers = {}
             status, text = await self._execute(method, url, headers, body)
-            changed = {action["name"]: action["value"]} if kind == "set_header" else {}
+            hdr_name = str(action.get("name") or "").strip()
+            changed = {hdr_name: action["value"]} if kind == "set_header" else {}
             rec = AttemptRecord(
                 step=step, kind="set_header" if kind == "set_header" else "mutate", method=method,
                 target=_normalized_target(url, body, changed),
                 location="header" if kind == "set_header" else str(action.get("location")),
-                name=str(action.get("name") if kind == "set_header" else action.get("param")),
-                value=(_header_value_view(action.get("name"), action.get("value"))
+                name=hdr_name if kind == "set_header" else str(action.get("param")),
+                value=(_header_value_view(hdr_name, action.get("value"))
                        if kind == "set_header" else _excerpt(_value_text(action.get("value")))),
                 outcome=(f"HTTP {status}, {len(text)} bytes" if status is not None else text),
                 key=key)
