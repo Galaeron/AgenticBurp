@@ -53,8 +53,18 @@ class Wire:
     def __init__(self, *steps):
         self.steps = list(steps)
         self.calls = 0
+        self.preflight = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        # TOK-4: the context-window preflight (GET /api/ps, POST /api/show) is not a
+        # model call. It is answered as "not loaded, size unknown" and consumes no
+        # step, so each scripted step still answers the chat call it was written for.
+        if request.url.path == "/api/ps":
+            self.preflight += 1
+            return httpx.Response(200, json={"models": []})
+        if request.url.path == "/api/show":
+            self.preflight += 1
+            return httpx.Response(404, json={"error": "model not found"})
         step = self.steps[min(self.calls, len(self.steps) - 1)]
         self.calls += 1
         if callable(step):
