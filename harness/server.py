@@ -703,7 +703,9 @@ def _plane_policy() -> tuple[dict, int | None]:
     (runs.max_requests; None = no ceiling, as for RunContext)."""
     from harness.config_schema import parse_validators_flags
     flags = parse_validators_flags(_live_validators_gate_config())
-    budget = (orchestrator.config.get("runs", {}) or {}).get("max_requests")
+    runs = orchestrator.config.get("runs", {})
+    runs = {} if runs is None else runs
+    budget = runs.get("max_requests") if isinstance(runs, dict) else 0
     if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget < 0):
         budget = 0  # a malformed ceiling refuses every send rather than lifting the limit
     return ({"active_enabled": bool(flags["active_enabled"]),

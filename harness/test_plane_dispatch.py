@@ -100,6 +100,13 @@ class PlaneDispatchRouteTests(unittest.TestCase):
         self.assertEqual(body["policy"], {"active_enabled": True, "allow_mutating_replay": True})
         self.assertIsNone(body["request_budget"])
 
+    def test_a_malformed_ceiling_fails_closed(self):
+        for runs in ([], "100", {"max_requests": "100"}, {"max_requests": True}, {"max_requests": -1}):
+            self.server.orchestrator.config = {"runs": runs}
+            reply = self._dispatch()
+            self.assertEqual(reply.status_code, 200, f"{runs!r}: {reply.text}")
+            self.assertEqual(reply.json()["request_budget"], 0, repr(runs))
+
     def test_a_quoted_flag_is_parsed_strictly(self):
         self.registry.active_enabled = True
         self.server.config["validators"] = {"allow_mutating_replay": "false"}

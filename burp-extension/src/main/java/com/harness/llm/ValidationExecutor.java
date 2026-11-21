@@ -74,6 +74,8 @@ public final class ValidationExecutor {
     // the plans in flight, so one plan never runs twice at once.
     private final Map<String, HarnessClient.PlaneDispatch> dispatches = new ConcurrentHashMap<>();
     private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
+    // The plans whose running dispatch has already submitted a result.
+    private final Set<String> submitted = ConcurrentHashMap.newKeySet();
 
     public ValidationExecutor(MontoyaApi api, HarnessClient client) {
         this.api = api;
@@ -148,12 +150,18 @@ public final class ValidationExecutor {
                         case "websocket_cswsh_validation" -> websocketCswsh(plan, source);
                         default -> submit(plan, source, "inconclusive", 0, false, "No typed executor exists for capability '"+plan.capability+"'.", "");
                     }
+                    // An arm that swallowed a refused send and returned without
+                    // a result: the refusal is still reported (submit() words it).
+                    if (dispatch.policy.refusal() != null && !submitted.contains(plan.id)) {
+                        submit(plan, source, "error", 0, false, "", "");
+                    }
                 } catch (Exception e) {
                     Outcome o=new Outcome(); o.status="error"; o.detail="Validation failed: "+e.getMessage();
                     outcomes.put(plan.id, o);
                     submit(plan, source, o.status, 0, false, o.detail, "");
                 } finally {
                     dispatches.remove(plan.id);
+                    submitted.remove(plan.id);
                 }
                 return null;
             }
@@ -1890,6 +1898,7 @@ public final class ValidationExecutor {
 
     private void submit(TestPlan p,HttpRequestResponse source,String status,double confidence,boolean confirmed,String summary,String evidence){
         HarnessClient.PlaneDispatch dispatch = dispatches.get(p.id);
+        submitted.add(p.id);
         String refusal = dispatch == null ? null : dispatch.policy.refusal();
         if (refusal != null) {
             // ARC-4: once the policy refused a send, the run has no verdict --
