@@ -282,6 +282,10 @@ iterative_agent:
   # probe's diagnostics as model_error_retries and breaker_waits. 0 turns the
   # in-step retry off; capped at 3.
   model_error_retries: 1
+  # TOK-3: steps the prompt's history shows as their own lines; earlier steps
+  # are folded into a compact summary table (at most 12 rows), so the prompt
+  # stops growing once the window is full. At least 1.
+  history_window: 8
 
 # Browser-driven XSS validation -- A2 (validators/browser_xss_validator.py).
 # Loads candidate URLs in a real headless browser and confirms XSS only on

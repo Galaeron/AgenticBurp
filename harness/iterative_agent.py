@@ -179,6 +179,14 @@ _RESP_HEAD_CHARS = 500          # start of the body shown for every response
 _RESP_WINDOW_CHARS = 180        # context each side of an error, reflection or change
 _RESP_MAX_WINDOWS = 3
 _DETAILED_STEPS = 2             # latest responses shown in full; older ones as one line
+# TOK-3: the history shows the latest DEFAULT_HISTORY_WINDOW steps as their own
+# lines and folds every earlier step into a compact table (one row per distinct
+# action/knob/outcome, at most _SUMMARY_MAX_ROWS rows), so a long probe's prompt
+# stops growing once the window is full. iterative_agent.history_window overrides it.
+DEFAULT_HISTORY_WINDOW = 8
+_SUMMARY_MAX_ROWS = 12
+_SUMMARY_VALUE_CHARS = 30       # last payload value shown per summary row
+_MECHANISM_RENDER_CHARS = 400   # a mechanism result's JSON as the history shows it
 _VIEW_HEADERS = ("content-type", "location", "www-authenticate", "x-powered-by", "server")
 _SERVER_ERROR_RE = re.compile(
     "|".join(re.escape(m) for m in _DB_ERROR_MARKERS)
@@ -224,14 +232,80 @@ def _response_view(text: object, *, headers: dict | None = None, baseline: objec
     return view, [name for name, _ in found]
 
 
-def _render_history(history: list) -> str:
-    """The prompt's history. Plain lines as they are; of the (short, full) step responses
-    the latest _DETAILED_STEPS in full and older ones as their short line, so the prompt
-    stays inside the model's context window however many steps ran."""
-    responses = [i for i, item in enumerate(history) if isinstance(item, tuple)]
-    full = set(responses[-_DETAILED_STEPS:]) if _DETAILED_STEPS > 0 else set()
-    return "\n".join(item if isinstance(item, str) else item[1] if i in full else item[0]
-                     for i, item in enumerate(history))
+@dataclass
+class _StepEntry:
+    """One step in the prompt's history (TOK-3): `text` is its line, `detail` the
+    full response view (responses only), and `row` (action, knob, outcome) with
+    the payload `value` is what the summary table keeps once the step has left
+    the window."""
+    step: int
+    text: str
+    row: tuple[str, str, str]
+    value: str = ""
+    detail: str | None = None
+
+
+def _step_knob(action: dict) -> str:
+    """The bounded knob an action turned, as a summary row names it."""
+    kind = action.get("action")
+    if kind == "set_header":
+        return "header:" + _excerpt(str(action.get("name") or "").strip(), 40)
+    if kind == "mutate":
+        return f"{_excerpt(action.get('location'), 10)}:{_excerpt(action.get('param'), 30)}"
+    return "-"
+
+
+def _step_value(action: dict) -> str:
+    """The payload an action carried, as a summary row shows it (a secret-named
+    header's value only as a fingerprint)."""
+    kind = action.get("action")
+    if kind == "set_header":
+        name = str(action.get("name") or "").strip()
+        return _excerpt(_header_value_view(name, action.get("value")), _SUMMARY_VALUE_CHARS)
+    if kind == "mutate" and "value" in action:
+        return _excerpt(_value_text(action.get("value")), _SUMMARY_VALUE_CHARS)
+    return ""
+
+
+def _summary_table(entries: list[_StepEntry]) -> list[str]:
+    """Steps that have left the window, one row per distinct (action, knob,
+    outcome): a repeat adds to its row's count rather than a line. Only the
+    _SUMMARY_MAX_ROWS rows seen most recently are listed."""
+    rows: dict[tuple, list] = {}
+    for e in entries:
+        r = rows.setdefault(e.row, [0, e.step, e.step, ""])
+        r[0] += 1
+        r[2] = e.step
+        r[3] = e.value or r[3]
+    ordered = sorted(rows.items(), key=lambda kv: kv[1][2])
+    omitted, kept = ordered[:-_SUMMARY_MAX_ROWS], ordered[-_SUMMARY_MAX_ROWS:]
+    lines = [f"EARLIER STEPS {entries[0].step}-{entries[-1].step} (summarised, one row per "
+             "action, knob and outcome; the latest steps follow in full):",
+             "action | knob | outcome | steps | last value"]
+    if omitted:
+        lines.append(f"(+{len(omitted)} older rows covering "
+                     f"{sum(r[0] for _, r in omitted)} steps omitted)")
+    for (action, knob, outcome), (n, first, last, value) in kept:
+        span = str(first) if first == last else f"{first}-{last}"
+        lines.append(f"{action} | {knob} | {outcome} | x{n} (step {span}) | "
+                     f"{json.dumps(value) if value else '-'}")
+    return lines
+
+
+def _render_history(history: list, window: int = DEFAULT_HISTORY_WINDOW) -> str:
+    """The prompt's history (TOK-3): the header lines; steps older than the latest
+    `window` as a compact table; the latest `window` steps as their lines, with
+    the latest _DETAILED_STEPS responses among them in full. Its size is bounded
+    however many steps ran."""
+    head = [item for item in history if isinstance(item, str)]
+    steps = [item for item in history if isinstance(item, _StepEntry)]
+    window = max(1, int(window))
+    recent, older = steps[-window:], steps[:-window]
+    with_detail = [e for e in recent if e.detail is not None]
+    full = {id(e) for e in with_detail[-_DETAILED_STEPS:]} if _DETAILED_STEPS > 0 else set()
+    lines = head + (_summary_table(older) if older else [])
+    lines += [e.detail if id(e) in full else e.text for e in recent]
+    return "\n".join(lines)
 
 
 def _sorted_query(query: str) -> str:
@@ -539,12 +613,16 @@ class IterativeAgent:
                  max_steps: int = 250, run_context=None, experiment_handoff=None,
                  experiment_catalog=None,
                  model_error_retries: int | None = DEFAULT_MODEL_ERROR_RETRIES,
-                 deadline: float | None = None):
+                 deadline: float | None = None, history_window: int | None = None):
         self.ollama = ollama
         self.model = model
         self.allowed_hosts = allowed_hosts or []
         self.temperature = temperature
         self.max_steps = max_steps
+        # TOK-3: steps shown as their own lines; earlier ones are summarised.
+        # Unset (None) => DEFAULT_HISTORY_WINDOW; at least 1.
+        self.history_window = max(1, int(
+            DEFAULT_HISTORY_WINDOW if history_window is None else history_window))
         # Clamped to [0, _MAX_MODEL_ERROR_RETRIES]; unset (None) => the default.
         self.model_error_retries = max(0, min(
             int(DEFAULT_MODEL_ERROR_RETRIES if model_error_retries is None else model_error_retries),
@@ -861,7 +939,7 @@ class IterativeAgent:
 
         system = _SYSTEM_PROMPT.format(specialty=specialty)
         diag = result.diagnostics
-        history: list[str | tuple[str, str]] = [
+        history: list[str | _StepEntry] = [
             f"HYPOTHESIS: {hypothesis}",
             f"ENDPOINT: {exchange.method} {exchange.url}",
             f"RESPONSE STATUS (captured baseline): {exchange.response_status}",
@@ -890,7 +968,7 @@ class IterativeAgent:
                     result.handoff_note = f"Halted by effort budget at step {step}: {reason}"
                     break
 
-            user = (_render_history(history) + self._mechanisms_block() +
+            user = (_render_history(history, self.history_window) + self._mechanisms_block() +
                     "\n\n" + _prior_attempts_block(attempts, result.duplicate_proposals) +
                     "\n\nChoose your next action as a single JSON object.")
             try:
@@ -917,7 +995,9 @@ class IterativeAgent:
 
             if not isinstance(action, dict) or "action" not in action:
                 diag["parse_errors"] += 1
-                history.append(f"[step {step}] output was not a JSON action object; try again.")
+                history.append(_StepEntry(
+                    step, f"[step {step}] output was not a JSON action object; try again.",
+                    ("(unparsed)", "-", "parse error")))
                 consecutive_no_progress += 1
                 emit(IterativeStep(step, {}, "(rejected)", None, "parse error", blocked="parse error"))
                 continue
@@ -947,7 +1027,11 @@ class IterativeAgent:
                 else:
                     diag["unavailable_selections"] += 1
                 ids = outcome.get('fresh_attempt_ids') or outcome.get('referenced_attempt_ids') or []
-                history.append(f"[step {step}] mechanism result: {json.dumps(outcome)}")
+                # TOK-3: the outcome JSON is capped; its id lists grow with the run.
+                history.append(_StepEntry(
+                    step, f"[step {step}] mechanism result: "
+                          f"{_excerpt(json.dumps(outcome), _MECHANISM_RENDER_CHARS)}",
+                    ("experiment", _excerpt(outcome.get("kind") or "-", 40), _excerpt(status, 40))))
                 emit(IterativeStep(step, {"action":"experiment", "kind":outcome.get('kind','<rejected>'),
                      "hypothesis":outcome.get('hypothesis','<rejected>')}, "(controller selection)", None,
                      json.dumps(outcome), attempt_id=ids[0] if ids else ""))
@@ -975,11 +1059,14 @@ class IterativeAgent:
                     err = "reset: the request is already the captured request"
                     diag["rejected_proposals"] += 1
                     consecutive_no_progress += 1
-                    history.append(f"[step {step}] action rejected: {err}")
+                    history.append(_StepEntry(step, f"[step {step}] action rejected: {err}",
+                                              ("reset", "-", "rejected: " + _excerpt(err, 50))))
                     emit(IterativeStep(step, action, "(rejected)", None, err, blocked=err))
                     continue
                 headers_state, request_state = dict(captured_headers), captured_request
-                history.append(f"[step {step}] reset: later edits apply to the captured request")
+                history.append(_StepEntry(
+                    step, f"[step {step}] reset: later edits apply to the captured request",
+                    ("reset", "-", "reset")))
                 emit(IterativeStep(step, action, "(reset)", None, "reset to the captured request"))
                 continue
 
@@ -992,7 +1079,9 @@ class IterativeAgent:
             if err:
                 diag["rejected_proposals"] += 1
                 consecutive_no_progress += 1
-                history.append(f"[step {step}] action rejected: {err}")
+                history.append(_StepEntry(
+                    step, f"[step {step}] action rejected: {err}",
+                    (_excerpt(kind, 20), _step_knob(action), "rejected: " + _excerpt(err, 50))))
                 emit(IterativeStep(step, action, "(rejected)", None, err, blocked=err))
                 continue
             method, url, headers, body = built
@@ -1015,7 +1104,9 @@ class IterativeAgent:
                        else "an earlier run's request on this agent (outcome unknown)")
                 note = (f"DUPLICATE of {ref}: choose a different supported action or stop "
                         f"[attempt {_attempt_id(key)}]")
-                history.append(f"[step {step}] {note}")
+                history.append(_StepEntry(step, f"[step {step}] {note}",
+                                          (kind, _step_knob(action), "duplicate"),
+                                          _step_value(action)))
                 log.info(
                     "iterative_agent: skipping duplicate request already sent this "
                     "active-probe session: %s %s", method, url)
@@ -1053,7 +1144,9 @@ class IterativeAgent:
             if status is None:
                 diag["blocked_attempts"] += 1
                 consecutive_no_progress += 1
-                history.append(f"[step {step}] {req_summary} -> {text} [attempt {rec.attempt_id}]")
+                history.append(_StepEntry(
+                    step, f"[step {step}] {req_summary} -> {text} [attempt {rec.attempt_id}]",
+                    (kind, _step_knob(action), _excerpt(text, 50)), _step_value(action)))
                 emit(IterativeStep(step, action, req_summary, None, text, blocked=text,
                                    attempt_id=rec.attempt_id))
                 # A transport failure (or safety/scope block that returned None)
@@ -1072,10 +1165,14 @@ class IterativeAgent:
                     baseline=exchange.response_body or None,
                     probe=None if kind == "set_header" else _value_text(action.get("value")))
                 line = f"[step {step}] {req_summary} -> HTTP {status}, {len(text)} bytes"
-                # Shown in full while among the latest _DETAILED_STEPS, then as the short line.
+                # Shown in full while among the latest _DETAILED_STEPS, then as the short
+                # line, then (TOK-3) as a summary row once it leaves the window.
                 tag = f" [attempt {rec.attempt_id}]"
-                history.append((line + (f" [{', '.join(signals)}]" if signals else "") + tag,
-                                f"{line}{tag}:\n{view}"))
+                marks = f" [{', '.join(signals)}]" if signals else ""
+                history.append(_StepEntry(
+                    step, line + marks + tag,
+                    (kind, _step_knob(action), f"HTTP {status}{marks}"), _step_value(action),
+                    detail=f"{line}{tag}:\n{view}"))
                 emit(IterativeStep(step, action, req_summary, status, view, attempt_id=rec.attempt_id))
                 consecutive_trouble = consecutive_trouble + 1 if status in _DISTRESS_STATUSES else 0
 

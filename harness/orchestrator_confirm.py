@@ -206,6 +206,7 @@ class ConfirmMixin:
             experiment_handoff=experiment_handoff,
             experiment_catalog=lambda: self._experiment_catalog(probe_ctx),
             model_error_retries=_ia_cfg.get("model_error_retries"), deadline=deadline,
+            history_window=_ia_cfg.get("history_window"),  # TOK-3
         )
 
         # Publish each step to the live feed (V1), and still call any caller-
