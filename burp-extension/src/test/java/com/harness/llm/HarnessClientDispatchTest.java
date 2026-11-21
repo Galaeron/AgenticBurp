@@ -3,6 +3,7 @@ package com.harness.llm;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.harness.llm.logic.PlanePolicy;
+import com.harness.llm.model.AnalysisModels.ValidationSubmission;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.AfterEach;
@@ -80,6 +81,75 @@ public final class HarnessClientDispatchTest {
         status = 409;
         reply = "{\"detail\": \"plan_terminal\"}";
         assertThrows(HarnessClient.HarnessException.class, () -> client.dispatchPlan("p1", "hash-1"));
+    }
+
+    // ---------------------------------------------------------------- ARC-12
+    /** The harness's status for each refusal code (server._PLANE_REFUSALS). */
+    private static final java.util.Map<String, Integer> STATUS = java.util.Map.ofEntries(
+            java.util.Map.entry("unknown_plan", 404),
+            java.util.Map.entry("not_dispatched", 409), java.util.Map.entry("dispatch_nonce_mismatch", 409),
+            java.util.Map.entry("duplicate_submission", 409), java.util.Map.entry("plan_terminal", 409),
+            java.util.Map.entry("dispatch_nonce_required", 422), java.util.Map.entry("wrong_execution_plane", 422),
+            java.util.Map.entry("binding_mismatch", 422), java.util.Map.entry("executor_mismatch", 422),
+            java.util.Map.entry("capability_cannot_confirm", 422), java.util.Map.entry("confirmed_status_invalid", 422));
+
+    private void refuseWith(String reason) {
+        status = STATUS.get(reason);
+        reply = "{\"detail\": {\"reason\": \"" + reason + "\", \"message\": \"server wording\"}}";
+    }
+
+    private static ValidationSubmission result() {
+        ValidationSubmission v = new ValidationSubmission();
+        v.plan_id = "p1"; v.status = "rejected"; v.executor = "burp:x"; v.dispatch_nonce = NONCE;
+        return v;
+    }
+
+    /** The refusal reached the caller as its code, in the kind, the getter and the message. */
+    private static void checkSurfaced(HarnessClient.HarnessException e, String reason) {
+        assertEquals("refused", e.getFailureKind(), e.getMessage());
+        assertEquals(reason, e.getRefusalReason());
+        assertTrue(e.getMessage().contains(reason) && e.getMessage().contains("HTTP " + STATUS.get(reason)),
+                e.getMessage());
+    }
+
+    @Test
+    @DisplayName("every refusal code the harness returns is surfaced, for the dispatch and for the result")
+    void everyRefusalReasonIsSurfaced() {
+        assertEquals(STATUS.keySet(), HarnessClient.PLANE_REFUSALS.keySet());
+        for (String reason : STATUS.keySet()) {
+            refuseWith(reason);
+            checkSurfaced(assertThrows(HarnessClient.HarnessException.class,
+                    () -> client.dispatchPlan("p1", "hash-1")), reason);
+            checkSurfaced(assertThrows(HarnessClient.HarnessException.class,
+                    () -> client.submitValidationResult(result())), reason);
+        }
+    }
+
+    @Test
+    @DisplayName("an unlisted code, a string detail or another status is withheld, not echoed")
+    void unlistedRefusalsAreWithheld() {
+        String[][] cases = {
+                {"409", "{\"detail\": {\"reason\": \"<b>owned</b>\", \"message\": \"x\"}}"},
+                {"409", "{\"detail\": \"duplicate_submission\"}"},
+                {"422", "{\"detail\": [{\"loc\": [\"body\", \"status\"], \"msg\": \"bad\"}]}"},
+                {"500", "{\"detail\": {\"reason\": \"plan_terminal\"}}"},
+                {"409", "not json"},
+        };
+        for (String[] c : cases) {
+            status = Integer.parseInt(c[0]);
+            reply = c[1];
+            var e = assertThrows(HarnessClient.HarnessException.class, () -> client.submitValidationResult(result()));
+            assertEquals(null, e.getRefusalReason(), c[1]);
+            assertFalse(e.getMessage().contains("owned"), e.getMessage());
+            assertTrue(e.getMessage().contains("HTTP " + c[0]), e.getMessage());
+        }
+    }
+
+    @Test
+    @DisplayName("control: the pre-ARC-12 failure (status only) does not surface the reason")
+    void controlStatusOnlyFailureLosesTheReason() {
+        assertThrows(AssertionError.class, () -> checkSurfaced(HarnessClient.httpFailure(409), "plan_terminal"));
+        checkSurfaced(HarnessClient.refused("result", "plan_terminal", 409), "plan_terminal");
     }
 
     @Test

@@ -1868,9 +1868,20 @@ def capability_can_confirm(capability: str) -> bool:
     return capability in _CONFIRMATION_CAPABILITIES
 
 
+# ARC-12: the in-process writer's wording for each content refusal code (the
+# Burp plane gets the code itself; see persist_plane_submission).
+_CONTENT_REFUSAL_MESSAGES = {
+    "binding_mismatch": "binding_mismatch",
+    "executor_mismatch": "executor does not match the registered capability",
+    "capability_cannot_confirm": "this capability may provide evidence but cannot mark the vulnerability confirmed",
+    "confirmed_status_invalid": "confirmed result has invalid status",
+}
+
+
 def _submission_content_refusal(row, submission: ValidationSubmission) -> str:
     """Why a submission's content does not fit its plan (row: source_exchange_hash,
-    status, capability, execution_plane), or "" when it fits."""
+    status, capability, execution_plane), as a stable code (ARC-12), or "" when
+    it fits."""
     if submission.source_exchange_hash != row[0]:
         return "binding_mismatch"
     # The executor prefix must match the plan's OWN execution plane,
@@ -1882,11 +1893,11 @@ def _submission_content_refusal(row, submission: ValidationSubmission) -> str:
     # rejected for a reason that had nothing to do with the test's
     # actual assertion.
     if submission.executor != f"{row[3]}:{row[2]}":
-        return "executor does not match the registered capability"
+        return "executor_mismatch"
     if submission.confirmed and not capability_can_confirm(row[2]):
-        return "this capability may provide evidence but cannot mark the vulnerability confirmed"
+        return "capability_cannot_confirm"
     if submission.confirmed and submission.status != "confirmed":
-        return "confirmed result has invalid status"
+        return "confirmed_status_invalid"
     return ""
 
 
@@ -1900,7 +1911,7 @@ def persist_validation_submission(submission: ValidationSubmission) -> tuple[boo
             return False, "unknown test plan"
         refusal = _submission_content_refusal(row, submission)
         if refusal:
-            return False, refusal
+            return False, _CONTENT_REFUSAL_MESSAGES[refusal]
         if row[1] not in _PLANE_DISPATCHABLE_STATUSES and conn.execute(
                 "SELECT 1 FROM plane_dispatches WHERE plan_id = ? AND consumed_at IS NOT NULL",
                 (submission.plan_id,)).fetchone():
@@ -1928,6 +1939,14 @@ def persist_validation_submission(submission: ValidationSubmission) -> tuple[boo
 # is a verdict, and a verdict is never overwritten: "error" means nothing was
 # decided (a failed send, a refused policy), so the plan may be dispatched again.
 _PLANE_DISPATCHABLE_STATUSES = frozenset({"proposed", "not_dispatchable", "error"})
+
+# ARC-12: every refusal code issue_plane_dispatch and persist_plane_submission
+# return. The server maps each to its own HTTP status.
+PLANE_REFUSAL_REASONS = frozenset({
+    "unknown_plan", "wrong_execution_plane", "plan_terminal", "not_dispatched",
+    "dispatch_nonce_required", "dispatch_nonce_mismatch", "duplicate_submission",
+    *_CONTENT_REFUSAL_MESSAGES,
+})
 
 
 def _nonce_digest(nonce: str) -> str:

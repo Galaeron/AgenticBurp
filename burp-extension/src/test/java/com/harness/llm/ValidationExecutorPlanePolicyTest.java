@@ -119,6 +119,26 @@ final class ValidationExecutorPlanePolicyTest {
     }
 
     @Test
+    @DisplayName("ARC-12: a refused dispatch shows its reason in the panel")
+    void refusedDispatchShowsItsReason() throws Exception {
+        Run run = massAssignment((planId, hash) -> { throw HarnessClient.refused("dispatch", "plan_terminal", 409); });
+        assertTrue(run.sent().isEmpty());
+        assertEquals("ERROR", run.outcome());
+        assertTrue(run.outcomeDetail().contains("plan_terminal"), run.outcomeDetail());
+    }
+
+    @Test
+    @DisplayName("ARC-12: a refused result shows NOT PERSISTED with the harness's reason")
+    void refusedResultShowsItsReason() throws Exception {
+        Run run = executeUnder(policy(true, true, PlanePolicy.NO_BUDGET),
+                submission -> { throw HarnessClient.refused("result", "duplicate_submission", 409); },
+                "api_security_validation", profileWrite(), Reply.of(200, "{\"name\":\"sample\"}"), persistingTarget());
+        assertEquals(1, run.submissions());
+        assertTrue(run.outcomeDetail().contains("NOT PERSISTED"), run.outcomeDetail());
+        assertTrue(run.outcomeDetail().contains("duplicate_submission"), run.outcomeDetail());
+    }
+
+    @Test
     @DisplayName("a passive arm still runs with both flags off (only mutating sends need them)")
     void passiveArmRunsWithFlagsOff() throws Exception {
         Run run = executeUnder(policy(false, false, PlanePolicy.NO_BUDGET), "cors_misconfiguration_detection",

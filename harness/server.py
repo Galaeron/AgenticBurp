@@ -670,21 +670,30 @@ async def test_plan(plan_id: str, authorization: str | None = Header(default=Non
     return plan
 
 
-# ARC-4: the HTTP status of each Burp-plane refusal. Unknown reasons are the
-# pre-existing content checks (binding/executor/confirmation policy).
-_PLANE_REFUSAL_STATUS = {
-    "unknown_plan": 404,
-    "not_dispatched": 409,
-    "dispatch_nonce_mismatch": 409,
-    "duplicate_submission": 409,
-    "plan_terminal": 409,
-    "dispatch_nonce_required": 422,
-    "wrong_execution_plane": 422,
+# ARC-4/ARC-12: the HTTP status and wording of each Burp-plane refusal code
+# (store.PLANE_REFUSAL_REASONS). 404 is an unknown plan and nothing else; a
+# refusal by the plan's state is 409, and a result or dispatch that does not
+# fit the plan is 422. The body is {"detail": {"reason": <code>, "message": ...}}.
+_PLANE_REFUSALS = {
+    "unknown_plan": (404, "unknown test plan"),
+    "not_dispatched": (409, "the plan was not dispatched to the Burp plane"),
+    "dispatch_nonce_mismatch": (409, "the dispatch nonce is not the plan's current one"),
+    "duplicate_submission": (409, "this dispatch already has a result"),
+    "plan_terminal": (409, "the plan already holds a verdict"),
+    "dispatch_nonce_required": (422, "the result carries no dispatch nonce"),
+    "wrong_execution_plane": (422, "the plan does not run on the Burp plane"),
+    "binding_mismatch": (422, "the source exchange does not match the plan"),
+    "executor_mismatch": (422, "executor does not match the registered capability"),
+    "capability_cannot_confirm": (422, "this capability may provide evidence but cannot mark the vulnerability confirmed"),
+    "confirmed_status_invalid": (422, "confirmed result has invalid status"),
 }
 
 
-def _plane_refusal_status(reason: str) -> int:
-    return _PLANE_REFUSAL_STATUS.get(reason, 400 if reason == "binding_mismatch" else 404)
+def _plane_refusal(reason: str) -> HTTPException:
+    # A code without an entry is a refusal all the same: 409, never a 404
+    # that reads as "unknown plan".
+    status, message = _PLANE_REFUSALS.get(reason, (409, "refused"))
+    return HTTPException(status_code=status, detail={"reason": reason, "message": message})
 
 
 def _plane_policy() -> tuple[dict, int | None]:
@@ -727,7 +736,7 @@ async def dispatch_test_plan(plan_id: str, req: PlanDispatchRequest,
             await _plane_ledger(EventType.AUTHORIZATION_DECISION, plan_id,
                                 f"Burp dispatch refused: {reason}",
                                 {"stage": "dispatch", "decision": "refused", "reason": reason})
-        raise HTTPException(status_code=_plane_refusal_status(reason), detail=reason)
+        raise _plane_refusal(reason)
     await _plane_ledger(EventType.AUTHORIZATION_DECISION, plan_id, "Burp dispatch issued",
                         {"stage": "dispatch", "decision": "dispatched", "policy": policy,
                          "request_budget": budget})
@@ -750,7 +759,7 @@ async def validation_result(submission: PlaneValidationSubmission, authorization
                                 f"Burp result refused: {reason}",
                                 {"stage": "submission", "decision": "refused", "reason": reason,
                                  "status": submission.status})
-        raise HTTPException(status_code=_plane_refusal_status(reason), detail=reason)
+        raise _plane_refusal(reason)
     await _plane_ledger(EventType.VALIDATION_DECISION, submission.plan_id,
                         f"Burp result accepted: {submission.status}",
                         {"stage": "submission", "decision": "accepted", "status": submission.status,

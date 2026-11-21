@@ -60,6 +60,11 @@ final class FakeMontoya {
                 new PlanePolicy(activeEnabled, allowMutatingReplay, requestBudget));
     }
 
+    /** What the fake harness answers to POST /validation-results (ARC-12): accept, or throw a refusal. */
+    interface Submitter {
+        void submit(ValidationSubmission submission) throws HarnessClient.HarnessException;
+    }
+
     /** Active and mutating replay on, no budget: every arm runs as it did before ARC-4. */
     static Dispatcher permissive() { return policy(true, true, PlanePolicy.NO_BUDGET); }
 
@@ -216,6 +221,12 @@ final class FakeMontoya {
      */
     static Run executeUnder(Dispatcher dispatcher, String capability, HttpRequest request, Reply capturedReply,
                             Function<HttpRequest, Reply> responder) throws Exception {
+        return executeUnder(dispatcher, submission -> { }, capability, request, capturedReply, responder);
+    }
+
+    /** As executeUnder(), with the harness's answer to the submission given by `submitter`. */
+    static Run executeUnder(Dispatcher dispatcher, Submitter submitter, String capability, HttpRequest request,
+                            Reply capturedReply, Function<HttpRequest, Reply> responder) throws Exception {
         List<HttpRequest> sent = new CopyOnWriteArrayList<>();
         List<ValidationSubmission> submissions = new CopyOnWriteArrayList<>();
         Http http = proxy(Http.class, (m, a) -> {
@@ -231,7 +242,10 @@ final class FakeMontoya {
             default -> throw new UnsupportedOperationException("MontoyaApi." + m);
         });
         HarnessClient client = new HarnessClient("http://127.0.0.1:8000", 1) {
-            @Override public void submitValidationResult(ValidationSubmission submission) { submissions.add(submission); }
+            @Override public void submitValidationResult(ValidationSubmission submission) throws HarnessException {
+                submissions.add(submission);
+                submitter.submit(submission);
+            }
             @Override public PlaneDispatch dispatchPlan(String planId, String sourceExchangeHash) throws HarnessException {
                 return dispatcher.dispatch(planId, sourceExchangeHash);
             }

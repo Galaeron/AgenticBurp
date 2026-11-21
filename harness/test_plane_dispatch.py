@@ -77,7 +77,10 @@ class PlaneDispatchRouteTests(unittest.TestCase):
 
     def _check_refused(self, reply, status, reason):
         self.assertEqual(reply.status_code, status, reply.text)
-        self.assertIn(reason, reply.text)
+        detail = reply.json()["detail"]
+        self.assertIsInstance(detail, dict, reply.text)
+        self.assertEqual(detail["reason"], reason, reply.text)
+        self.assertTrue(detail["message"], reply.text)
 
     # -- the protocol -------------------------------------------------------
     def test_dispatch_hands_the_plane_the_live_policy_and_budget(self):
@@ -193,6 +196,88 @@ class PlaneDispatchRouteTests(unittest.TestCase):
                 self._check_refused(self._submit(plan_id="plane-plan-2", status="confirmed"),
                                     409, "duplicate_submission")
         self.assertEqual(self._plan_status("plane-plan-2"), "confirmed")  # the overwrite
+
+    # -- ARC-12: one status per refusal reason -------------------------------
+    def _refusals(self):
+        """Every refusal code, reached through the routes; each consumes nothing."""
+        seen = {}
+        seen["unknown_plan"] = self._dispatch("no-such-plan"), self._submit(plan_id="no-such-plan")
+        seen["not_dispatched"] = (self._submit(),)
+        store.persist_retry_plan(_plan("local-plan", plane="local_tool"))
+        seen["wrong_execution_plane"] = (self._dispatch("local-plan"),)
+        seen["binding_mismatch"] = (self._dispatch(binding="hash-other"),)
+        nonce = self._nonce()
+        seen["dispatch_nonce_required"] = (self._submit(),)
+        seen["dispatch_nonce_mismatch"] = (self._submit(nonce="not-the-nonce-" + "x" * 30),)
+        seen["binding_mismatch"] += (self._submit(nonce=nonce, source_exchange_hash="hash-other"),)
+        seen["executor_mismatch"] = (self._submit(nonce=nonce, executor="burp:sql_injection_validation"),)
+        seen["confirmed_status_invalid"] = (self._submit(nonce=nonce, status="supported", confirmed=True),)
+        store.persist_retry_plan(_plan("csp-plan", capability="csp_clickjacking_validation"))
+        seen["capability_cannot_confirm"] = (self._submit(
+            plan_id="csp-plan", nonce=self._nonce("csp-plan"), status="confirmed",
+            executor="burp:csp_clickjacking_validation"),)
+        self.assertEqual(self._submit(nonce=nonce).status_code, 200)  # nothing above consumed it
+        seen["duplicate_submission"] = (self._submit(nonce=nonce),)
+        seen["plan_terminal"] = (self._dispatch(),)
+        return seen
+
+    _EXPECTED_STATUS = {
+        "unknown_plan": 404, "not_dispatched": 409, "dispatch_nonce_mismatch": 409,
+        "duplicate_submission": 409, "plan_terminal": 409, "dispatch_nonce_required": 422,
+        "wrong_execution_plane": 422, "binding_mismatch": 422, "executor_mismatch": 422,
+        "capability_cannot_confirm": 422, "confirmed_status_invalid": 422,
+    }
+
+    def _check_refusal_statuses(self, seen):
+        self.assertEqual(set(seen), set(store.PLANE_REFUSAL_REASONS), "every code is exercised")
+        for reason, replies in seen.items():
+            for reply in replies:  # no subTest: the control below needs the AssertionError
+                self._check_refused(reply, self._EXPECTED_STATUS[reason], reason)
+
+    def test_each_refusal_reason_has_its_own_status(self):
+        self._check_refusal_statuses(self._refusals())
+        self.assertEqual(self._runs("csp-plan"), [])
+
+    def test_only_an_unknown_plan_is_a_404(self):
+        server = self.server
+        self.assertEqual(set(server._PLANE_REFUSALS), set(store.PLANE_REFUSAL_REASONS))
+        self.assertEqual({r for r, (status, _) in server._PLANE_REFUSALS.items() if status == 404},
+                         {"unknown_plan"})
+        self.assertEqual(server._plane_refusal("a_future_code").status_code, 409)
+
+    def test_the_burp_client_knows_every_refusal_code(self):
+        # HarnessClient surfaces only the codes it lists; a code added here and
+        # not there would reach the analyst as a bare HTTP status.
+        import re
+        from pathlib import Path
+        java = (Path(store.__file__).resolve().parent.parent / "burp-extension" / "src" / "main" / "java"
+                / "com" / "harness" / "llm" / "HarnessClient.java").read_text(encoding="utf-8")
+        block = java.split("PLANE_REFUSALS = java.util.Map.ofEntries(", 1)[1].split(");", 1)[0]
+        self.assertEqual(set(re.findall(r'Map\.entry\("([a-z_]+)"', block)), set(store.PLANE_REFUSAL_REASONS))
+
+    def test_the_internal_writer_keeps_its_messages(self):
+        ok, reason = store.persist_validation_submission(ValidationSubmission(
+            plan_id="plane-plan-1", status="rejected", executor="burp:sql_injection_validation",
+            source_exchange_hash="hash-plane"))
+        self.assertEqual((ok, reason), (False, "executor does not match the registered capability"))
+        self.assertEqual(store.persist_validation_submission(ValidationSubmission(
+            plan_id="no-such-plan", status="rejected"))[1], "unknown test plan")
+
+    def test_control_the_pre_arc12_mapping_fails_the_status_checks(self):
+        from fastapi import HTTPException
+        server = self.server  # the fixture's own copy of the route module
+
+        def legacy(reason):  # ARC-4's mapping: 400 for a binding, 404 for any other content refusal
+            status = {"unknown_plan": 404, "not_dispatched": 409, "dispatch_nonce_mismatch": 409,
+                      "duplicate_submission": 409, "plan_terminal": 409,
+                      "dispatch_nonce_required": 422, "wrong_execution_plane": 422}.get(
+                reason, 400 if reason == "binding_mismatch" else 404)
+            return HTTPException(status_code=status, detail={"reason": reason, "message": reason})
+
+        with patch.object(server, "_plane_refusal", legacy):
+            seen = self._refusals()
+        with self.assertRaises(AssertionError):
+            self._check_refusal_statuses(seen)
 
     def test_control_the_shared_model_accepts_any_status(self):
         # The base model the route took before ARC-4 has no status set: an
