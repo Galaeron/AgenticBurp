@@ -337,6 +337,8 @@ class DeclarationsStoreMigrationTests(unittest.TestCase):  # P8
                 DROP TABLE plan_dispatch_notes;
                 DROP TABLE proof_evidence_source;
                 DELETE FROM state_metadata WHERE name = 'plan-dispatch-schema';
+                DROP TABLE plane_dispatches;
+                DELETE FROM state_metadata WHERE name = 'plane-dispatch-schema';
             """)
             after = _legacy_identity(conn)
         finally:

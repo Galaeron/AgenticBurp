@@ -15,7 +15,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from harness.models import (AnalysisRequest, AnalysisResponse, ValidationSubmission, EstimateRequest, EffortStatus,
+from harness.models import (AnalysisRequest, AnalysisResponse, PlaneValidationSubmission, PlanDispatchRequest,
+                     EstimateRequest, EffortStatus,
                      IdentityCreateRequest, SessionCreateRequest, SuppressFindingRequest,
                      PrioritizeRequest, PrioritizeResponse, PrioritizeResultItem, HttpExchange,
                      ObservationAttributionCorrection)
@@ -669,15 +670,92 @@ async def test_plan(plan_id: str, authorization: str | None = Header(default=Non
     return plan
 
 
+# ARC-4: the HTTP status of each Burp-plane refusal. Unknown reasons are the
+# pre-existing content checks (binding/executor/confirmation policy).
+_PLANE_REFUSAL_STATUS = {
+    "unknown_plan": 404,
+    "not_dispatched": 409,
+    "dispatch_nonce_mismatch": 409,
+    "duplicate_submission": 409,
+    "plan_terminal": 409,
+    "dispatch_nonce_required": 422,
+    "wrong_execution_plane": 422,
+}
+
+
+def _plane_refusal_status(reason: str) -> int:
+    return _PLANE_REFUSAL_STATUS.get(reason, 400 if reason == "binding_mismatch" else 404)
+
+
+def _plane_policy() -> tuple[dict, int | None]:
+    """The live policy the Burp plane executes a dispatched plan under: the
+    same two flags the Python SafetyGate reads for a run started now (live
+    active toggle over config, parsed strictly), and the run request ceiling
+    (runs.max_requests; None = no ceiling, as for RunContext)."""
+    from harness.config_schema import parse_validators_flags
+    flags = parse_validators_flags(_live_validators_gate_config())
+    budget = (orchestrator.config.get("runs", {}) or {}).get("max_requests")
+    if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget < 0):
+        budget = 0  # a malformed ceiling refuses every send rather than lifting the limit
+    return ({"active_enabled": bool(flags["active_enabled"]),
+             "allow_mutating_replay": bool(flags["allow_mutating_replay"])}, budget)
+
+
+async def _plane_ledger(event_type, plan_id: str, summary: str, data: dict) -> None:
+    """One evidence-ledger event for the Burp plane's dispatch protocol, keyed
+    "plan:<plan_id>" (wiped with the plan's host). Best effort, like emit()."""
+    from harness import evidence_ledger
+    await asyncio.to_thread(evidence_ledger.emit, event_type, f"plan:{plan_id}", summary, data=data)
+
+
+@app.post("/test-plans/{plan_id}/dispatch")
+async def dispatch_test_plan(plan_id: str, req: PlanDispatchRequest,
+                             authorization: str | None = Header(default=None)):
+    """Issue the single-use nonce and live policy for one Burp-plane run (ARC-4).
+
+    The plane reads the policy here rather than trusting its own copy: a
+    mutating arm runs only when active_enabled and allow_mutating_replay are
+    both on, and the plane stops at request_budget sends."""
+    _require_auth(authorization)
+    from harness.evidence_ledger import EventType
+    policy, budget = _plane_policy()
+    issued, reason, nonce = await asyncio.to_thread(
+        store.issue_plane_dispatch, plan_id, req.source_exchange_hash,
+        {**policy, "request_budget": budget})
+    if not issued:
+        if reason != "unknown_plan":  # an unknown id has no plan to attach an event to
+            await _plane_ledger(EventType.AUTHORIZATION_DECISION, plan_id,
+                                f"Burp dispatch refused: {reason}",
+                                {"stage": "dispatch", "decision": "refused", "reason": reason})
+        raise HTTPException(status_code=_plane_refusal_status(reason), detail=reason)
+    await _plane_ledger(EventType.AUTHORIZATION_DECISION, plan_id, "Burp dispatch issued",
+                        {"stage": "dispatch", "decision": "dispatched", "policy": policy,
+                         "request_budget": budget})
+    log.info("Burp dispatch issued plan=%s policy=%s budget=%s", plan_id, policy, budget)
+    return {"plan_id": plan_id, "dispatch_nonce": nonce, "policy": policy, "request_budget": budget}
+
+
 @app.post("/validation-results")
-async def validation_result(submission: ValidationSubmission, authorization: str | None = Header(default=None)):
+async def validation_result(submission: PlaneValidationSubmission, authorization: str | None = Header(default=None)):
     _require_auth(authorization)
     # The execution plane (normally Burp) posts only the observed result.
     # It cannot change a plan's target or turn a model assertion into a
-    # confirmation; the server accepts the result as evidence for the plan.
-    accepted, reason = await __import__("asyncio").to_thread(store.persist_validation_submission, submission)
+    # confirmation; the server accepts the result as evidence for the plan,
+    # once, under the nonce POST /test-plans/{plan_id}/dispatch issued (ARC-4).
+    from harness.evidence_ledger import EventType
+    accepted, reason = await asyncio.to_thread(store.persist_plane_submission, submission)
     if not accepted:
-        raise HTTPException(status_code=400 if reason == "binding_mismatch" else 404, detail=reason)
+        if reason != "unknown_plan":
+            await _plane_ledger(EventType.AUTHORIZATION_DECISION, submission.plan_id,
+                                f"Burp result refused: {reason}",
+                                {"stage": "submission", "decision": "refused", "reason": reason,
+                                 "status": submission.status})
+        raise HTTPException(status_code=_plane_refusal_status(reason), detail=reason)
+    await _plane_ledger(EventType.VALIDATION_DECISION, submission.plan_id,
+                        f"Burp result accepted: {submission.status}",
+                        {"stage": "submission", "decision": "accepted", "status": submission.status,
+                         "confirmed": submission.confirmed, "confidence": submission.confidence,
+                         "executor": submission.executor})
     log.info("Validation result received plan=%s status=%s confirmed=%s",
              submission.plan_id, submission.status, submission.confirmed)
 

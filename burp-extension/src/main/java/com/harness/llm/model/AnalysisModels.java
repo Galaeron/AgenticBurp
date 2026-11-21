@@ -93,6 +93,8 @@ public class AnalysisModels {
         public String evidence;
         public String executor;
         public String source_exchange_hash;
+        /** ARC-4: the single-use nonce POST /test-plans/{id}/dispatch issued for this run. */
+        public String dispatch_nonce;
     }
 
     public static class AnalysisResponse {

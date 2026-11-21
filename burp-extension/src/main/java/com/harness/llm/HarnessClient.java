@@ -372,6 +372,57 @@ public class HarnessClient {
         responseObject(resp.body());
     }
 
+    /** ARC-4: one dispatch of a plan to this plane -- its nonce and live policy. */
+    public static final class PlaneDispatch {
+        public final String nonce;
+        public final com.harness.llm.logic.PlanePolicy policy;
+        public PlaneDispatch(String nonce, com.harness.llm.logic.PlanePolicy policy) {
+            this.nonce = nonce;
+            this.policy = policy;
+        }
+    }
+
+    private static final java.util.regex.Pattern DISPATCH_NONCE = java.util.regex.Pattern.compile("[A-Za-z0-9_-]{16,128}");
+
+    /**
+     * ARC-4: POST /test-plans/{plan_id}/dispatch before a plan runs. Returns the
+     * single-use nonce the result must carry and the live policy to run it
+     * under. Fails closed: a reply without a usable nonce is an error, a
+     * missing or non-boolean policy flag reads as off, and a missing or
+     * malformed request_budget as zero sends; only an explicit null budget
+     * means no ceiling (as runs.max_requests unset does on the harness).
+     */
+    public PlaneDispatch dispatchPlan(String planId, String sourceExchangeHash) throws HarnessException {
+        if (planId == null || planId.isBlank()) throw failed("invalid_request", "No plan id to dispatch.");
+        String path = "/test-plans/" + URLEncoder.encode(planId, StandardCharsets.UTF_8).replace("+", "%20") + "/dispatch";
+        return parseDispatch(postJson(path, java.util.Map.of("source_exchange_hash",
+                sourceExchangeHash == null ? "" : sourceExchangeHash), shortTimeout()));
+    }
+
+    static PlaneDispatch parseDispatch(com.google.gson.JsonObject reply) throws HarnessException {
+        var nonce = reply.get("dispatch_nonce");
+        if (nonce == null || !nonce.isJsonPrimitive() || !nonce.getAsJsonPrimitive().isString()
+                || !DISPATCH_NONCE.matcher(nonce.getAsString()).matches()) {
+            throw failed("malformed", "Harness dispatch carried no usable nonce; nothing was sent.");
+        }
+        var policyEl = reply.get("policy");
+        var policy = policyEl != null && policyEl.isJsonObject() ? policyEl.getAsJsonObject() : new com.google.gson.JsonObject();
+        int budget = 0;
+        var budgetEl = reply.get("request_budget");
+        if (budgetEl != null && budgetEl.isJsonNull()) {
+            budget = com.harness.llm.logic.PlanePolicy.NO_BUDGET;
+        } else if (budgetEl != null && budgetEl.isJsonPrimitive() && budgetEl.getAsJsonPrimitive().isNumber()) {
+            try {
+                long value = budgetEl.getAsBigDecimal().longValueExact();
+                budget = value < 0 ? 0 : (int) Math.min(value, Integer.MAX_VALUE);
+            } catch (ArithmeticException fractional) {
+                budget = 0;
+            }
+        }
+        return new PlaneDispatch(nonce.getAsString(), new com.harness.llm.logic.PlanePolicy(
+                trueField(policy, "active_enabled"), trueField(policy, "allow_mutating_replay"), budget));
+    }
+
     public synchronized void setBearerToken(String token) {
         if (token != null && (token.length() > 4096
                 || token.chars().anyMatch(c -> c < 32 || c > 126))) {

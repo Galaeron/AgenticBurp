@@ -33,6 +33,7 @@ import com.harness.llm.logic.InfoDisclosureLogic;
 import com.harness.llm.logic.JwtForgeryLogic;
 import com.harness.llm.logic.MassAssignmentLogic;
 import com.harness.llm.logic.OpenRedirectLogic;
+import com.harness.llm.logic.PlanePolicy;
 import com.harness.llm.logic.PoolCandidateResolver;
 import com.harness.llm.logic.RaceConditionLogic;
 import com.harness.llm.logic.SessionLifecycleLogic;
@@ -69,6 +70,10 @@ public final class ValidationExecutor {
     private final HarnessClient client;
     private final Map<String, HttpRequestResponse> sources = new ConcurrentHashMap<>();
     private final Map<String, HttpRequestResponse> exchangePool = new ConcurrentHashMap<>();
+    // ARC-4: the dispatch (nonce + live policy) each running plan holds, and
+    // the plans in flight, so one plan never runs twice at once.
+    private final Map<String, HarnessClient.PlaneDispatch> dispatches = new ConcurrentHashMap<>();
+    private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
 
     public ValidationExecutor(MontoyaApi api, HarnessClient client) {
         this.api = api;
@@ -90,11 +95,26 @@ public final class ValidationExecutor {
         HttpRequestResponse source = sources.get(plan.id);
         if (source == null) { onComplete.accept("ERROR", "Captured exchange is no longer available."); return; }
         if (!"burp".equalsIgnoreCase(plan.execution_plane)) { onComplete.accept("ERROR", "Plan is not assigned to Burp."); return; }
-        if (!source.request().isInScope()) { submit(plan, source, "rejected", 0, false, "Request is outside Burp's configured scope.", ""); onComplete.accept("REJECTED", "Out-of-scope request refused."); return; }
+        // ARC-4: an out-of-scope source is refused here and nothing is recorded:
+        // "rejected" would read as tested clean, and nothing was tested.
+        if (!source.request().isInScope()) { onComplete.accept("REJECTED", "Out-of-scope request refused; nothing was sent or recorded."); return; }
         if (!exchangeFingerprint(source).equals(plan.source_exchange_hash)) { onComplete.accept("REJECTED", "Source request fingerprint does not match the plan."); return; }
+        if (!inFlight.add(plan.id)) { onComplete.accept("ERROR", "This plan is already running."); return; }
 
         new SwingWorker<Void, Void>() {
             @Override protected Void doInBackground() {
+                // ARC-4: the harness dispatches the plan first and hands back the
+                // live policy; without a dispatch nothing is sent.
+                HarnessClient.PlaneDispatch dispatch;
+                try {
+                    dispatch = client.dispatchPlan(plan.id, plan.source_exchange_hash);
+                } catch (Exception e) {
+                    Outcome o = new Outcome(); o.status = "error";
+                    o.detail = "The harness did not dispatch this plan; nothing was sent: " + e.getMessage();
+                    outcomes.put(plan.id, o);
+                    return null;
+                }
+                dispatches.put(plan.id, dispatch);
                 try {
                     switch (plan.capability) {
                         case "reflection_context_validation" -> reflection(plan, source);
@@ -132,11 +152,31 @@ public final class ValidationExecutor {
                     Outcome o=new Outcome(); o.status="error"; o.detail="Validation failed: "+e.getMessage();
                     outcomes.put(plan.id, o);
                     submit(plan, source, o.status, 0, false, o.detail, "");
+                } finally {
+                    dispatches.remove(plan.id);
                 }
                 return null;
             }
-            @Override protected void done() { Outcome o=outcomes.remove(plan.id); if(o==null)o=new Outcome(); onComplete.accept(o.status.toUpperCase(Locale.ROOT), o.detail); }
+            @Override protected void done() { inFlight.remove(plan.id); Outcome o=outcomes.remove(plan.id); if(o==null)o=new Outcome(); onComplete.accept(o.status.toUpperCase(Locale.ROOT), o.detail); }
         }.execute();
+    }
+
+    /** ARC-4: a send the plan's live policy refused. */
+    private static final class PlaneRefusedException extends RuntimeException {
+        PlaneRefusedException(String reason) { super("Refused by the live plane policy: " + reason); }
+    }
+
+    /**
+     * ARC-4: the one way an executor sends. The plan's dispatch policy decides
+     * each request (mutating methods need active_enabled and
+     * allow_mutating_replay; every send counts against the request budget).
+     */
+    private HttpRequestResponse send(TestPlan plan, HttpRequest request) {
+        HarnessClient.PlaneDispatch dispatch = plan == null ? null : dispatches.get(plan.id);
+        if (dispatch == null) throw new PlaneRefusedException("the plan was not dispatched");
+        String refusal = dispatch.policy.authorize(request.method());
+        if (refusal != null) throw new PlaneRefusedException(refusal);
+        return api.http().sendRequest(request);
     }
 
     /**
@@ -183,7 +223,7 @@ public final class ValidationExecutor {
                 tried.add(payload.template());
                 String canary = "LLMHARNESS_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
                 String rendered = payload.render(canary);
-                var rr = api.http().sendRequest(req.withParameter(HttpParameter.parameter(param.name(), rendered, param.type())));
+                var rr = send(plan, req.withParameter(HttpParameter.parameter(param.name(), rendered, param.type())));
                 String body = rr.response() == null ? "" : rr.response().bodyToString();
                 XssPayloadLogic.Verdict v = XssPayloadLogic.classify(payload, canary, body);
                 if (v == XssPayloadLogic.Verdict.CONFIRMED) {
@@ -218,7 +258,7 @@ public final class ValidationExecutor {
     private void rateLimit(TestPlan plan, HttpRequestResponse source) {
         long start=System.nanoTime(); int throttled=0; List<Integer> statuses=new ArrayList<>();
         for(int i=0;i<MAX_BURST;i++) {
-            var rr=api.http().sendRequest(source.request());
+            var rr=send(plan, source.request());
             int code=rr.response()==null?0:rr.response().statusCode(); statuses.add(code);
             if(code==429 || code==503) throttled++;
         }
@@ -325,15 +365,15 @@ public final class ValidationExecutor {
             }
         }
 
-        var sourceReplay = api.http().sendRequest(source.request());
-        var candidateReplay = api.http().sendRequest(candidate.request());
+        var sourceReplay = send(plan, source.request());
+        var candidateReplay = send(plan, candidate.request());
         if (sourceReplay.response() == null || candidateReplay.response() == null) {
             statusFor(plan, source, "inconclusive", 0, false, "One baseline request returned no response.", "");
             return;
         }
 
         HttpRequest attemptReq = (isIdor && diff != null) ? applyIdentifierSwap(source.request(), diff) : source.request();
-        var attemptResp = api.http().sendRequest(attemptReq);
+        var attemptResp = send(plan, attemptReq);
         if (attemptResp.response() == null) {
             statusFor(plan, source, "inconclusive", 0, false, "The cross-identity attempt request returned no response.", "");
             return;
@@ -342,7 +382,7 @@ public final class ValidationExecutor {
         HttpRequestResponse anonResp = null;
         try {
             HttpRequest anonReq = stripIdentityHeaders(attemptReq);
-            anonResp = api.http().sendRequest(anonReq);
+            anonResp = send(plan, anonReq);
         } catch (Exception ignored) {}
 
         IdentityCompareLogic.Probe sourceProbe = toProbe(sourceReplay);
@@ -507,7 +547,7 @@ public final class ValidationExecutor {
             default -> protectedResource = r.candidate; // RESOLVED
         }
 
-        var reuseReplay = api.http().sendRequest(protectedResource.request());
+        var reuseReplay = send(plan, protectedResource.request());
         if (reuseReplay.response() == null) {
             statusFor(plan, source, "inconclusive", 0, false,
                     "Replaying the old session against the protected resource returned no response.", "");
@@ -517,7 +557,7 @@ public final class ValidationExecutor {
         HttpRequestResponse anonResp = null;
         try {
             HttpRequest anonReq = stripIdentityHeaders(protectedResource.request());
-            anonResp = api.http().sendRequest(anonReq);
+            anonResp = send(plan, anonReq);
         } catch (Exception ignored) {}
 
         SessionLifecycleLogic.Probe preLogoutProbe =
@@ -646,10 +686,10 @@ public final class ValidationExecutor {
         String boundaryValue = boundaryViolationValue(originalValue);
         String malformedValue = "not_a_number";
 
-        var baselineResp = api.http().sendRequest(req);
-        var boundaryResp = api.http().sendRequest(
+        var baselineResp = send(plan, req);
+        var boundaryResp = send(plan, 
                 req.withParameter(HttpParameter.parameter(target.name(), boundaryValue, target.type())));
-        var malformedResp = api.http().sendRequest(
+        var malformedResp = send(plan, 
                 req.withParameter(HttpParameter.parameter(target.name(), malformedValue, target.type())));
 
         IdentityCompareLogic.Probe baselineProbe = baselineResp.response() == null ? null : toProbe(baselineResp);
@@ -733,7 +773,7 @@ public final class ValidationExecutor {
             HttpParameter p = candidates.get(i);
             String calloutUrl = "http://" + payloads.get(i) + "/";
             try {
-                api.http().sendRequest(req.withParameter(HttpParameter.parameter(p.name(), calloutUrl, p.type())));
+                send(plan, req.withParameter(HttpParameter.parameter(p.name(), calloutUrl, p.type())));
             } catch (Exception ignored) {}
         }
 
@@ -830,7 +870,7 @@ public final class ValidationExecutor {
     private void corsMisconfig(TestPlan plan, HttpRequestResponse source) {
         HttpRequest req = source.request();
         HttpRequest probeReq = req.withUpdatedHeader("Origin", CORS_PROBE_ORIGIN);
-        var rr = api.http().sendRequest(probeReq);
+        var rr = send(plan, probeReq);
         var resp = rr.response();
         if (resp == null) {
             statusFor(plan, source, "inconclusive", 0, false, "No response was received for the CORS probe request.", "");
@@ -862,7 +902,7 @@ public final class ValidationExecutor {
                     "No URL/redirect-shaped parameter was available on this request for open_redirect_validation to target.", "");
             return;
         }
-        var rr = api.http().sendRequest(req.withParameter(HttpParameter.parameter(target.name(), OPEN_REDIRECT_PROBE_URL, target.type())));
+        var rr = send(plan, req.withParameter(HttpParameter.parameter(target.name(), OPEN_REDIRECT_PROBE_URL, target.type())));
         var resp = rr.response();
         if (resp == null) {
             statusFor(plan, source, "inconclusive", 0, false, "No response was received for the open redirect probe request.", "");
@@ -903,7 +943,7 @@ public final class ValidationExecutor {
         }
         boolean baselineHasMarker = source.response() != null && source.response().headerValue(HEADER_INJECTION_MARKER_NAME) != null;
         String payloadValue = HeaderInjectionLogic.buildPayload(target.value(), HEADER_INJECTION_MARKER_NAME, HEADER_INJECTION_MARKER_VALUE);
-        var rr = api.http().sendRequest(req.withParameter(HttpParameter.parameter(target.name(), payloadValue, target.type())));
+        var rr = send(plan, req.withParameter(HttpParameter.parameter(target.name(), payloadValue, target.type())));
         var resp = rr.response();
         if (resp == null) {
             statusFor(plan, source, "inconclusive", 0, false, "No response was received for the header injection probe request.", "");
@@ -961,11 +1001,11 @@ public final class ValidationExecutor {
         HttpRequestResponse before = null;
         boolean createStyle = false;
         if (capturedObject != null) {
-            before = api.http().sendRequest(readRequest(req, capturedObject));
+            before = send(plan, readRequest(req, capturedObject));
             createStyle = MassAssignmentLogic.isSuccess(status(before));
         }
-        if (!createStyle) before = api.http().sendRequest(readRequest(req, req.path()));
-        var rr = api.http().sendRequest(req.withBody(mutatedBody));
+        if (!createStyle) before = send(plan, readRequest(req, req.path()));
+        var rr = send(plan, req.withBody(mutatedBody));
         var resp = rr.response();
         if (resp == null) {
             statusFor(plan, source, "inconclusive", 0, false, "No response was received for the mass-assignment probe request.", "");
@@ -978,7 +1018,7 @@ public final class ValidationExecutor {
                             writePath, resp.headerValue("Location"), resp.bodyToString()))
                     : req.path();
         }
-        var after = afterPath == null ? null : api.http().sendRequest(readRequest(req, afterPath));
+        var after = afterPath == null ? null : send(plan, readRequest(req, afterPath));
         String readTargets = createStyle
                 ? "create-style: read before GET " + capturedObject + " (object the captured request created), read after "
                         + (afterPath == null ? "not sent (the probe's response named no same-origin object)"
@@ -1098,7 +1138,7 @@ public final class ValidationExecutor {
         int probeStatus;
         boolean errored = false;
         try {
-            var rr = api.http().sendRequest(req.withUpdatedHeader("Transfer-Encoding", "chunked"));
+            var rr = send(plan, req.withUpdatedHeader("Transfer-Encoding", "chunked"));
             probeStatus = status(rr);
         } catch (Exception e) {
             probeStatus = -1;
@@ -1127,7 +1167,7 @@ public final class ValidationExecutor {
             return;
         }
         int baseline = status(source);
-        var rr = api.http().sendRequest(req.withParameter(HttpParameter.parameter(target.name(), NOSQL_PAYLOAD, target.type())));
+        var rr = send(plan, req.withParameter(HttpParameter.parameter(target.name(), NOSQL_PAYLOAD, target.type())));
         var resp = rr.response();
         String injBody = resp == null ? null : resp.bodyToString();
         NoSqlInjectionLogic.Evidence ev = NoSqlInjectionLogic.evaluate(baseline, status(rr), injBody);
@@ -1154,7 +1194,7 @@ public final class ValidationExecutor {
             statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
             return;
         }
-        var rr = api.http().sendRequest(req.withParameter(
+        var rr = send(plan, req.withParameter(
                 HttpParameter.parameter(redirectParam.name(), OAUTH_ATTACKER_REDIRECT, redirectParam.type())));
         var resp = rr.response();
         String loc = resp == null ? null : resp.headerValue("Location");
@@ -1179,12 +1219,12 @@ public final class ValidationExecutor {
             return;
         }
         String base = target.value() == null ? "" : target.value();
-        var quoteRr = api.http().sendRequest(req.withParameter(
+        var quoteRr = send(plan, req.withParameter(
                 HttpParameter.parameter(target.name(), base + "'", target.type())));
         String quoteBody = quoteRr.response() == null ? null : quoteRr.response().bodyToString();
-        var trueRr = api.http().sendRequest(req.withParameter(
+        var trueRr = send(plan, req.withParameter(
                 HttpParameter.parameter(target.name(), base + "' AND '1'='1", target.type())));
-        var falseRr = api.http().sendRequest(req.withParameter(
+        var falseRr = send(plan, req.withParameter(
                 HttpParameter.parameter(target.name(), base + "' AND '1'='2", target.type())));
         SqlInjectionLogic.Evidence ev = SqlInjectionLogic.evaluate(
                 quoteBody, status(trueRr), bodyLen(trueRr), status(falseRr), bodyLen(falseRr));
@@ -1208,9 +1248,9 @@ public final class ValidationExecutor {
     private void webCachePoisoning(TestPlan plan, HttpRequestResponse source) {
         HttpRequest req = source.request();
         // 1) poison attempt with an unkeyed header.
-        api.http().sendRequest(req.withUpdatedHeader("X-Forwarded-Host", CACHE_POISON_HOST));
+        send(plan, req.withUpdatedHeader("X-Forwarded-Host", CACHE_POISON_HOST));
         // 2) clean follow-up (does NOT carry the header) -- did the marker persist?
-        var rr = api.http().sendRequest(req);
+        var rr = send(plan, req);
         var resp = rr.response();
         if (resp == null) {
             statusFor(plan, source, "inconclusive", 0, false, "No response was received for the cache-poisoning follow-up.", "");
@@ -1247,7 +1287,7 @@ public final class ValidationExecutor {
         boolean carriesAuth = reqHeader(req, "Authorization") != null || reqHeader(req, "Cookie") != null;
         int st;
         try {
-            var rr = api.http().sendRequest(req.withUpdatedHeader("Origin", WS_FOREIGN_ORIGIN));
+            var rr = send(plan, req.withUpdatedHeader("Origin", WS_FOREIGN_ORIGIN));
             st = status(rr);
         } catch (Exception e) {
             st = -1;
@@ -1306,11 +1346,11 @@ public final class ValidationExecutor {
 
         String algNone = JwtForgeryLogic.forgeAlgNone(originalToken);
         if (algNone != null) {
-            var rr = api.http().sendRequest(bare.withAddedHeader(carrier.headerName(), carrier.headerValue(algNone)));
+            var rr = send(plan, bare.withAddedHeader(carrier.headerName(), carrier.headerValue(algNone)));
             var resp = rr.response();
             if (resp != null) {
                 if (JwtForgeryLogic.isSuccess(resp.statusCode())) {
-                    unauthenticatedStatus = status(api.http().sendRequest(bare));
+                    unauthenticatedStatus = status(send(plan, bare));
                     controlSent = true;
                 }
                 JwtForgeryLogic.Evidence ev = JwtForgeryLogic.evaluate("alg:none", originalStatus, resp.statusCode(), originalLen, resp.bodyToString().length(), unauthenticatedStatus);
@@ -1323,14 +1363,14 @@ public final class ValidationExecutor {
         }
 
         String garbled = JwtForgeryLogic.forgeGarbledSignature(originalToken);
-        var rr2 = api.http().sendRequest(bare.withAddedHeader(carrier.headerName(), carrier.headerValue(garbled)));
+        var rr2 = send(plan, bare.withAddedHeader(carrier.headerName(), carrier.headerValue(garbled)));
         var resp2 = rr2.response();
         if (resp2 == null) {
             statusFor(plan, source, "inconclusive", 0, false, "No response was received for the garbled-signature probe.", carried);
             return;
         }
         if (JwtForgeryLogic.isSuccess(resp2.statusCode()) && !controlSent) {
-            unauthenticatedStatus = status(api.http().sendRequest(bare));
+            unauthenticatedStatus = status(send(plan, bare));
         }
         JwtForgeryLogic.Evidence ev2 = JwtForgeryLogic.evaluate("garbled signature", originalStatus, resp2.statusCode(), originalLen, resp2.bodyToString().length(), unauthenticatedStatus);
         if (!JwtForgeryLogic.isSuccess(resp2.statusCode())) {
@@ -1338,13 +1378,13 @@ public final class ValidationExecutor {
             // the token only if the original token alone is accepted. That
             // request is the captured one unless other credentials were removed.
             HttpRequest tokenAlone = bare.withAddedHeader(carrier.headerName(), carrier.headerValue(originalToken));
-            int tokenAloneStatus = sameHeaders(tokenAlone, req) ? originalStatus : status(api.http().sendRequest(tokenAlone));
+            int tokenAloneStatus = sameHeaders(tokenAlone, req) ? originalStatus : status(send(plan, tokenAlone));
             ev2 = JwtForgeryLogic.requireTokenAloneAccepted(ev2, tokenAloneStatus);
             // Refused alone, the token may need a cookie that is no credential
             // (a tenant, a locale): probe again with only those kept (RV-Q item Q3).
             String kept = JwtForgeryLogic.nonCredentialCookies(cookieHeaders(req), carrier);
             if (ev2.verdict() == JwtForgeryLogic.Verdict.INCONCLUSIVE && kept != null) {
-                ev2 = jwtWithKeptCookies(bare, carrier, kept, originalStatus, originalLen, ev2);
+                ev2 = jwtWithKeptCookies(plan, bare, carrier, kept, originalStatus, originalLen, ev2);
             }
         }
         statusFor(plan, source, ev2.verdict().name().toLowerCase(Locale.ROOT), ev2.confidence(), ev2.confirmed(), ev2.summary(), ev2.detail() + " | " + carried);
@@ -1356,21 +1396,21 @@ public final class ValidationExecutor {
      * forged token got a 2xx, is the kept cookies alone. At most four
      * requests. See JwtForgeryLogic.withKeptCookies.
      */
-    private JwtForgeryLogic.Evidence jwtWithKeptCookies(HttpRequest bare, JwtForgeryLogic.Carrier carrier, String kept,
+    private JwtForgeryLogic.Evidence jwtWithKeptCookies(TestPlan plan, HttpRequest bare, JwtForgeryLogic.Carrier carrier, String kept,
                                                         int originalStatus, int originalLen,
                                                         JwtForgeryLogic.Evidence tokenAloneRefused) {
         String token = carrier.token();
-        int tokenWithKept = status(api.http().sendRequest(withKeptCookies(bare, carrier, kept, token)));
+        int tokenWithKept = status(send(plan, withKeptCookies(bare, carrier, kept, token)));
         JwtForgeryLogic.Evidence forged = null;
         if (JwtForgeryLogic.isSuccess(tokenWithKept)) {
             String[][] variants = {{"alg:none", JwtForgeryLogic.forgeAlgNone(token)},
                     {"garbled signature", JwtForgeryLogic.forgeGarbledSignature(token)}};
             for (String[] variant : variants) {
                 if (variant[1] == null) continue;
-                var resp = api.http().sendRequest(withKeptCookies(bare, carrier, kept, variant[1])).response();
+                var resp = send(plan, withKeptCookies(bare, carrier, kept, variant[1])).response();
                 if (resp == null) continue;
                 boolean accepted = JwtForgeryLogic.isSuccess(resp.statusCode());
-                int keptAloneStatus = accepted ? status(api.http().sendRequest(bare.withAddedHeader("Cookie", kept))) : -1;
+                int keptAloneStatus = accepted ? status(send(plan, bare.withAddedHeader("Cookie", kept))) : -1;
                 forged = JwtForgeryLogic.evaluate(variant[0] + ", with the kept cookies", originalStatus, resp.statusCode(),
                         originalLen, resp.bodyToString().length(), keptAloneStatus);
                 if (accepted) break;
@@ -1436,7 +1476,7 @@ public final class ValidationExecutor {
         }
 
         String payloadBody = XxeCollaboratorLogic.buildPayload(payload.toString());
-        api.http().sendRequest(req.withBody(payloadBody));
+        send(plan, req.withBody(payloadBody));
         List<String> types = pollInteractionTypes(client, payload.toString());
         XxeCollaboratorLogic.Evidence ev = XxeCollaboratorLogic.evaluate(true, types);
         statusFor(plan, source, ev.verdict().name().toLowerCase(Locale.ROOT), ev.confidence(), ev.confirmed(), ev.summary(), ev.detail());
@@ -1524,7 +1564,7 @@ public final class ValidationExecutor {
                 marker = CsrfLogic.newChangeMarker(java.util.concurrent.ThreadLocalRandom.current());
                 forged = forged.withParameter(HttpParameter.parameter(markable.name(), markable.value() + marker, markable.type()));
                 for (String candidate : csrfReadTargets(req)) {
-                    before = api.http().sendRequest(readRequest(req, candidate));
+                    before = send(plan, readRequest(req, candidate));
                     if (CsrfLogic.isSuccess(status(before))) { readTarget = candidate; break; }
                 }
             }
@@ -1534,7 +1574,7 @@ public final class ValidationExecutor {
                     forged = forged.withRemovedHeader(h.getKey()).withAddedHeader(h.getKey(), h.getValue());
                 }
             }
-            forgedStatus = status(api.http().sendRequest(forged));
+            forgedStatus = status(send(plan, forged));
             boolean preflighted = false;
             if (textPlainFirst && CsrfLogic.isSuccess(forgedStatus)) {
                 preflight = null;
@@ -1547,15 +1587,15 @@ public final class ValidationExecutor {
                 variantNote = "the body sent as text/plain was refused (status " + forgedStatus
                         + "), so it was sent as captured (Content-Type " + contentType + ")";
                 forged = asCaptured;
-                forgedStatus = status(api.http().sendRequest(forged));
+                forgedStatus = status(send(plan, forged));
                 preflighted = true;
             }
             if (CsrfLogic.isSuccess(forgedStatus)) {
                 if (preflighted && readTarget != null) {
                     readBack = CsrfLogic.ReadBack.notRun("only the request as captured, which needs a CORS preflight, succeeded");
                 } else if (readTarget != null) {
-                    var after = api.http().sendRequest(readRequest(req, readTarget));
-                    var again = api.http().sendRequest(readRequest(req, readTarget));
+                    var after = send(plan, readRequest(req, readTarget));
+                    var again = send(plan, readRequest(req, readTarget));
                     readBack = CsrfLogic.readBack(readTarget, markable.name(), marker,
                             status(before), responseBody(before), status(after), responseBody(after),
                             status(again), responseBody(again));
@@ -1566,7 +1606,7 @@ public final class ValidationExecutor {
                 }
                 // Control: the same request without the cookie either. If it
                 // also succeeds, the action is not gated on the session.
-                anonymousStatus = status(api.http().sendRequest(forged.withRemovedHeader("Cookie")));
+                anonymousStatus = status(send(plan, forged.withRemovedHeader("Cookie")));
             }
         }
         CsrfLogic.Evidence ev = CsrfLogic.evaluate(req.method(), cookieAuthPresent, tokenFound,
@@ -1625,7 +1665,7 @@ public final class ValidationExecutor {
             SstiPayloadLogic.Payload payload;
             while ((payload = SstiPayloadLogic.nextPayload(tried)) != null) {
                 tried.add(payload.template());
-                var rr = api.http().sendRequest(req.withParameter(HttpParameter.parameter(param.name(), payload.template(), param.type())));
+                var rr = send(plan, req.withParameter(HttpParameter.parameter(param.name(), payload.template(), param.type())));
                 String mutatedBody = rr.response() == null ? null : rr.response().bodyToString();
                 SstiPayloadLogic.Evidence ev = SstiPayloadLogic.classify(payload, baselineBody, mutatedBody);
                 if (ev.verdict() == SstiPayloadLogic.Verdict.CONFIRMED) {
@@ -1691,7 +1731,7 @@ public final class ValidationExecutor {
         HttpParameter target = targets.get(0);
 
         long baselineStart = System.nanoTime();
-        api.http().sendRequest(req);
+        send(plan, req);
         long baselineMs = (System.nanoTime() - baselineStart) / 1_000_000;
 
         CommandInjectionTimingLogic.Verdict best = CommandInjectionTimingLogic.Verdict.REJECTED;
@@ -1703,12 +1743,12 @@ public final class ValidationExecutor {
 
             String shortPayload = payload.render(CommandInjectionTimingLogic.SHORT_SECONDS);
             long shortStart = System.nanoTime();
-            api.http().sendRequest(req.withParameter(HttpParameter.parameter(target.name(), shortPayload, target.type())));
+            send(plan, req.withParameter(HttpParameter.parameter(target.name(), shortPayload, target.type())));
             long shortMs = (System.nanoTime() - shortStart) / 1_000_000;
 
             String longPayload = payload.render(CommandInjectionTimingLogic.LONG_SECONDS);
             long longStart = System.nanoTime();
-            api.http().sendRequest(req.withParameter(HttpParameter.parameter(target.name(), longPayload, target.type())));
+            send(plan, req.withParameter(HttpParameter.parameter(target.name(), longPayload, target.type())));
             long longMs = (System.nanoTime() - longStart) / 1_000_000;
 
             CommandInjectionTimingLogic.Evidence ev = CommandInjectionTimingLogic.evaluate(payload, baselineMs, shortMs, longMs);
@@ -1761,7 +1801,7 @@ public final class ValidationExecutor {
                 futures.add(pool.submit(() -> {
                     ready.countDown();
                     try { go.await(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                    var rr = api.http().sendRequest(req);
+                    var rr = send(plan, req);
                     return rr.response() == null ? 0 : (int) rr.response().statusCode();
                 }));
             }
@@ -1815,7 +1855,7 @@ public final class ValidationExecutor {
             return;
         }
 
-        var rr = api.http().sendRequest(req.withBody(mutatedBody));
+        var rr = send(plan, req.withBody(mutatedBody));
         var resp = rr.response();
         if (resp == null) {
             statusFor(plan, source, "inconclusive", 0, false, "No response was received for the file-upload probe request.", "");
@@ -1832,7 +1872,7 @@ public final class ValidationExecutor {
                         ? java.net.URI.create(extractedUrl).getRawPath()
                         : extractedUrl;
                 if (path != null && !path.isEmpty()) {
-                    var fetchRr = api.http().sendRequest(readRequest(req, path));
+                    var fetchRr = send(plan, readRequest(req, path));
                     if (fetchRr.response() != null) {
                         fetchStatus = fetchRr.response().statusCode();
                         fetchedContainsEicar = fetchRr.response().bodyToString().contains(FileUploadLogic.EICAR_STRING);
@@ -1849,8 +1889,22 @@ public final class ValidationExecutor {
     }
 
     private void submit(TestPlan p,HttpRequestResponse source,String status,double confidence,boolean confirmed,String summary,String evidence){
+        HarnessClient.PlaneDispatch dispatch = dispatches.get(p.id);
+        String refusal = dispatch == null ? null : dispatch.policy.refusal();
+        if (refusal != null) {
+            // ARC-4: once the policy refused a send, the run has no verdict --
+            // whatever the arm concluded from a partial run (several swallow a
+            // failed send). The refusal is reported instead, as "error", which
+            // the coverage report shows as blocked, never as tested clean.
+            status = "error"; confidence = 0; confirmed = false;
+            summary = "Refused by the live plane policy: " + refusal;
+            evidence = dispatch.policy.sent() + " request(s) sent before the refusal";
+            Outcome o = new Outcome(); o.status = "refused"; o.detail = summary;
+            outcomes.put(p.id, o);
+        }
         ValidationSubmission v=new ValidationSubmission(); v.plan_id=p.id; v.status=status; v.confidence=confidence; v.confirmed=confirmed;
         v.summary=summary; v.evidence=evidence; v.executor="burp:"+p.capability; v.source_exchange_hash=exchangeFingerprint(source);
+        v.dispatch_nonce = dispatch == null ? null : dispatch.nonce;
         try{
             client.submitValidationResult(v);
         }catch(HarnessClient.HarnessException e){
