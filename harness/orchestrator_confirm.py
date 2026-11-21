@@ -136,6 +136,21 @@ class ConfirmMixin:
 
         oracle_framework.stamp_finding(finding, capsule)
 
+    def _standalone_probe_gate(self):
+        """ARC-11: a SafetyGate of this probe's own -- never the process-wide default
+        gate, whose policy is frozen at startup (it misses the /settings
+        active_enabled toggle) and whose audit log and per-finding mutation counts
+        every standalone probe shared. The validators policy with the LIVE
+        active_enabled, scoped to this orchestrator's hosts (as RunContext.create
+        folds them)."""
+        from harness import scope_lock
+        from harness.safety_gate import SafetyGate, SafetyGateConfig
+        from harness.target_request_policy import TargetRequestPolicy
+        cfg = per_run_gate_config(self.config, getattr(self, "validator_registry", None))
+        cfg["allowed_hosts"] = list(scope_lock.configured_entries(self.allowed_hosts))
+        cfg["target_policy"] = TargetRequestPolicy.from_config(self.config or {})
+        return SafetyGate(SafetyGateConfig.from_dict(cfg))
+
     async def run_active_probe(
         self,
         exchange: HttpExchange,
@@ -167,7 +182,6 @@ class ConfirmMixin:
         from harness import pivot_memory
         from harness import activity_feed
         from harness.run_context import standalone_context
-        from harness.safety_gate import get_default_gate
 
         # Phase 4 cloud-coordinator seam: the iterative agent's reasoning runs on
         # the cloud model when the seam is toggled on (else local).
@@ -195,7 +209,7 @@ class ConfirmMixin:
             if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
                 raise ValueError("iterative_agent.max_requests must be a nonnegative integer")
             owned_ctx = standalone_context(self.allowed_hosts, config=self.config,
-                                           gate=get_default_gate(), active_mode=True,
+                                           gate=self._standalone_probe_gate(), active_mode=True,
                                            max_requests=ceiling)
             probe_ctx = owned_ctx
         async def experiment_handoff(action):

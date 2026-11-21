@@ -129,6 +129,9 @@ class RunManifest:
         # ARC-3: the outbound throttle the run started under (and who set it).
         from harness import global_throttle
         data["throttle"] = {"at_start": global_throttle.throttle.audit_state()}
+        # ARC-11: validators.active_enabled at the start (and who set it last).
+        from harness import safety_gate
+        data["active_enabled"] = {"at_start": safety_gate.active_enabled_state()}
         manifest = cls(data, out)
         manifest._persist(append_ledger=True)
         return manifest
@@ -143,6 +146,12 @@ class RunManifest:
                                  "at_finish": global_throttle.throttle.audit_state(),
                                  "changes": global_throttle.throttle.changes(
                                      since=self.data.get("started_at"))}
+        # ARC-11: every active_enabled toggle made while the run was live.
+        from harness import safety_gate
+        self.data["active_enabled"] = {**(self.data.get("active_enabled") or {}),
+                                       "at_finish": safety_gate.active_enabled_state(),
+                                       "changes": safety_gate.active_enabled_changes(
+                                           since=self.data.get("started_at"))}
         if request_ceiling is not None:
             self.data["request_ceiling"] = _counters(request_ceiling)
             if request_ceiling.get("exhausted"):

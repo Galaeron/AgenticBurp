@@ -44,7 +44,7 @@ import httpx  # noqa: F401 -- HTTP transport site; sends now go via run_context.
 from harness import circuit_breaker, global_throttle
 from harness.models import Finding, HttpExchange, request_body_is_placeholder, sanitize_agent_finding
 from harness.ollama_client import OllamaInvalidJSONError, OllamaTransientError
-from harness.safety_gate import get_default_gate
+from harness.safety_gate import ambient_gate
 from harness.security import SECRET_HEADER_NAMES  # the one classifier behind redact_headers
 from harness.security import is_identity_credential_header
 from harness.run_context import transport_for  # W-16: the single TargetTransport
@@ -658,7 +658,11 @@ class IterativeAgent:
         # time pinned every later _execute() to whatever gate was ambient (or
         # the safe fallback) at STARTUP, forever -- exactly the stale-gate defect
         # this property closes (2026-09-17 coverage-recovery plan, Step 1).
-        return get_default_gate()
+        # ARC-11: the ambient run's gate, or None -- never the process-wide default
+        # gate, whose policy is frozen at startup and whose audit log and mutation
+        # counts every caller shares. With None, a send outside any run gets a gate
+        # of its own (transport_for -> standalone_context) with the strict defaults.
+        return ambient_gate()
 
     def _build_request(self, exchange: HttpExchange, action: dict, headers_state: dict,
                        current: tuple[str, str] | None = None) -> tuple:

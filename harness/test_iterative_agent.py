@@ -541,10 +541,15 @@ class DuplicateProposalTests(unittest.IsolatedAsyncioTestCase):
                           request_headers={"Content-Type": "application/json"},
                           request_body='{"subject":"x","note":"n"}', response_status=201)
         body = lambda p, v: _fresh({"action": "mutate", "location": "body", "param": p, "value": v})
-        with patch("harness.iterative_agent.get_default_gate", return_value=gate):
+        from harness.run_context import standalone_context
+        ctx = standalone_context(["localhost"], gate=gate)   # ARC-11: injected, not patched
+        try:
             result, net, ollama = await self._drive(
                 [body("subject", "y"), body("subject", "z"), body("note", "y"),
-                 body("subject", "y"), _STOP], exchange=ex)
+                 body("subject", "y"), _STOP], exchange=ex,
+                agent=IterativeAgent(None, "m", ["localhost"], run_context=ctx))
+        finally:
+            await ctx.aclose()
         self.assertEqual([s[3] for s in net.sent],
                          ['{"subject": "y", "note": "n"}', '{"subject": "z", "note": "n"}',
                           '{"subject": "x", "note": "y"}'])

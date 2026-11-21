@@ -6,11 +6,11 @@ import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
 
 from harness import safety_gate
 from harness.iterative_agent import IterativeAgent
 from harness.models import HttpExchange
+from harness.run_context import standalone_context
 from harness.safety_gate import SafetyGate, SafetyGateConfig
 
 _STOP = {"action": "stop", "verdict": "not_found", "thought": "done"}
@@ -91,9 +91,13 @@ class _LoopBase(unittest.IsolatedAsyncioTestCase):
 
     async def _drive(self, actions, exchange):
         ollama = _ScriptedOllama(actions + [_STOP])
-        agent = IterativeAgent(ollama, "m", ["127.0.0.1"])
-        with patch("harness.iterative_agent.get_default_gate", return_value=self.gate):
+        # ARC-11: the gate is injected through the run context, not patched in.
+        ctx = standalone_context(["127.0.0.1"], gate=self.gate)
+        agent = IterativeAgent(ollama, "m", ["127.0.0.1"], run_context=ctx)
+        try:
             result = await agent.run(exchange, "price tampering", "business_logic", step_budget=20)
+        finally:
+            await ctx.aclose()
         return result, ollama
 
 

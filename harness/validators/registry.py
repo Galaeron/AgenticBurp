@@ -44,7 +44,7 @@ from .security_headers_validator import SecurityHeadersValidator
 from .error_handling_validator import ErrorHandlingValidator
 from .content_exposure_validator import ContentExposureValidator
 from .write_integrity_validator import WriteIntegrityValidator
-from harness.safety_gate import get_default_gate, reset_default_gate
+from harness.safety_gate import get_default_gate, record_active_enabled, reset_default_gate
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +68,7 @@ class ValidatorRegistry:
                                        and name != "cross_identity"}
         self.enabled = bool(cfg.get("enabled", True))
         self.active_enabled = bool(cfg.get("active_enabled", False))
+        record_active_enabled(self.active_enabled, source="config")   # ARC-11
         # Seed the process-wide safety gate from the real config now,
         # before any validator's validate() call can lazily initialize
         # it with defaults. reset_default_gate() first so re-creating a
@@ -493,11 +494,14 @@ class ValidatorRegistry:
                 validator.ownership = ledger
         self._auto_xid = None
 
-    def set_active_enabled(self, enabled: bool) -> None:
+    def set_active_enabled(self, enabled: bool, *, source: str = "settings") -> None:
         """Runtime toggle for the active-validator gate (validators.active_enabled).
         In-memory only; never written back to config. Does NOT persist across a
-        server restart -- deliberately, like the identities it authorizes."""
+        server restart -- deliberately, like the identities it authorizes. ARC-11:
+        the change is logged (safety_gate.record_active_enabled) so the manifest of
+        a run that was live at the time records it."""
         self.active_enabled = bool(enabled)
+        record_active_enabled(self.active_enabled, source=source)
         # Second-switch visibility: active_enabled ALONE does not exercise the
         # validators whose proof requires a mutating request -- those are gated by
         # the SEPARATE validators.allow_mutating_replay flag (frozen from startup
