@@ -451,7 +451,15 @@ public class HarnessClient {
                 .build();
         HttpResponse<String> resp = sendBounded(req);
         requireAuthenticatedResponse(resp);
-        if (resp.statusCode() != 200) throw planeFailure(resp, "dispatch");
+        if (resp.statusCode() != 200) {
+            HarnessException failure = planeFailure(resp, "dispatch");
+            if (resp.statusCode() == 404 && failure.getRefusalReason() == null) {
+                // No route at all: a harness from before the dispatch protocol (ARC-4).
+                failure = failed("http_error", failure.getMessage()
+                        + " The harness may predate plan dispatch; update it to match this extension.");
+            }
+            throw failure;
+        }
         return parseDispatch(responseObject(resp.body()));
     }
 

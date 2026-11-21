@@ -146,6 +146,19 @@ public final class HarnessClientDispatchTest {
     }
 
     @Test
+    @DisplayName("a dispatch 404 without a code points at a harness that predates dispatch")
+    void routeless404HintsAtVersionSkew() {
+        status = 404;
+        reply = "{\"detail\": \"Not Found\"}";
+        var e = assertThrows(HarnessClient.HarnessException.class, () -> client.dispatchPlan("p1", "hash-1"));
+        assertTrue(e.getMessage().contains("predate plan dispatch"), e.getMessage());
+        refuseWith("unknown_plan");
+        e = assertThrows(HarnessClient.HarnessException.class, () -> client.dispatchPlan("p1", "hash-1"));
+        assertFalse(e.getMessage().contains("predate"), e.getMessage());
+        checkSurfaced(e, "unknown_plan");
+    }
+
+    @Test
     @DisplayName("control: the pre-ARC-12 failure (status only) does not surface the reason")
     void controlStatusOnlyFailureLosesTheReason() {
         assertThrows(AssertionError.class, () -> checkSurfaced(HarnessClient.httpFailure(409), "plan_terminal"));
