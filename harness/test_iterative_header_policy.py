@@ -92,6 +92,12 @@ class SetHeaderDenyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(net.sent, [])
         self.assertIn("CR, LF or NUL", result.transcript[0].blocked)
 
+    def test_a_name_with_a_trailing_line_feed_is_not_a_token(self):
+        """Review fix: the token check is a full match (`$` alone admits a final LF)."""
+        from harness.iterative_agent import _set_header_denial
+        self.assertIn("not a valid header name", _set_header_denial("X-Probe\n", "v"))
+        self.assertIsNone(_set_header_denial("X-Probe", "v"))
+
     async def test_negative_control_removing_the_deny_entry_lets_the_send_happen(self):
         """With "host" taken out of the deny set the very same action is sent, so
         the zero-send result above is the deny entry's doing."""

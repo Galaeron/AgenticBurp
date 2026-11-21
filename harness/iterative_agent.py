@@ -148,7 +148,7 @@ def _set_header_denial(name: str, value: str) -> str | None:
     and the framing pair; credentials that say who is calling (Authorization,
     Cookie, X-API-Key ...) come only from the run's sessions. A request-binding
     token (X-CSRF-Token, Idempotency-Key) stays a knob the model may turn."""
-    if not _HEADER_NAME_RE.match(name):
+    if not _HEADER_NAME_RE.fullmatch(name):   # fullmatch: `$` alone admits a trailing LF
         return f"set_header name {_excerpt(name, 40)!r} is not a valid header name"
     if any(c in value for c in "\r\n\x00"):
         return "set_header value must not contain CR, LF or NUL"
