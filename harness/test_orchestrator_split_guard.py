@@ -205,6 +205,17 @@ class ModuleSizeTests(unittest.TestCase):
         self.assertEqual(set(chain_stage_patch.CHAIN_MODULES), on_disk)
 
 
+class DriverContractTests(unittest.TestCase):
+    def test_the_driver_keeps_the_decorators_of_the_function_it_replaced(self):
+        # The split once dropped these: the identity lease and the review-overlap reaper wrap the
+        # whole engagement, so they belong on the driver, not on a stage.
+        tree = ast.parse((HARNESS / "orchestrator_chain.py").read_text(encoding="utf-8-sig"))
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ChainMixin")
+        fn = next(n for n in cls.body if getattr(n, "name", "") == "investigate_engagement")
+        self.assertEqual({ast.unparse(d) for d in fn.decorator_list},
+                         {"identity_headers.leased", "review_overlap.reaps_review_overlaps"})
+
+
 class PatchTargetTests(unittest.TestCase):
     def test_every_orchestrator_patch_target_is_looked_up_by_its_module(self):
         problems = {}

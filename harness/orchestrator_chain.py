@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 # FR-6: need the module too (the driver scope reads its ambient run) -- aliased because
 # investigate_engagement and several methods have a `run_context` parameter that would shadow it.
 from harness import run_context as _run_context_mod
-from harness import global_throttle, scope_discovery, store
+from harness import global_throttle, identity_headers, review_overlap, scope_discovery, store
 from harness.models import HttpExchange
 from harness.orchestrator_chain_coverage import ChainCoverageMixin
 from harness.orchestrator_chain_discovery import ChainDiscoveryMixin
@@ -762,6 +762,12 @@ class ChainMixin(
             return {}
         return {"discovery_recursion_depth": depth, "discovery_recursion_max_requests": cap}
 
+    # Roles registered as replay identities below are owned by this engagement
+    # and released when it ends (never leak into a later engagement on the host).
+    # A capture review left running beside the later phases is cancelled and awaited
+    # when the engagement ends, however it ends (harness/review_overlap.py).
+    @identity_headers.leased
+    @review_overlap.reaps_review_overlaps
     async def investigate_engagement(self, base_url, roles, *, max_nodes: int = 8,
                                      step_budget: int = 16, discovery_max_probes: int = 6000,
                                      discovery_max_endpoints: int | None = None,
