@@ -24,6 +24,7 @@ The contract that keeps patching working (harness.test_store_facade checks it):
 from __future__ import annotations
 import contextvars
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -134,9 +135,17 @@ from harness.store_maintenance import (  # noqa: E402
     engagement_retention_days, expired_engagement_stores, apply_engagement_retention,
 )
 
-# OPS-5: a store named in the environment is selected at import.
-if os.environ.get(ENGAGEMENT_ENV_VAR):
-    try:
-        select_engagement_store(os.environ[ENGAGEMENT_ENV_VAR])
-    except ValueError as exc:
-        raise ValueError(f"{ENGAGEMENT_ENV_VAR}: {exc}") from None
+# OPS-5: a store named in the environment is selected at import. If that fails, Python drops
+# this module from sys.modules but the repositories stay loaded, bound to it; forget them too,
+# so a retried import builds a facade they read through instead of this discarded one.
+try:
+    if os.environ.get(ENGAGEMENT_ENV_VAR):
+        try:
+            select_engagement_store(os.environ[ENGAGEMENT_ENV_VAR])
+        except ValueError as exc:
+            raise ValueError(f"{ENGAGEMENT_ENV_VAR}: {exc}") from None
+except BaseException:
+    for _repository in [name for name in sys.modules if name.startswith("harness.store_")]:
+        del sys.modules[_repository]
+        sys.modules["harness"].__dict__.pop(_repository.rpartition(".")[2], None)
+    raise

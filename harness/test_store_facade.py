@@ -209,11 +209,16 @@ class FacadeShapeTests(unittest.TestCase):
     def test_callers_outside_the_store_never_import_a_repository(self):
         # A caller that imported harness.store_x directly would bypass every facade patch.
         offenders = []
-        for path in sorted(HARNESS.rglob("*.py")):
+        roots = [HARNESS, REPO / "testing", REPO / "evaluation_integrity"]
+        for path in sorted(p for root in roots if root.is_dir() for p in root.rglob("*.py")):
             if ("__pycache__" in path.parts or path.name.startswith("test_")
                     or path.stem in REPOSITORIES + ("store",)):
                 continue
-            for n in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            except (SyntaxError, UnicodeDecodeError):
+                continue   # not importable either, so it cannot bypass a patch
+            for n in ast.walk(tree):
                 mods = ([n.module or ""] + [f"harness.{a.name}" for a in n.names] if isinstance(n, ast.ImportFrom)
                         else [a.name for a in n.names] if isinstance(n, ast.Import) else [])
                 if any(m.startswith("harness.store_") for m in mods):
@@ -230,6 +235,47 @@ class FacadeShapeTests(unittest.TestCase):
                 proc = subprocess.run([sys.executable, "-c", code], cwd=REPO, env=env,
                                       capture_output=True, text=True, timeout=120)
                 self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+
+    def test_a_retried_import_after_a_failed_selection_rebinds_the_repositories(self):
+        # An invalid HARNESS_ENGAGEMENT_ID makes the facade's import raise. The retried import
+        # must give repositories that read through the new facade. Negative control: the same
+        # facade source with its cleanup removed leaves them bound to the discarded module.
+        env = {k: v for k, v in os.environ.items() if k != "HARNESS_ENGAGEMENT_ID"}
+        env["PYTHONPATH"] = str(REPO)
+        cleanup = "        del sys.modules[_repository]\n"
+        self.assertIn(cleanup, _source("store").replace("\r\n", "\n"))
+        for strip_cleanup, expected in ((False, "bound"), (True, "stale")):
+            code = RETRY_SCRIPT.format(strip=strip_cleanup)
+            with self.subTest(strip_cleanup=strip_cleanup):
+                proc = subprocess.run([sys.executable, "-c", code], cwd=REPO, env=env,
+                                      capture_output=True, text=True, timeout=120)
+                self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+                self.assertEqual(proc.stdout.strip(), expected)
+
+
+RETRY_SCRIPT = '''
+import os, sys, types
+from pathlib import Path
+import harness
+path = Path(harness.__file__).with_name("store.py")
+source = path.read_text(encoding="utf-8").replace("\\r\\n", "\\n")
+if {strip}:
+    source = source.replace("        del sys.modules[_repository]\\n", "        pass\\n")
+module = types.ModuleType("harness.store")
+module.__file__ = str(path)
+sys.modules["harness.store"] = module          # what the import system does, then undoes on failure
+os.environ["HARNESS_ENGAGEMENT_ID"] = " surrounded by whitespace "
+try:
+    exec(compile(source, str(path), "exec"), module.__dict__)
+except ValueError:
+    sys.modules.pop("harness.store", None)
+else:
+    sys.exit("the invalid engagement ID was accepted")
+del os.environ["HARNESS_ENGAGEMENT_ID"]
+from harness import store
+import harness.store_schema as schema
+print("bound" if schema._store is store and store._connect is schema._connect else "stale")
+'''
 
 
 class ContractCheckerNegativeControls(unittest.TestCase):
@@ -366,7 +412,10 @@ class PatchReachTests(unittest.TestCase):
 
     def test_caller_helpers_are_looked_up_on_the_facade(self):
         # put_evidence_blob, persist_test_plans and persist_validation_submission are called
-        # from outside the store, as `store.<name>` on `from harness import store`.
+        # from outside the store, as `store.<name>` on `from harness import store`. This checks
+        # that binding (statically, and for module-level bindings by identity under a patch); the
+        # caller-level reach of these patches is exercised by the tests that patch them
+        # (test_evidence_ledger_wiring, test_agent_routing_caller, test_parameter_binding_caller...).
         callers = {"put_evidence_blob": ["run_context", "browser_driver"],
                    "persist_test_plans": ["orchestrator_detect", "orchestrator_confirm", "pivot_memory"],
                    "persist_validation_submission": ["orchestrator_confirm"]}
@@ -385,7 +434,6 @@ class PatchReachTests(unittest.TestCase):
                         if hasattr(module, "store"):   # bound at module level
                             self.assertIs(module.store, store)
                             self.assertIs(getattr(module.store, name), mock)
-                        self.assertIs(getattr(sys.modules["harness.store"], name), mock)
 
 
 if __name__ == "__main__":
