@@ -11,12 +11,16 @@ from harness.ollama_client import (
     _loads_lenient,
     _chat_options,
 )
+from harness.testing_fixtures.model_pacer import fresh_model_pacer
 
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 
 def _make_client(testcase: unittest.TestCase, handler) -> OllamaClient:
+    # Its own model-call pacer: every client in the process shares one, and the
+    # earlier tests' calls would pace this test's (up to 6 s a call).
+    fresh_model_pacer(testcase)
     client = OllamaClient(base_url="http://fake-ollama:11434")
 
     class PatchedAsyncClient(_REAL_ASYNC_CLIENT):
@@ -37,6 +41,7 @@ def _seed_capture_client(testcase, captured, *, seed=None) -> OllamaClient:
     """Like _make_client, but constructs the client with a run-level `seed` and
     records every outgoing request payload into `captured` so a test can assert
     exactly what reached Ollama's options."""
+    fresh_model_pacer(testcase)
     client = OllamaClient(base_url="http://fake-ollama:11434", seed=seed)
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -219,6 +224,7 @@ class NumCtxOptInTests(unittest.IsolatedAsyncioTestCase):
                 "message": {"content": json.dumps({"ok": True})},
                 "done": True,
             })
+        fresh_model_pacer(self)
         client = OllamaClient(base_url="http://fake-ollama:11434", num_ctx=num_ctx)
 
         class PatchedAsyncClient(_REAL_ASYNC_CLIENT):

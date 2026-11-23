@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import logging
+import math
 import re
 import asyncio
 import time
@@ -152,12 +153,24 @@ class OllamaCloudModelRefusedError(OllamaError):
         self.slots = list(slots or [])
 
 
+class OllamaPacerTimeoutError(OllamaError):
+    """The process-wide model-call pacer (`ollama.rate_limit`, see
+    rate_limiter.pacer_config) did not admit the call within its
+    max_wait_seconds, so nothing was sent. A local backlog, not an outage: never
+    retried and kept out of the circuit breaker."""
+
+    def __init__(self, message: str = "", *, max_wait_seconds: float | None = None):
+        super().__init__(message)
+        self.max_wait_seconds = max_wait_seconds
+
+
 # Exceptions that do not count as circuit-breaker failures: a config-level,
 # per-prompt or rate-limit fault, not a service outage. What still counts: a
 # transport failure, a timeout, a 5xx. Shared with RunContext's per-run breaker.
 BREAKER_EXCLUDED_ERRORS = (OllamaModelNotFoundError, OllamaInvalidJSONError,
                            OllamaContextTruncatedError, OllamaEmptyResponseError,
-                           OllamaRateLimitedError, OllamaCloudModelRefusedError)
+                           OllamaRateLimitedError, OllamaCloudModelRefusedError,
+                           OllamaPacerTimeoutError)
 
 
 # Context-window guard. Ollama does not say when it cuts a prompt: the reply
@@ -548,7 +561,8 @@ def backend_options(ollama_config: dict | None) -> dict:
     cfg = ollama_config or {}
     return {"api": cfg.get("api"), "max_output_tokens": cfg.get("max_output_tokens"),
             "reasoning_effort": cfg.get("reasoning_effort"),
-            "allow_cloud_models": cfg.get("allow_cloud_models")}
+            "allow_cloud_models": cfg.get("allow_cloud_models"),
+            "rate_limit": cfg.get("rate_limit")}
 
 
 def backend_setting(ollama_config: dict | None) -> dict:
@@ -558,6 +572,45 @@ def backend_setting(ollama_config: dict | None) -> dict:
     api, cap, effort = parse_backend_settings(
         options["api"], options["max_output_tokens"], options["reasoning_effort"])
     return {"api": api, "max_output_tokens": cap, "reasoning_effort": effort}
+
+
+def _number(value) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def parse_rate_limit(section) -> rate_limiter.RateLimitConfig | None:
+    """`ollama.rate_limit`, the model-call pacer every OllamaClient in the process
+    shares, as its token-bucket config; None when the block is absent (the pacer
+    keeps the values it has). Keys, each optional, defaulting to the pacer's
+    shipped values (rate_limiter.PACER_DEFAULTS):
+    - enabled: true | false (unquoted). false admits every call at once.
+    - burst_calls: an integer from 1: calls that may start back to back.
+    - calls_per_minute: a number above 0: the refill once the burst is spent.
+    - max_wait_seconds: a number above 0: a call not admitted by then fails
+      with OllamaPacerTimeoutError, unsent. It has no unbounded setting.
+    Strict like the other ollama keys: an unknown key or a wrong type raises at
+    startup instead of being ignored."""
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ValueError("invalid ollama config: ollama.rate_limit must be a mapping, "
+                         f"got {type(section).__name__}")
+    unknown = sorted(set(section) - set(rate_limiter.PACER_DEFAULTS))
+    if unknown:
+        raise ValueError(f"invalid ollama config: ollama.rate_limit has unknown key(s) {unknown}; "
+                         f"allowed: {', '.join(rate_limiter.PACER_DEFAULTS)}")
+    values = {**rate_limiter.PACER_DEFAULTS, **section}
+    if type(values["enabled"]) is not bool:
+        raise ValueError("invalid ollama config: ollama.rate_limit.enabled must be true or "
+                         f"false (unquoted), got {values['enabled']!r}")
+    if type(values["burst_calls"]) is not int or values["burst_calls"] < 1:
+        raise ValueError("invalid ollama config: ollama.rate_limit.burst_calls must be an "
+                         f"unquoted integer of at least 1, got {values['burst_calls']!r}")
+    for key in ("calls_per_minute", "max_wait_seconds"):
+        if not _number(values[key]) or values[key] <= 0:
+            raise ValueError(f"invalid ollama config: ollama.rate_limit.{key} must be an "
+                             f"unquoted finite number above 0, got {values[key]!r}")
+    return rate_limiter.pacer_config(**values)
 
 
 def _openai_envelope(data: dict) -> dict:
@@ -632,8 +685,11 @@ class OllamaClient:
                  transient_retries: int | None = DEFAULT_TRANSIENT_RETRIES,
                  think: bool | list[str] | None = None, *, api: str | None = None,
                  max_output_tokens: int | None = None, reasoning_effort: str | None = None,
-                 allow_cloud_models: bool | None = None):
+                 allow_cloud_models: bool | None = None, rate_limit: dict | None = None):
         self.base_url = base_url.rstrip("/")
+        # `ollama.rate_limit` (see parse_rate_limit), validated before anything else
+        # so a bad value refuses the client; applied to the shared pacer below.
+        pacer = parse_rate_limit(rate_limit)
         # `ollama.api` / `ollama.max_output_tokens` / `ollama.reasoning_effort`
         # (see parse_backend_settings). All unset => the Ollama payload is
         # byte-identical to the one sent before these keys existed.
@@ -766,8 +822,15 @@ class OllamaClient:
             ),
         )
         
-        # Initialize rate limiter
-        self.rate_limiter = rate_limiter.get_token_limiter("ollama")
+        # The model-call pacer: ONE token limiter for every client in the process
+        # (rate_limiter.PACER_NAME), entered before each attempt. With
+        # `ollama.rate_limit` set, this client applies it to that shared limiter,
+        # so the latest configured client sets the pace for all of them; without
+        # it the limiter keeps what it has (the shipped 10-call burst, then one
+        # call every 6 s, unless a client applied other values). The run manifest
+        # records the values in force (rate_limiter.pacer_state).
+        self.rate_limiter = (rate_limiter.configure_pacer(pacer) if pacer is not None
+                             else rate_limiter.get_token_limiter(rate_limiter.PACER_NAME))
         
         # Initialize prompt validator
         self.prompt_validator = prompt_validator.PromptValidator()
@@ -1317,6 +1380,19 @@ class OllamaClient:
                             waited_ms if measurement["queue_ms"] is None
                             else measurement["queue_ms"] + waited_ms)
                         parsed, data = await self._send_once(url, payload, model, measurement)
+                except rate_limiter.RateLimitWaitExceeded as exc:
+                    # The pacer's bound (ollama.rate_limit.max_wait_seconds): the
+                    # wait still counts as queue time; nothing was sent.
+                    waited_ms = (time.monotonic() - attempt_queue_started) * 1000.0
+                    measurement["queue_ms"] = (
+                        waited_ms if measurement["queue_ms"] is None
+                        else measurement["queue_ms"] + waited_ms)
+                    log.warning("Model %s: call not admitted by the model-call pacer within "
+                                "%gs (ollama.rate_limit); not sent", model, exc.max_wait_seconds)
+                    raise OllamaPacerTimeoutError(
+                        f"model call for {model} not admitted by the model-call pacer "
+                        f"(ollama.rate_limit) within {exc.max_wait_seconds:g}s; nothing was sent",
+                        max_wait_seconds=exc.max_wait_seconds) from exc
                 except OllamaOutputCappedError:
                     larger = (None if capped_retried or _cancellation_requested()
                               else self._capped_retry_cap(model, payload, measurement))

@@ -132,6 +132,10 @@ class RunManifest:
         # ARC-11: validators.active_enabled at the start (and who set it last).
         from harness import safety_gate
         data["active_enabled"] = {"at_start": safety_gate.active_enabled_state()}
+        # O11: the model-call pacer's values in force (ollama.rate_limit, read off
+        # the live shared limiter) and its process-lifetime counters.
+        from harness import rate_limiter
+        data["model_rate_limit"] = {"at_start": rate_limiter.pacer_state()}
         manifest = cls(data, out)
         manifest._persist(append_ledger=True)
         return manifest
@@ -152,6 +156,16 @@ class RunManifest:
                                        "at_finish": safety_gate.active_enabled_state(),
                                        "changes": safety_gate.active_enabled_changes(
                                            since=self.data.get("started_at"))}
+        # O11: the pacer at the finish, and the run's share of its counters (the
+        # difference; a run overlapping another shares the one process-wide pacer).
+        from harness import rate_limiter
+        pacer = dict(self.data.get("model_rate_limit") or {})
+        pacer["at_finish"] = rate_limiter.pacer_state()
+        if isinstance(pacer.get("at_start"), dict):
+            pacer["during_run"] = {
+                key: round(pacer["at_finish"][key] - pacer["at_start"].get(key, 0), 3)
+                for key in rate_limiter.PACER_COUNTERS}
+        self.data["model_rate_limit"] = pacer
         if request_ceiling is not None:
             self.data["request_ceiling"] = _counters(request_ceiling)
             if request_ceiling.get("exhausted"):

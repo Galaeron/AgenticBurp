@@ -56,6 +56,27 @@ class RateLimitConfig:
     # Enabled
     enabled: bool = True
 
+    # Longest an `async with` entry waits for a token before raising
+    # RateLimitWaitExceeded. None waits without a bound (the generic default);
+    # the model-call pacer (pacer_config) always sets one.
+    max_wait_seconds: float | None = None
+
+
+# How often a waiter re-checks the bucket.
+POLL_SECONDS = 0.1
+
+
+class RateLimitWaitExceeded(Exception):
+    """An `async with limiter` entry waited `max_wait_seconds` without a token.
+    Nothing was admitted, so the caller's work did not run."""
+
+    def __init__(self, name: str, max_wait_seconds: float, waited_seconds: float):
+        super().__init__(f"rate limiter {name!r}: no token within {max_wait_seconds:g}s "
+                         f"(waited {waited_seconds:.1f}s)")
+        self.name = name
+        self.max_wait_seconds = max_wait_seconds
+        self.waited_seconds = waited_seconds
+
 
 @dataclass
 class RateLimitStats:
@@ -66,6 +87,12 @@ class RateLimitStats:
     current_requests: int = 0
     last_update: float = 0.0
     waiting: int = 0
+    # wait_for_token calls that found the bucket empty and had to wait, their
+    # summed and longest wait, and those that gave up at their timeout.
+    waited: int = 0
+    wait_seconds_total: float = 0.0
+    wait_seconds_max: float = 0.0
+    timed_out: int = 0
 
 
 class RateLimiter:
@@ -181,28 +208,35 @@ class RateLimiter:
         """
         if not self.config.enabled:
             return True
-        
+
+        if self.allow():
+            return True
         start_time = time.time()
-        
-        while True:
-            if self.allow():
-                return True
-            
-            if timeout is not None:
-                elapsed = time.time() - start_time
-                if elapsed >= timeout:
+        self._stats.waited += 1
+        try:
+            while True:
+                if timeout is not None and time.time() - start_time >= timeout:
+                    self._stats.timed_out += 1
                     return False
-            
-            # Wait a bit before checking again
-            await asyncio.sleep(0.1)
-    
+                # Wait a bit before checking again
+                await asyncio.sleep(POLL_SECONDS)
+                if self.allow():
+                    return True
+        finally:
+            waited = time.time() - start_time
+            self._stats.wait_seconds_total += waited
+            self._stats.wait_seconds_max = max(self._stats.wait_seconds_max, waited)
+
     async def __aenter__(self) -> RateLimiter:
-        """Enter the rate limiter context."""
+        """Enter the rate limiter context: wait for a token, at most
+        config.max_wait_seconds, then raise RateLimitWaitExceeded."""
         if self.config.enabled:
-            # Wait for a token to be available
-            await self.wait_for_token()
+            started = time.time()
+            if not await self.wait_for_token(self.config.max_wait_seconds):
+                raise RateLimitWaitExceeded(self.name, self.config.max_wait_seconds,
+                                            time.time() - started)
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """Exit the rate limiter context."""
         pass
@@ -241,6 +275,10 @@ class RateLimiter:
             current_requests=len(self._requests),
             last_update=self._last_update,
             waiting=self._stats.waiting,
+            waited=self._stats.waited,
+            wait_seconds_total=self._stats.wait_seconds_total,
+            wait_seconds_max=self._stats.wait_seconds_max,
+            timed_out=self._stats.timed_out,
         )
 
 
@@ -330,6 +368,14 @@ class TokenRateLimiter:
         """Exit the token rate limiter context."""
         await self._limiter.__aexit__(exc_type, exc_val, exc_tb)
     
+    def reconfigure(self, config: RateLimitConfig) -> None:
+        """Replace the config in place, keeping the bucket's current fill (capped
+        at the new size) and its counters, so every holder of this limiter paces
+        to the new values from its next entry on."""
+        self.config = config
+        self._limiter.config = config
+        self._limiter._tokens = min(self._limiter._tokens, config.max_tokens)
+
     def reset(self) -> None:
         """Reset the token rate limiter."""
         self._limiter.reset()
@@ -484,12 +530,9 @@ class RateLimiterRegistry:
     
     def __init__(self):
         self._limiters: dict[str, RateLimiter] = {}
-        self._default_token_config = RateLimitConfig(
-            strategy=RateLimitStrategy.TOKEN_BUCKET,
-            tokens_per_second=1000.0 / 60.0,
-            max_tokens=1000,
-            enabled=True,
-        )
+        # The model-call pacer's shipped values (see pacer_config); get_token_limiter
+        # hands this to "ollama" unless ollama.rate_limit replaces it.
+        self._default_token_config = pacer_config()
         self._default_request_config = RateLimitConfig(
             strategy=RateLimitStrategy.FIXED_WINDOW,
             max_requests=100,
@@ -542,6 +585,78 @@ class RateLimiterRegistry:
     def set_default_request_config(self, config: RateLimitConfig) -> None:
         """Set the default request rate limiter configuration."""
         self._default_request_config = config
+
+
+# =============================================================================
+# The model-call pacer
+# =============================================================================
+#
+# Every OllamaClient enters the same process-wide token limiter,
+# get_token_limiter(PACER_NAME), before each model-call attempt. Each call costs
+# PACER_TOKENS_PER_CALL tokens whatever its size, so the bucket counts calls:
+# `burst_calls` may start at once, then `calls_per_minute` refill. The shipped
+# values (PACER_DEFAULTS, the ones this limiter has always had) are a 10-call
+# burst, then one call every 6 s. `ollama.rate_limit` in config sets them
+# (OllamaClient applies it, see ollama_client.parse_rate_limit). A call not
+# admitted within `max_wait_seconds` raises RateLimitWaitExceeded, unsent.
+
+PACER_NAME = "ollama"
+PACER_TOKENS_PER_CALL = 100
+PACER_DEFAULTS = {"enabled": True, "burst_calls": 10, "calls_per_minute": 10.0,
+                  "max_wait_seconds": 300.0}
+# The process-lifetime counters pacer_state reports; a run's share is the
+# difference between its finish and start values.
+PACER_COUNTERS = ("admitted", "waited", "wait_seconds_total", "timed_out")
+
+
+def pacer_config(*, enabled: bool = PACER_DEFAULTS["enabled"],
+                 burst_calls: int = PACER_DEFAULTS["burst_calls"],
+                 calls_per_minute: float = PACER_DEFAULTS["calls_per_minute"],
+                 max_wait_seconds: float = PACER_DEFAULTS["max_wait_seconds"]) -> RateLimitConfig:
+    """The pacer's token-bucket config for settings given in calls."""
+    return RateLimitConfig(
+        strategy=RateLimitStrategy.TOKEN_BUCKET,
+        tokens_per_second=calls_per_minute * PACER_TOKENS_PER_CALL / 60.0,
+        max_tokens=burst_calls * PACER_TOKENS_PER_CALL,
+        tokens_per_request=PACER_TOKENS_PER_CALL,
+        enabled=enabled,
+        max_wait_seconds=max_wait_seconds,
+    )
+
+
+def configure_pacer(config: RateLimitConfig) -> TokenRateLimiter:
+    """Apply `config` to the shared pacer (created if absent) and return it."""
+    limiter = get_token_limiter(PACER_NAME)
+    limiter.reconfigure(config)
+    return limiter
+
+
+def _plain(value: float) -> float | int:
+    value = round(value, 6)
+    return int(value) if value == int(value) else value
+
+
+def pacer_state() -> dict:
+    """The pacer's effective settings, in calls, and its process-lifetime counters
+    (admitted calls, calls that waited, their summed and longest wait, calls
+    refused at max_wait_seconds), for the run manifest. Read off the live
+    limiter, so it shows what paced the calls, not what a config file says."""
+    limiter = get_token_limiter(PACER_NAME)
+    cfg = limiter.config
+    per_call = cfg.tokens_per_request or 1
+    stats = limiter._limiter.get_stats()
+    return {
+        "enabled": cfg.enabled,
+        "burst_calls": _plain(cfg.max_tokens / per_call),
+        "calls_per_minute": _plain(cfg.tokens_per_second * 60.0 / per_call),
+        "max_wait_seconds": cfg.max_wait_seconds,
+        "poll_seconds": POLL_SECONDS,
+        "admitted": stats.allowed,
+        "waited": stats.waited,
+        "wait_seconds_total": round(stats.wait_seconds_total, 3),
+        "wait_seconds_max": round(stats.wait_seconds_max, 3),
+        "timed_out": stats.timed_out,
+    }
 
 
 # Global registry instance

@@ -26,6 +26,7 @@ import yaml
 from harness import circuit_breaker
 from harness.ollama_client import (OllamaContextTruncatedError, OllamaError, OllamaInvalidJSONError,
                                    OllamaOutputCappedError, backend_setting)
+from harness.testing_fixtures.model_pacer import fresh_model_pacer
 
 _TRACE = "SENTINEL-REASONING-TRACE {\"verdict\": \"from-the-trace\"}"
 
@@ -121,6 +122,9 @@ _OPENAI = {"api": "openai", "max_output_tokens": 2048, "reasoning_effort": "low"
 
 class _Base(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        # Its own model-call pacer: every client in the process shares one, and
+        # the earlier tests' calls would pace this test's (up to 6 s a call).
+        fresh_model_pacer(self)
         self.fake = _FakeServer()
         self.addCleanup(self.fake.close)
 

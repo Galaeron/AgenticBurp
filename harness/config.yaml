@@ -103,6 +103,18 @@ ollama:
   # true only in config.local.yaml, for an engagement that permits the egress;
   # the run manifest and GET /health/details record it under model_egress.
   allow_cloud_models: false
+  # Model-call pacer (O11): one token bucket shared by every model call in the
+  # process (agents, critique, routing, writeups). Up to burst_calls start back
+  # to back, then calls_per_minute. A call not admitted within max_wait_seconds
+  # fails unsent (not retried, not a circuit-breaker failure). burst_calls and
+  # calls_per_minute are the values the pacer always had; the wait bound is new.
+  # enabled: false admits every call at once. The run manifest records the
+  # values in force under model_rate_limit.
+  rate_limit:
+    enabled: true
+    burst_calls: 10
+    calls_per_minute: 10
+    max_wait_seconds: 300
 
 # Context-window budget for agent and critique prompts (harness/prompt_budget.py).
 # TOK-4: the context is the window the model's server reports before each
