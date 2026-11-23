@@ -81,7 +81,7 @@ Every step emits events to an append-only ledger (`evidence_ledger.py`). Events 
 
 ### Harness Server (`harness/server.py`)
 
-FastAPI on `127.0.0.1:8787`. At startup: loads and validates config, constructs a single `Orchestrator`, generates an ephemeral bearer token (or uses configured one), installs trusted-host and CSRF middleware. Its routes are listed in `harness/server.py` (the `@app.get/post/put/delete` decorators); the main ones:
+FastAPI on `127.0.0.1:8787`. At startup: loads and validates config, constructs a single `Orchestrator`, generates an ephemeral bearer token (or uses configured one), installs trusted-host and CSRF middleware. Its routes live in the router modules `harness/server_routes_*.py` (the `@router.get/post/put/delete` decorators), which `harness/server.py` registers on the app; the main ones:
 
 | Endpoint | Purpose |
 |---|---|
@@ -308,6 +308,7 @@ AgenticVibe/
 |   +-- agents/              # specialist agents (plugin-discovered)
 |   +-- validators/          # deterministic validators
 |   +-- server.py            # API entry point (:8787)
+|   +-- server_routes_*.py   # API routes, by area
 |   +-- orchestrator.py      # Mixin assembly
 |   +-- agent_families.py    # Opt-in family routing (ships OFF)
 |   +-- config.yaml          # Safe defaults (checked in)

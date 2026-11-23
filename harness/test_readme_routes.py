@@ -13,6 +13,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 SERVER = ast.parse((ROOT / "harness/server.py").read_text(encoding="utf-8"))
+# ARC-9: the routes live in the router modules that server.py registers.
+ROUTERS = [ast.parse(p.read_text(encoding="utf-8"))
+           for p in sorted((ROOT / "harness").glob("server_routes_*.py"))]
 
 
 def _normal(path: str) -> str:
@@ -21,13 +24,15 @@ def _normal(path: str) -> str:
 
 def server_routes() -> set[tuple[str, str]]:
     found = set()
-    for node in ast.walk(SERVER):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for dec in node.decorator_list:
-                if (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
-                        and isinstance(dec.func.value, ast.Name) and dec.func.value.id == "app"
-                        and dec.args and isinstance(dec.args[0], ast.Constant)):
-                    found.add((dec.func.attr.upper(), _normal(dec.args[0].value)))
+    for tree in (SERVER, *ROUTERS):
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for dec in node.decorator_list:
+                    if (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
+                            and isinstance(dec.func.value, ast.Name)
+                            and dec.func.value.id in ("app", "router")
+                            and dec.args and isinstance(dec.args[0], ast.Constant)):
+                        found.add((dec.func.attr.upper(), _normal(dec.args[0].value)))
     return found
 
 
