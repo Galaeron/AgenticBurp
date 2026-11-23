@@ -5,9 +5,20 @@ too — this tool is an unproven research prototype, not a drop-in scanner.
 
 ## 1. First run — and why it may "find nothing"
 
-Install first, from the repository root (the lock is the dependency set CI tests; the
-server also warns at startup, and lists any difference under `dependency_lock` in
-`/health/details`, when installed versions differ from it):
+Six steps, in order. The README Quick Start lists the same steps in brief. The
+30-minute clean-machine walk-through by someone new to the tool has **not** been
+done (**unverified**; it is an owner step, recorded per release).
+
+### 1. Python
+
+Python 3.11 or newer (`requires-python` in `pyproject.toml`). CI runs **Python 3.14**
+and the lock file is frozen from it, so prefer 3.14 (see §8).
+
+### 2. Install from the lock
+
+From the repository root. The lock is the dependency set CI tests; the server also
+warns at startup, and lists any difference under `dependency_lock` in
+`/health/details`, when installed versions differ from it:
 
 ```bash
 pip install -r harness/requirements.lock
@@ -15,10 +26,73 @@ pip install -e . --no-deps
 python -m harness.lock_preflight    # optional: report installed-vs-lock mismatches
 ```
 
+### 3. Model and context settings
+
+Start the backend and pull the default model (the name must match `config.yaml`):
+
 ```bash
-ollama serve                 # 1. start the model backend
-ollama pull qwen3:8b         # 2. pull the default model (name must match config.yaml)
-python -m harness.server     # 3. start the harness on 127.0.0.1:8787
+ollama serve                 # start the model backend
+ollama pull qwen3:8b         # pull the default model
+```
+
+Put your overrides in the **git-ignored** `harness/config.local.yaml`:
+
+```yaml
+ollama:
+  num_ctx: 16384             # for llama-server (ollama.api: "openai"): its per-slot window, -c divided by -np
+  # allow_cloud_models: true # only for an engagement that permits sending content to Ollama's cloud
+```
+
+- **`ollama.num_ctx`.** Ollama loads a model at its own default window and truncates
+  a longer prompt, which cuts off the agent's instructions. The harness detects a
+  cut call, discards its reply and marks the run `degraded`, so set the window up
+  front. 16384 holds the largest prompt measured. It is sent with each request to
+  Ollama and is used by the prompt fitting below; with `ollama.api: "openai"` it
+  is not sent, only used for the fitting, and the server keeps the window it was
+  started with.
+- **Prompt fitting (`prompt_budget`).** Before each prompt the harness asks the model
+  server for the window it has (llama-server `/props`; Ollama `/api/ps` for a loaded
+  model, `/api/show` for the trained maximum), takes the smaller of that and
+  `ollama.num_ctx`, and fits agent and critique prompts to it minus
+  `prompt_budget.answer_tokens`. Each cut is marked in the prompt and listed per
+  capture in the job result's `review_stats.elided`. With no window known it
+  fits to `prompt_budget.unknown_context_tokens` (4096): it never sends a prompt
+  unfitted, but a small fallback means heavily cut prompts, so set `num_ctx`.
+- **`ollama.allow_cloud_models`** is `false`. A model named `*-cloud` or `*:cloud`
+  runs on Ollama's cloud, so its prompts leave this machine. With the flag off, a run
+  that would use one in any model slot is refused before its first call (HTTP 409 on
+  `/analyze` and `/engagement/{host}/investigate`) and a direct call to one is refused
+  unsent. `/health/details` shows the state under `model_egress`.
+- **`ollama.rate_limit`** is one token bucket shared by every model call in the
+  process. Shipped: `enabled: true`, `burst_calls: 10`, `calls_per_minute: 10`,
+  `max_wait_seconds: 300`. Up to `burst_calls` calls start back to back, then
+  `calls_per_minute`; a call that is not admitted within `max_wait_seconds` fails
+  unsent (it is not retried and does not trip the circuit breaker). On a slow local
+  model it rarely binds. Raising it or setting `enabled: false` loosens a
+  safeguard, so do it in `config.local.yaml`. The run manifest records the values
+  in force and the waits under `model_rate_limit`.
+
+### 4. Build the Burp extension (optional)
+
+See §6: the Gradle wrapper, a JDK 17 toolchain and the checksum-pinned Gradle 8.7.
+Load the resulting `*-all.jar` in Burp Suite → Extensions.
+
+### 5. Start the server and pair
+
+```bash
+python -m harness.server     # start the harness on 127.0.0.1:8787
+```
+
+`$HARNESS_TOKEN` is the pairing token the Burp extension uses: your
+`server.auth_token` or `HARNESS_BEARER_TOKEN` if you set one, else the ephemeral
+token the server writes to `harness/.harness_token.lock` at every start. Every
+state-changing route needs it, even from loopback. In Burp, paste it into the
+**Pairing token** field of the LLM Harness tab (or export `HARNESS_BEARER_TOKEN` before
+starting Burp). `GET /pairing/check` proves the token is accepted:
+
+```bash
+export HARNESS_TOKEN="$(cat harness/.harness_token.lock)"   # PowerShell: $env:HARNESS_TOKEN = (Get-Content harness\.harness_token.lock -Raw).Trim()
+curl -s -H "Authorization: Bearer $HARNESS_TOKEN" http://127.0.0.1:8787/pairing/check
 ```
 
 Then **check readiness** — this is the first thing to do if results look empty:
@@ -27,11 +101,8 @@ Then **check readiness** — this is the first thing to do if results look empty
 curl -s -H "Authorization: Bearer $HARNESS_TOKEN" http://127.0.0.1:8787/health/details
 ```
 
-`$HARNESS_TOKEN` is the pairing token the Burp extension uses: your
-`HARNESS_BEARER_TOKEN` if you set one, else the ephemeral token the server
-writes to `harness/.harness_token.lock` at startup. `GET /health` is liveness
-only: it needs no token, contacts nothing and answers `{"status": "ok"}` while
-the server runs. `GET /health/details` caches its backend probe for 10 s
+`GET /health` is liveness only: it needs no token, contacts nothing and answers
+`{"status": "ok"}` while the server runs. `GET /health/details` caches its backend probe for 10 s
 (`probe_age_seconds`); `model_egress` lists any slot that holds a cloud model
 and whether `ollama.allow_cloud_models` lets it run. Its `status` is `"ok"` only
 when Ollama is reachable **and** every configured local model is pulled. If it
@@ -41,6 +112,29 @@ hint) and `agent_models` shows the model each agent will actually use. A server
 with no working model still answers `/analyze` with HTTP 200, but the response
 is marked `degraded: true`, lists `agent_errors`, and the summary leads with a
 warning — the findings are then from deterministic checks only, not the LLM.
+
+### 6. A first `/analyze`
+
+Save one captured exchange as `exchange.json` (the fields of `HttpExchange`; only
+`url` and `method` are required):
+
+```json
+{"exchange": {"url": "http://127.0.0.1:8080/rest/user/login", "method": "POST",
+              "request_headers": {"Content-Type": "application/json"},
+              "request_body": "{\"email\":\"a@b.test\",\"password\":\"x\"}",
+              "response_status": 401, "response_headers": {"Content-Type": "application/json"},
+              "response_body": "{\"error\":\"Invalid email or password.\"}"}}
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/analyze \
+  -H "Authorization: Bearer $HARNESS_TOKEN" -H "Content-Type: application/json" \
+  --data @exchange.json
+```
+
+(In PowerShell use `curl.exe`.) The response lists `dispatched_agents`,
+`agent_reports` and a `summary`. It can take minutes on a single consumer GPU (§4).
+From Burp, right-click a request → **Send to LLM Harness** does the same call.
 
 The committed defaults are **passive and safe**: active validators, autonomous
 discovery, the oracle, cloud routing and cloud reasoning are all OFF, and
