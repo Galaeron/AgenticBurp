@@ -3,8 +3,8 @@
 A Burp Suite copilot that uses locally-hosted LLMs to analyze captured HTTP traffic for security vulnerabilities, then confirms or refutes those findings with deterministic validators.
 
 > **Status: working research prototype, effectiveness unproven.** The software
-> runs and ~2,400 Python / ~230 Java tests pass, but nothing in the repo
-> measures how well it finds real bugs on an unfamiliar app, and its tuning
+> runs and its Python and Java test suites are run in CI (`docs/TESTING.md`), but
+> nothing in the repo measures how well it finds real bugs on an unfamiliar app, and its tuning
 > corpora ship with answer keys. Read **[docs/LIMITATIONS.md](docs/LIMITATIONS.md)**
 > before trusting any result, and **[docs/USER_MANUAL.md](docs/USER_MANUAL.md)**
 > to run it safely.
@@ -26,7 +26,7 @@ A Burp Suite copilot that uses locally-hosted LLMs to analyze captured HTTP traf
 |                   |                 |                   |             +-------------+
 |  2 suite tabs:    |                 |  Orchestrator     |
 |  - LLM Harness    |                 |    |              |
-|  - Harness Tools  |                 |    +-> Agents (36)|
+|  - Harness Tools  |                 |    +-> Agents     |
 |  + context menu   |                 |    +-> Validators |
 +-------------------+                 |    +-> Ledger     |
                                       +-------------------+
@@ -40,7 +40,7 @@ This is the core path. When the Burp extension sends an HTTP exchange to `POST /
 2. **Scope check** -- reject if the host is outside `server.allowed_hosts` (when configured).
 3. **Budget check** -- reject if the effort budget is exhausted.
 4. **Agent selection** -- `fast_path.py` tries deterministic pattern matching first (URL regexes, header patterns, response signatures, body anomalies). If no strong signal, falls back to the **coordinator LLM** which picks agents from the available set. On coordinator failure, fails open to all agents (or a curated core subset, depending on `coordinator.fail_open_mode`).
-5. **Agent dispatch** -- `AgentManager.run_multiple_agents()` runs selected agents in parallel, bounded by an asyncio semaphore (`concurrency.max_parallel_agents`). Each agent sends a vulnerability-class-specific prompt + the exchange to Ollama and returns structured findings. Optionally, agents can be grouped into 6 families for fewer model calls (`coordinator.routing_mode: "families"`, ships OFF).
+5. **Agent dispatch** -- `AgentManager.run_multiple_agents()` runs selected agents in parallel, bounded by an asyncio semaphore (`concurrency.max_parallel_agents`). Each agent sends a vulnerability-class-specific prompt + the exchange to Ollama and returns structured findings. Optionally, agents can be grouped into families for fewer model calls (`coordinator.routing_mode: "families"`, ships OFF).
 6. **Access control gate** -- caps IDOR/authz findings that are refuted by 401/403/405 status codes.
 7. **Header noise gate** -- caps CORS/CSP/clickjacking findings to "low" severity.
 8. **Critique** -- adversarial LLM review of surviving findings. Each is verdicted "survived", "downgraded", or "rejected". Rejected findings are removed.
@@ -79,7 +79,7 @@ Every step emits events to an append-only ledger (`evidence_ledger.py`). Events 
 
 ### Harness Server (`harness/server.py`)
 
-FastAPI on `127.0.0.1:8787`. At startup: loads and validates config, constructs a single `Orchestrator`, generates an ephemeral bearer token (or uses configured one), installs trusted-host and CSRF middleware. ~50 endpoints including:
+FastAPI on `127.0.0.1:8787`. At startup: loads and validates config, constructs a single `Orchestrator`, generates an ephemeral bearer token (or uses configured one), installs trusted-host and CSRF middleware. Its routes are listed in `harness/server.py` (the `@app.get/post/put/delete` decorators); the main ones:
 
 | Endpoint | Purpose |
 |---|---|
@@ -99,7 +99,7 @@ FastAPI on `127.0.0.1:8787`. At startup: loads and validates config, constructs 
 
 ### Orchestrator (`harness/orchestrator.py`)
 
-Assembled from four mixins. `__init__` constructs: `OllamaClient`, coordinator + critique LLM providers (local Ollama or optional remote), `Coordinator`, `AgentManager`, `AnalysisPipeline`, `FastPathSelector`, `ValidatorRegistry`, `EffortBudget`, GitHub Advisory + KEV + package registry clients, engagement policy, global throttle.
+Assembled from the mixins below. `__init__` constructs: `OllamaClient`, coordinator + critique LLM providers (local Ollama or optional remote), `Coordinator`, `AgentManager`, `AnalysisPipeline`, `FastPathSelector`, `ValidatorRegistry`, `EffortBudget`, GitHub Advisory + KEV + package registry clients, engagement policy, global throttle.
 
 | Mixin | Module | Key methods |
 |---|---|---|
@@ -110,9 +110,9 @@ Assembled from four mixins. `__init__` constructs: `OllamaClient`, coordinator +
 
 ### Agents (`harness/agents/`)
 
-36 specialist agents, each a `BaseAgent` subclass with a `name` attribute, discovered at runtime by `AgentPluginSystem` (file scan of the `agents/` directory). `BaseAgent` handles: prompt construction with exchange body truncation (preserves high-signal content like stack traces beyond the truncation point via regex), quarantine fencing (random-nonce boundaries to contain prompt injection from target responses), and structured finding extraction.
+The specialist agents are `BaseAgent` subclasses, each with a `name` attribute, discovered at runtime by `AgentPluginSystem` (file scan of the `agents/` directory). `BaseAgent` handles: prompt construction with exchange body truncation (preserves high-signal content like stack traces beyond the truncation point via regex), quarantine fencing (random-nonce boundaries to contain prompt injection from target responses), and structured finding extraction.
 
-The default routing mode dispatches each agent as an individual model call. An opt-in family routing mode (`coordinator.routing_mode: "families"`) groups all 36 into 6 families and issues one composed call per family:
+The default routing mode dispatches each agent as an individual model call. An opt-in family routing mode (`coordinator.routing_mode: "families"`) groups them into the families below and issues one composed call per family:
 
 | Family | Members |
 |---|---|
@@ -127,7 +127,7 @@ Family routing ships OFF. Any agent not in a family falls back to a solo call.
 
 ### Validators (`harness/validators/registry.py`)
 
-35 validators registered in `ValidatorRegistry.__init__()`, each togglable. Matched to findings via `for_finding()` based on vulnerability class. Categories:
+The validators are registered in `ValidatorRegistry.__init__()`, each togglable. Matched to findings via `for_finding()` based on vulnerability class. Categories:
 
 **Passive (no network):** `deserialization` (format fingerprinting), `verbose_error` (stack trace/debug detection).
 
@@ -157,7 +157,7 @@ Java plugin using Burp's Montoya API. Connects to `http://localhost:8787`. Regis
 - **"Harness Tools" tab** -- `HarnessToolsPanel` with model selection, discovery controls, active testing toggles, budget/effort display, tool catalog, confidential scan, activity feed.
 - **Context menu** -- `HarnessContextMenu` for right-click "Send to LLM Harness" from Proxy/Repeater/Target.
 - **`ValidationExecutor`** -- executes test plans returned by the server using Burp's HTTP stack.
-- **`logic/` package** -- 32 client-side modules: most are per-vulnerability-class deterministic checks (SQLi, XSS, SSRF, XXE, JWT forgery, CSRF, mass assignment, etc.), plus shared identity/URL/pool-comparison helpers (`IdentityCompareLogic`, `UrlIdentifierDiff`, `PoolCandidateResolver`, `WorkflowReplayLogic`) they build on.
+- **`logic/` package** -- the client-side modules: most are per-vulnerability-class deterministic checks (SQLi, XSS, SSRF, XXE, JWT forgery, CSRF, mass assignment, etc.), plus shared identity/URL/pool-comparison helpers (`IdentityCompareLogic`, `UrlIdentifierDiff`, `PoolCandidateResolver`, `WorkflowReplayLogic`) they build on.
 
 ### Configuration
 
@@ -216,8 +216,8 @@ python -m harness.suite full    # unittest + pytest + evaluation integrity
 ```
 AgenticVibe/
 +-- harness/                 # Python backend (FastAPI)
-|   +-- agents/              # 36 specialist agents (plugin-discovered)
-|   +-- validators/          # 35 deterministic validators
+|   +-- agents/              # specialist agents (plugin-discovered)
+|   +-- validators/          # deterministic validators
 |   +-- server.py            # API entry point (:8787)
 |   +-- orchestrator.py      # Mixin assembly
 |   +-- agent_families.py    # Opt-in family routing (ships OFF)

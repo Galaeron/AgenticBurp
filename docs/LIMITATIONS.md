@@ -68,7 +68,7 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
 - **[open] Duplicates Burp Scanner.** CORS/CSP/missing-headers/verbose-error/JWT
   checks overlap what Burp Pro already does deterministically. The LLM's real
   edge is access control across roles, business logic and multi-step workflows;
-  the 36-agent spread dilutes that focus. (A header-noise gate already caps the
+  the wide agent spread dilutes that focus. (A header-noise gate already caps the
   low-value classes to "low".)
 - **[open] Noise ranks next to real issues.** Findings like "[Unconfirmed]
   Multiple anomalies detected" or a medium "suspicious pattern: `Error:`" read as
@@ -89,10 +89,18 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
   top-level check; set `server.allowed_hosts` explicitly and do not rely on a
   single backstop. (This migration is in-flight in the working tree and is why
   some active-gate unit tests are red.)
-- **[partial] A legacy, unscoped transport path still exists.** ~20 modules have
-  both the new scoped executor and a legacy raw HTTP client used when no run
-  context is passed; `subdomain_takeover`'s legacy path can follow scraped
-  redirects without a scope check. The normal pipeline uses the scoped path.
+- **[partial] A legacy, unscoped transport path still exists in some
+  validators.** ARC-7 removed the raw HTTP clients from the crawlers, discovery,
+  feature workflow, the missing-auth probe and the cross-identity probe; they send
+  only through a run's transport. These validators still fall back to a raw client
+  when called without a run context: csp, header_injection, http_request_smuggling,
+  jwt_forge, oauth, race_condition, rate_limit, recon, sqlmap (its boolean-probe
+  fallback), subdomain_takeover, toctou and web_cache_poisoning. The no-run
+  `safety_gate.GatedAsyncClient` is gate-authorised but has no run budget or
+  address pin. `subdomain_takeover`'s fallback follows redirects with no scope
+  check. The normal pipeline passes a run context and uses the scoped path;
+  `transport_inventory.RAW_CLIENT_ALLOWLIST` lists every remaining raw client with
+  its reason, and a test fails on any new one.
 - **[by-design] Scope is hostname-only.** The port is not part of the check, so
   anything else on the same host is technically in scope. Documented in
   `config.yaml`.
@@ -113,7 +121,7 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
   Ollama and reports `degraded` with specifics; `/analyze` sets `degraded`, lists `agent_errors`,
   and warns in the summary when every agent failed. (Previously `/health` said
   "ok" with no model and failures hid in per-agent `raw_error`.)
-- **[fixed] Ten agents silently pinned the default model.** Redundant per-agent
+- **[fixed] Some agents silently pinned the default model.** Redundant per-agent
   `model: qwen3:8b` pins removed; startup now warns on a shadowing override and
   `/health/details` exposes `agent_models`.
 - **[open] Model-outage circuit breaker lingers ~60 s.** After 3 failures the
@@ -175,15 +183,15 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
 
 ## Architecture debt (roadmap, not bugs)
 
-- **[open] Orchestrator import cycle.** ~10 orchestrator/chain/attribution modules
+- **[open] Orchestrator import cycle.** The orchestrator/chain/attribution modules
   import each other; many imports are inside functions to dodge cycles; `store`,
   `evidence_ledger` and `confirmation_gate` form a cycle. Split by size, not
   responsibility.
 - **[open] Process-wide shared state.** `global_throttle`, a default safety gate
   and run context are process singletons, so two engagements can't be cleanly
   isolated. (Opt-in per-run scoping primitives exist but aren't the default.)
-- **[open] Flat package + oversized files.** 114 modules sit flat in `harness/`;
-  `server.py` and `store.py` are ~1,400 lines.
+- **[open] Flat package + oversized files.** The modules sit flat in `harness/`;
+  `server.py`, `store.py` and `orchestrator_chain.py` are each thousands of lines.
 - **[open] Overlapping agents.** `business_logic`/`business_logic_enhanced` and
   `ai_llm`/`ai_security` are new-beside-old rather than replacements.
 - **[open] Broad exception handling.** Many `except Exception` blocks; the proof-
@@ -201,4 +209,4 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
 Independent plug-in agents/validators (no orchestrator/server imports); a shared
 `harness.models` vocabulary; careful model calls (JSON mode, thinking disabled,
 typed errors, token logging); SQLite in WAL mode with per-call connections and
-lock retries; and a large, real test suite (~2,400 Python + ~230 Java tests).
+lock retries; and a large, real test suite (Python and Java; see `docs/TESTING.md`).
