@@ -31,6 +31,7 @@ import harness.ollama_client as mod
 import harness.rate_limiter as rl
 from harness.ollama_client import OllamaClient, OllamaPacerTimeoutError, parse_rate_limit
 from harness.run_manifest import RunManifest
+from harness.testing_fixtures.model_pacer import fresh_model_pacer
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 _REAL_SLEEP = asyncio.sleep
@@ -332,6 +333,31 @@ class ManifestTests(_VirtualPacer, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(during), set(rl.PACER_COUNTERS))
         self.assertEqual((during["admitted"], during["waited"], during["timed_out"]), (4, 2, 0))
         self.assertAlmostEqual(during["wait_seconds_total"], 6.0, delta=0.3)
+
+
+class FreshPacerFixtureTests(unittest.TestCase):
+    """testing_fixtures.model_pacer: a test's own pacer, restored when it ends."""
+
+    def test_a_test_gets_a_full_pacer_and_the_shared_one_comes_back(self):
+        _fresh_registries(self)
+        shared = rl.get_token_limiter(rl.PACER_NAME)
+        shared._limiter._tokens = 0          # drained by earlier tests' calls
+        inner = unittest.FunctionTestCase(lambda: None)
+        fresh_model_pacer(inner)
+        fresh = rl.get_token_limiter(rl.PACER_NAME)
+        fresh_model_pacer(inner)             # a second client in the same test
+        self.assertIs(rl.get_token_limiter(rl.PACER_NAME), fresh)
+        self.assertIsNot(fresh, shared)
+        self.assertEqual(fresh._limiter._tokens, 1000)
+        inner.doCleanups()
+        self.assertIs(rl.get_token_limiter(rl.PACER_NAME), shared)
+        self.assertEqual(shared._limiter._tokens, 0)
+
+    def test_without_it_the_test_inherits_the_drained_pacer(self):
+        # NEGATIVE CONTROL: no fixture, the next client gets the drained bucket.
+        _fresh_registries(self)
+        rl.get_token_limiter(rl.PACER_NAME)._limiter._tokens = 0
+        self.assertEqual(OllamaClient(_URL).rate_limiter._limiter._tokens, 0)
 
 
 if __name__ == "__main__":
