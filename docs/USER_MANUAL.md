@@ -266,11 +266,39 @@ secrets and PII in captured traffic; it does not redact anything.
 - **Third-party lookups.** Passive analysis also looks up component names at
   third-party services unless `privacy.external_lookups` is false (see
   [LIMITATIONS.md](LIMITATIONS.md), "Model backend & data").
-- **On disk.** Findings, cached analyses and logs are written as **unencrypted
-  files** under the tool's folder, with no per-engagement separation. Log
-  messages and the evidence objects stored for an observation go through the same
-  sanitiser, but nothing else is encrypted or redacted at rest. There is a
-  `DELETE /engagement/{host}/evidence` wipe (enable `server.enable_wipe_endpoint`).
+- **On disk.** Findings, evidence, cached analyses and logs are written as
+  **unencrypted files** under `harness/`. The tool does not encrypt them, so
+  **run it only on a disk with full-disk encryption** (BitLocker, FileVault or
+  LUKS) that also covers wherever you keep engagement exports. Log messages and
+  the evidence objects stored for an observation go through the same sanitiser,
+  but nothing else is redacted at rest.
+- **One store per engagement (OPS-5).** Set `HARNESS_ENGAGEMENT_ID` (for example
+  `$env:HARNESS_ENGAGEMENT_ID = "acme-2026"`) before starting the server or a run,
+  and that process stores into its own `harness/engagements/<key>/` directory
+  (its own `harness_state.db`, job and run-journal databases). Without it,
+  everything goes to the single `harness/harness_state.db` as before; data
+  already there loads unchanged and is never moved. One engagement per process:
+  restart to switch. The exchange cache (`harness_cache.db`) is still shared.
+- **Closing an engagement.** When the engagement ends, close it from a process
+  that is not storing into it:
+  `python -m harness.data_maintenance close-engagement --engagement-id acme-2026 --confirm acme-2026`
+  (`--export-dir D` to choose where the export goes; `engagements` lists the
+  stores). The same close is `POST /engagements/close` with
+  `{"engagement_id": "acme-2026", "confirm": "acme-2026"}`, which needs the
+  bearer token and `server.enable_wipe_endpoint: true`. Close first writes a
+  SQLite snapshot of the engagement's store, plus the rows the single store
+  attributes to that engagement ID, to a new
+  `harness/engagement_exports/<key>-<time>-<random>/` directory with an
+  `export_manifest.json` of SHA-256 digests. Only then does it delete the store
+  directory and those rows. Other engagements and unattributed rows are not
+  touched. Deleting files is **not secure erasure**; handle the export as the
+  contract requires (hand it over, archive it encrypted, or destroy it).
+- **Retention.** `store.engagement_retention_days` is off (`0`) by default.
+  `python -m harness.data_maintenance retention` lists engagement stores not
+  written for that many days (`--days N` overrides the config), and `--apply`
+  closes them, export first. Nothing runs it automatically. The per-host
+  `DELETE /engagement/{host}/evidence` wipe (also behind
+  `server.enable_wipe_endpoint`) still acts on the current store only.
   Active file-upload / stored-XSS tests may **leave artifacts on the target** and
   there is no automatic cleanup — track and remove them manually.
 
