@@ -169,6 +169,12 @@ class LlamaServerDiscoveryTests(_StoreIsolation, _FreshBreaker, unittest.Isolate
 
     async def test_unknown_window_fits_to_the_fallback(self):
         # /props fails: never sent unfitted; fitted to unknown_context_tokens.
+        # The fallback warning is logged once per (model, fallback) per process, so
+        # an earlier test in the same process may already have used it up: start
+        # from an empty warn-once set and put the old one back afterwards.
+        saved = set(prompt_budget._fallback_warned)
+        prompt_budget._fallback_warned.clear()
+        self.addCleanup(prompt_budget._fallback_warned.update, saved)
         stub = StubLlamaServer(props_status=404)
         agent, client = self._agent(stub)
         with self.assertLogs("harness.prompt_budget", "WARNING"):
