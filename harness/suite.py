@@ -19,6 +19,9 @@ SMOKE_MODULES = (
     # (coverage_manifest._CALLER_EVIDENCE names a test class in each of these modules).
     'harness.test_leg_live_verification',
     'harness.test_auth_logout_invalidation', 'harness.test_file_upload_busl08',
+    # GAP-2: race (BUSL-05), NoSQL (INJT-05.6) and CORS (CLNT-07) loopback legs.
+    'harness.test_oracle_gaps_race', 'harness.test_oracle_gaps_nosql',
+    'harness.test_cors_transport',
     # GAP-4: the harness safety properties (coverage_manifest._SAFETY_EVIDENCE).
     'harness.test_live_safety_loopback',
 )

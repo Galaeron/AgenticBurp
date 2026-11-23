@@ -23,6 +23,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+import harness.coverage_manifest as cm
+from harness.coverage_evidence_case import EvidenceCase, evidence_for
+from harness.testing_fixtures.leg_fault import bound_test_names, outcomes_with_leg_severed
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.run_context import RunContext, ScopePolicy
@@ -106,7 +109,7 @@ def _finding():
                    summary="race", evidence="candidate", suggested_test="burst", basis="derived")
 
 
-class OracleGapRaceTests(unittest.TestCase):
+class OracleGapRaceTests(EvidenceCase):
     @classmethod
     def setUpClass(cls):
         global_throttle.configure(0)
@@ -181,8 +184,10 @@ class OracleGapRaceTests(unittest.TestCase):
         self.assertIn("http://h.test/api/v2/baskets/77/items", urls)  # the collection itself
         self.assertFalse(any("logout" in u or "evil" in u or "/big" in u for u in urls))
 
+    @evidence_for(**cm.caller_evidence("race_confirm"))
     def test_once_only_like_raced_past_its_check_confirms_by_read_back(self):
         result = self.run_leg("/api/reviews/like", {"id": "rev7a"}, captured=self._captured())
+        self.record_observation({"status": result.status, "posts": len(_Shop.posts)})
         self.assertEqual(result.status, "confirmed", result.summary + " | " + result.limitation)
         self.assertTrue(result.confirmed)
         self.assertEqual(result.confidence, 0.9)          # duplicate likedBy entries
@@ -206,8 +211,10 @@ class OracleGapRaceTests(unittest.TestCase):
         self.assertIn("Volatile fields ignored: views", result.evidence)
         self.assertNotIn("`views`", result.summary)
 
+    @evidence_for(**cm.caller_evidence("race_control"))
     def test_control_operation_holding_its_limit_is_a_negative(self):
         result = self.run_leg("/api/locked/like", {"id": "rev7b"}, captured=self._captured())
+        self.record_observation({"status": result.status, "posts": len(_Shop.posts)})
         self.assertEqual((result.status, result.control_outcome), ("not_confirmed", ""))
         self.assertFalse(result.confirmed)
         self.assertIn("recorded the effect once", result.summary)
@@ -246,6 +253,15 @@ class OracleGapRaceTests(unittest.TestCase):
                               mutating=False)
         self.assertEqual(result.status, "blocked")
         self.assertEqual((_Shop.posts, _Shop.gets), ([], []))
+
+    # --- Fault injection: a bound aspect must notice a disconnected leg ---------
+    def test_bound_aspects_fail_when_the_leg_is_disconnected(self):
+        names = bound_test_names(type(self))
+        self.assertEqual(len(names), 2, f"bound tests went missing: {names}")
+        for name, outcome in outcomes_with_leg_severed(type(self), names).items():
+            with self.subTest(test=name):
+                self.assertNotEqual(outcome, "passed",
+                                    f"{name} still passes with the leg disconnected: not evidence")
 
 
 if __name__ == "__main__":

@@ -32,6 +32,21 @@ Guiding rules (each one is a fix for a real hole the reviewer found):
 Report vocabulary: pass / fail / skipped / manual / not_applicable, plus
 `not_implemented` flagged SEPARATELY (a declared automated aspect with no fresh
 evidence, or a requirement with no test at all).
+
+What blocks `--check` (`declared_coverage_ok`, run after the unit tests of the smoke
+and full tiers): every DECLARED automated aspect, of a requirement or a harness safety
+property, must have fresh `pass` evidence. It blocks on
+
+- `fail`: the test failed or errored, or its artifact was invalid, duplicated, or
+  carried an empty or mismatched `test_id`;
+- `skipped`: the test ran and was skipped;
+- `not_implemented`: no fresh artifact for this run (the test did not run).
+
+It does NOT block on `manual` aspects, `not_applicable` requirements, or
+`gap_unimplemented` requirements. `gap_unimplemented` means "no test is registered in
+this ledger"; it does not mean no test exists, and it never means the weakness was
+verified absent. The requirement rollup (`covered_partial`, `gap_*`) is a report; the
+gate checks each declared aspect on its own.
 """
 from __future__ import annotations
 
@@ -196,6 +211,9 @@ _LEG = "harness.test_leg_live_verification.LiveLegVerificationTest"
 _AUTHZ = "harness.test_smoke_authorization_workflow.AuthorizationSliceSmokeTest"
 _LOGOUT = "harness.test_auth_logout_invalidation.LogoutInvalidationCallerTests"
 _UPLOAD = "harness.test_file_upload_busl08.FileUploadCallerTests"
+_RACE = "harness.test_oracle_gaps_race.OracleGapRaceTests"
+_NOSQL = "harness.test_oracle_gaps_nosql.OracleGapNosqlTests"
+_CORS = "harness.test_cors_transport.CorsDecodedResponseTests"
 _CONFIRM, _CONTROL = "harness_confirmation", "harness_control"
 
 # key -> (check_id, test class, test method, label, aspect)
@@ -307,6 +325,46 @@ _CALLER_EVIDENCE: dict[str, tuple[str, str, str, str, str]] = {
     "deser_control": ("WSTG-INJT-23", _LEG, "test_deserialization_oob_silent_on_json_control", _CONTROL,
                       "harness DeserializationOobValidator returns a controlled negative where "
                       "the cookie is parsed as JSON"),
+    # GAP-2: live loopback legs that existed but were not registered in this ledger.
+    "enum_confirm": ("WSTG-IDNT-04", _LEG, "test_auth_username_enum_confirms", _CONFIRM,
+                     "harness AuthSequenceValidator confirms username enumeration (the login "
+                     "response for a known username differs from an unknown one)"),
+    "enum_control": ("WSTG-IDNT-04", _LEG, "test_auth_username_enum_silent_on_uniform_control",
+                     _CONTROL,
+                     "harness AuthSequenceValidator returns a controlled negative where the "
+                     "login response is uniform for known and unknown usernames"),
+    "client_trust_confirm": ("WSTG-BUSL-02", _LEG, "test_client_trust_confirms_reflected_price",
+                             _CONFIRM,
+                             "harness ClientTrustValidator confirms a client-supplied price is "
+                             "trusted (the tampered price is reflected back by the cart)"),
+    "client_trust_control": ("WSTG-BUSL-02", _LEG, "test_client_trust_silent_on_server_priced_control",
+                             _CONTROL,
+                             "harness ClientTrustValidator returns a controlled negative where "
+                             "the server prices the item itself"),
+    "race_confirm": ("WSTG-BUSL-05", _RACE,
+                     "test_once_only_like_raced_past_its_check_confirms_by_read_back", _CONFIRM,
+                     "harness RaceConditionValidator confirms a once-only operation raced past "
+                     "its check (a concurrent burst records the effect several times, a "
+                     "sequential repeat is refused, and a read-back shows the duplicates)"),
+    "race_control": ("WSTG-BUSL-05", _RACE, "test_control_operation_holding_its_limit_is_a_negative",
+                     _CONTROL,
+                     "harness RaceConditionValidator returns a controlled negative where the "
+                     "operation holds its limit under the concurrent burst"),
+    "nosql_confirm": ("WSTG-INJT-05.6", _NOSQL, "test_quoted_where_on_a_string_path_id_is_confirmed",
+                      _CONFIRM,
+                      "harness NosqlValidator confirms NoSQL injection through a single-quoted "
+                      "$where on a string path id (true and false probes split the response)"),
+    "nosql_control": ("WSTG-INJT-05.6", _NOSQL, "test_control_plain_string_route_is_a_negative",
+                      _CONTROL,
+                      "harness NosqlValidator returns a controlled negative where the path id "
+                      "is matched as a plain string"),
+    "cors_confirm": ("WSTG-CLNT-07", _CORS, "test_compressed_and_plain_grants_agree", _CONFIRM,
+                     "harness CorsValidator confirms a credentialed CORS grant to a reflected "
+                     "foreign origin (plain, gzip and br responses agree)"),
+    "cors_control": ("WSTG-CLNT-07", _CORS, "test_compressed_and_plain_secure_controls_agree",
+                     _CONTROL,
+                     "harness CorsValidator reports safe where the server grants no foreign "
+                     "origin (plain, gzip and br responses agree)"),
 }
 
 

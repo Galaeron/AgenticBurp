@@ -452,17 +452,22 @@ class LiveLegVerificationTest(EvidenceCase):
         self.assertNotEqual(res.status, "confirmed")
         self._assert_controlled_negative(res)
 
+    @evidence_for(**cm.caller_evidence("enum_confirm"))
     def test_auth_username_enum_confirms(self):
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
         ex = self._auth_exchange("/auth/login-enum", '{"username": "alice", "password": "alicepw"}')
         res = self._run_ex(v, ex, "username_enumeration")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed", f"username-enum leg missed a discriminating response: {res.summary}")
 
+    @evidence_for(**cm.caller_evidence("enum_control"))
     def test_auth_username_enum_silent_on_uniform_control(self):
         v = AuthSequenceValidator(allowed_hosts=["127.0.0.1"])
         ex = self._auth_exchange("/auth/login-uniform", '{"username": "alice", "password": "alicepw"}')
         res = self._run_ex(v, ex, "username_enumeration")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     @evidence_for(**cm.caller_evidence("mfa_confirm"))
     def test_auth_2fa_bypass_confirms(self):
@@ -639,19 +644,24 @@ class LiveLegVerificationTest(EvidenceCase):
             request_headers={"Content-Type": "application/x-www-form-urlencoded"},
             request_body="productId=1&quantity=1&price=133700")
 
+    @evidence_for(**cm.caller_evidence("client_trust_confirm"))
     def test_client_trust_confirms_reflected_price(self):
         v = ClientTrustValidator(allowed_hosts=["127.0.0.1"])
         res = self._run_ex(v, self._price_exchange("/shop/cart"), "business_logic")
+        self._observe(res)
         self.assertEqual(res.status, "confirmed",
                          f"client-trust leg missed a server-reflected client price: {res.summary}")
         self.assertTrue(res.confirmed)
 
+    @evidence_for(**cm.caller_evidence("client_trust_control"))
     def test_client_trust_silent_on_server_priced_control(self):
         # NEGATIVE CONTROL: the server ignores the client price and uses its own, so
         # the tampered sentinel is never reflected -> must NOT confirm.
         v = ClientTrustValidator(allowed_hosts=["127.0.0.1"])
         res = self._run_ex(v, self._price_exchange("/shop/cart-safe"), "business_logic")
+        self._observe(res)
         self.assertNotEqual(res.status, "confirmed")
+        self._assert_controlled_negative(res)
 
     def test_jwt_kid_confusion_through_run_context(self):
         from harness.run_context import RunContext
@@ -917,7 +927,7 @@ class LiveLegVerificationTest(EvidenceCase):
         # A control that stays green with the leg's egress cut only proves the validator
         # did nothing, so no evidence-bound test may pass when every async send is refused.
         names = bound_test_names(type(self))
-        self.assertGreaterEqual(len(names), 24, f"bound tests went missing: {names}")
+        self.assertGreaterEqual(len(names), 28, f"bound tests went missing: {names}")
         for name, outcome in outcomes_with_leg_severed(type(self), names).items():
             with self.subTest(test=name):
                 self.assertNotEqual(outcome, "passed",

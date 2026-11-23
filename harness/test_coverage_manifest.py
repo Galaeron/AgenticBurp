@@ -363,6 +363,91 @@ class SafetyPropertyLedgerTests(unittest.TestCase):
         self.assertTrue(declared_coverage_ok(rep)[0])
 
 
+class RegisteredLiveTestStatusTests(unittest.TestCase):
+    """GAP-2: a requirement with a registered live test reports that test's real status,
+    never `gap_unimplemented`, and the statuses that block the gate are the documented ones."""
+
+    #: requirements GAP-2 registered from live loopback legs that already existed.
+    GAP2_REGISTERED = {"WSTG-IDNT-04", "WSTG-BUSL-02", "WSTG-BUSL-05", "WSTG-INJT-05.6",
+                       "WSTG-CLNT-07"}
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="cov_gap2_"))
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+
+    @staticmethod
+    def _automated():
+        return {s.check_id for s in cm.REQUIREMENT_TESTS if s.mode == "automated"}
+
+    def _statuses(self):
+        rep = reconcile(evidence_dir=self._tmp, run_id=RUN)
+        return rep, {r["check_id"]: r["requirement_status"] for r in rep["requirements"]}
+
+    def _pass(self, specs):
+        for s in specs:
+            if s.mode == "automated":
+                _write(self._tmp, s.check_id, s.aspect, TestStatus.PASS, test_id=s.test_id)
+
+    def test_gap2_requirements_are_registered_with_a_confirm_and_a_control(self):
+        for cid in sorted(self.GAP2_REGISTERED):
+            labels = {s.label for s in cm.REQUIREMENT_TESTS if s.check_id == cid}
+            with self.subTest(check_id=cid):
+                self.assertEqual(labels, {"harness_confirmation", "harness_control"})
+
+    def test_negative_control_without_the_registrations_the_rows_are_gap_unimplemented(self):
+        specs = tuple(s for s in cm.REQUIREMENT_TESTS if s.check_id not in self.GAP2_REGISTERED)
+        self._pass(specs)
+        rep = reconcile(specs, evidence_dir=self._tmp, run_id=RUN)
+        statuses = {r["check_id"]: r["requirement_status"] for r in rep["requirements"]}
+        for cid in sorted(self.GAP2_REGISTERED):
+            with self.subTest(check_id=cid):
+                self.assertEqual(statuses[cid], RequirementStatus.GAP_UNIMPLEMENTED.value)
+
+    def test_no_registered_requirement_reports_gap_unimplemented(self):
+        _, without_evidence = self._statuses()
+        for cid in sorted(self._automated()):
+            with self.subTest(check_id=cid):
+                # No evidence yet: the declared test did not run, which blocks; it is not
+                # "no test exists".
+                self.assertEqual(without_evidence[cid], RequirementStatus.GAP_SKIPPED.value)
+        self._pass(cm.REQUIREMENT_TESTS + cm.SAFETY_TESTS)
+        rep, passed = self._statuses()
+        for cid in sorted(self._automated()):
+            with self.subTest(check_id=cid):
+                self.assertEqual(passed[cid], RequirementStatus.COVERED_PARTIAL.value)
+        self.assertTrue(declared_coverage_ok(rep)[0])
+        unimplemented = {c for c, st in passed.items()
+                         if st == RequirementStatus.GAP_UNIMPLEMENTED.value}
+        self.assertFalse(unimplemented & self._automated())
+        self.assertEqual(rep["totals"]["requirement_status_counts"].get(
+            RequirementStatus.COVERED_PARTIAL.value), len(self._automated()))
+
+    def test_blocking_statuses_are_the_documented_ones(self):
+        spec = next(s for s in cm.REQUIREMENT_TESTS if s.check_id == "WSTG-BUSL-05")
+        self._pass([s for s in cm.REQUIREMENT_TESTS + cm.SAFETY_TESTS if s is not spec])
+        blocked = {}
+        for status in (None, TestStatus.FAIL, TestStatus.SKIPPED):
+            if status is not None:
+                _write(self._tmp, spec.check_id, spec.aspect, status, test_id=spec.test_id)
+            ok, problems = declared_coverage_ok(reconcile(evidence_dir=self._tmp, run_id=RUN))
+            blocked[status] = ok
+            self.assertTrue(any(spec.check_id in p for p in problems), (status, problems))
+        self.assertEqual(set(blocked.values()), {False})
+        # manual aspects, N/A rows and unregistered rows do not block on their own.
+        _write(self._tmp, spec.check_id, spec.aspect, TestStatus.PASS, test_id=spec.test_id)
+        rep = reconcile(evidence_dir=self._tmp, run_id=RUN)
+        self.assertTrue(declared_coverage_ok(rep)[0])
+        counts = rep["totals"]["requirement_status_counts"]
+        self.assertGreater(counts.get(RequirementStatus.GAP_MANUAL.value, 0), 0)
+        self.assertGreater(counts.get(RequirementStatus.GAP_UNIMPLEMENTED.value, 0), 0)
+        # A requirement declared N/A does not block even when its declared test failed.
+        _write(self._tmp, spec.check_id, spec.aspect, TestStatus.FAIL, test_id=spec.test_id)
+        self.assertFalse(declared_coverage_ok(reconcile(evidence_dir=self._tmp, run_id=RUN))[0])
+        na = reconcile(evidence_dir=self._tmp, run_id=RUN,
+                       applicability={spec.check_id: (False, "no concurrent operation")})
+        self.assertTrue(declared_coverage_ok(na)[0])
+
+
 class DeclaredIdentityTests(unittest.TestCase):
     def test_declared_automated_ids_resolve_to_runner_ids(self):
         for spec in cm.REQUIREMENT_TESTS + cm.SAFETY_TESTS:
