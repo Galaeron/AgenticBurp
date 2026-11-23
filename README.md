@@ -97,7 +97,24 @@ FastAPI on `127.0.0.1:8787`. At startup: loads and validates config, constructs 
 | `GET /settings` / `POST /settings` | Runtime toggles: active validation, cross-identity, throttle, cloud reasoning |
 | `POST /scan/confidential` | Deterministic regex secrets/PII scan (no model) |
 | `GET /findings/{ref}/evidence` | Evidence ledger reconstruction + reproduction recipe |
-| `POST /validation-results` | Accept Burp-side validation submissions |
+| `POST /test-plans/{id}/dispatch` | Issue the single-use nonce and the live policy for one Burp-plane run (below) |
+| `POST /validation-results` | Accept a Burp-side validation submission, once, under that nonce (below) |
+
+**Burp-plane dispatch.** The Burp extension runs a test plan with its own HTTP stack, so the harness
+decides what it may send. `POST /test-plans/{id}/dispatch` (token required) returns
+`{plan_id, dispatch_nonce, policy: {active_enabled, allow_mutating_replay}, request_budget}`: the live
+values of the two flags and the run request ceiling (`runs.max_requests`). The plane sends mutating
+requests only when both flags are on, and stops at the budget. `POST /validation-results` accepts a
+result only under the plan's current, unconsumed nonce, for a plan that holds no verdict. A refusal
+consumes nothing and answers `{"detail": {"reason": <code>, "message": ...}}`:
+
+| Status | Reason codes |
+|---|---|
+| 404 | `unknown_plan` |
+| 409 | `not_dispatched`, `dispatch_nonce_mismatch`, `duplicate_submission`, `plan_terminal` |
+| 422 | `dispatch_nonce_required`, `wrong_execution_plane`, `binding_mismatch`, `executor_mismatch`, `capability_cannot_confirm`, `confirmed_status_invalid` |
+
+The harness and the Burp jar must be upgraded together: an older harness fails the dispatch with a version hint.
 
 ### Orchestrator (`harness/orchestrator.py`)
 
