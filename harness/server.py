@@ -2507,7 +2507,45 @@ async def wipe_engagement_evidence(host: str, authorization: str | None = Header
     if not _WIPE_ENDPOINT_ENABLED:
         raise HTTPException(status_code=403, detail="wipe endpoint disabled (set server.enable_wipe_endpoint)")
     counts = await __import__("asyncio").to_thread(store.wipe_engagement, host)
-    return {"host": host, "wiped": counts}
+    # OPS-5: the wipe acts on the store this process uses ('' = legacy single store).
+    return {"host": host, "wiped": counts, "engagement_store": store.active_engagement()}
+
+
+class CloseEngagementRequest(_BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    engagement_id: str = Field(min_length=1, max_length=128)
+    # The engagement ID typed again: a destructive close must be confirmed explicitly.
+    confirm: str = Field(default="", max_length=128)
+
+
+@app.post("/engagements/close")
+async def close_engagement_store(req: CloseEngagementRequest, authorization: str | None = Header(default=None)):
+    """OPS-5: export, then remove, one engagement's data -- its own store
+    (engagements/<key>/) and the rows the legacy single store attributes to it.
+    Gated like the wipe route: the CSRF middleware's mutation token and
+    _require_auth, the same server.enable_wipe_endpoint opt-in (ships false),
+    plus `confirm` repeating the engagement ID. The export lands in a new
+    directory under engagement_exports/ beside the legacy store, never at a
+    request-supplied path. The engagement this process stores into is refused
+    (409): restart the server for another engagement (or none) first. The
+    offline equivalent is `python -m harness.data_maintenance close-engagement`."""
+    _require_auth(authorization)
+    if not _WIPE_ENDPOINT_ENABLED:
+        raise HTTPException(status_code=403, detail="close endpoint disabled (set server.enable_wipe_endpoint)")
+    if req.confirm != req.engagement_id:
+        raise HTTPException(status_code=422, detail="closing removes the engagement's stored data after export; "
+                                                    "resend with confirm set to the engagement_id")
+    try:
+        return await asyncio.to_thread(store.close_engagement, req.engagement_id)
+    except store.EngagementStoreActive as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except LookupError:
+        raise HTTPException(status_code=404, detail="nothing is stored for this engagement") from None
+    except ValueError:
+        raise HTTPException(status_code=422, detail="engagement ID or store layout refused; nothing was removed") from None
+    except (OSError, __import__("sqlite3").Error) as exc:
+        log.warning("close engagement failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="close failed before removal; nothing was removed") from None
 
 
 @app.get("/activity")
