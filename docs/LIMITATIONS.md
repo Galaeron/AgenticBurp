@@ -174,8 +174,23 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
   `/telemetry` as `external_lookup:<service>` (service names only). The default
   stays on, matching earlier behaviour; whether it should default off is an open
   owner decision. The `passive-only` operating profile does not change it.
-- **[open] Data on disk is unencrypted** with no per-engagement separation; a
-  wipe endpoint exists (`enable_wipe_endpoint`) but is not automatic.
+- **[partial] Data on disk is unencrypted; engagements can now be separated and
+  closed (OPS-5).** The tool encrypts nothing at rest, so it must run on a disk
+  with full-disk encryption that also covers the export directory. With
+  `HARNESS_ENGAGEMENT_ID` set, a process stores into its own
+  `harness/engagements/<key>/` store. Closing an engagement (the
+  `data_maintenance close-engagement` CLI, or `POST /engagements/close` behind
+  the bearer token, `server.enable_wipe_endpoint` and a repeated-ID
+  confirmation) exports first, then removes that store and the single store's
+  rows attributed to that ID. Still open: separation is opt-in (without the
+  variable everything goes to the single legacy store, as before); there is one
+  engagement per process; the exchange cache (`harness_cache.db`) stays shared;
+  in the single store, tables without an engagement column (test plans,
+  validation runs, proof records, finding inputs and similar) keep their rows
+  when an engagement is closed, so use a per-engagement store; removal
+  is a file delete, not secure erasure; and the optional
+  `store.engagement_retention_days` TTL ships off and only runs from the
+  explicit `retention --apply` command.
 
 ## Reproducibility & portability
 
