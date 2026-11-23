@@ -87,6 +87,20 @@ helper tests before declaring an integration requirement met. The separate
 `evaluation_integrity/` contract suite does not itself prove every score/export
 path enforces that contract.
 
+## Import isolation (`sitecustomize.py`)
+
+The tracked `sitecustomize.py` at the repository root is a test-environment hook, not part of the
+product: `pyproject.toml` packages only `harness*`, so an installed harness has none. Python
+imports it at startup when the root is on `PYTHONPATH`, which `python -m harness.suite` arranges
+for every child process it starts and `PYTHONPATH=<worktree>` does by hand. It removes the
+editable-install finders, so a module missing from the checkout under test raises `ImportError`
+instead of loading from another checkout that a venv's `pip install -e .` points at. Tests run
+through it therefore see a stricter import environment than an installed package, or than
+`python -m harness.server` in a shell without `PYTHONPATH`; a passing run does not show that the
+installed package imports. `harness/test_sitecustomize_header.py` pins the header and the
+behaviour. A verification snapshot (`docs/VERIFICATION_SNAPSHOTS.md`) generates its own, stricter
+`sitecustomize.py`; that is a different file.
+
 ## CI and live evidence
 
 Read from `.github/workflows/ci.yml`. Smoke is a local fast subset; CI does not run it.
