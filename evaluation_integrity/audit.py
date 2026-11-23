@@ -213,7 +213,7 @@ def markdown(report: dict[str, Any]) -> str:
     met = report["metrics"]
     lines += ["", "## Counts and metric scope", "",
               f"- Normalized auditable finding records: **{met['normalized_auditable_finding_records']}**",
-              f"- Unique issues: **{met['unique_issues'] if met['unique_issues'] is not None else 'unknown'}** "
+              f"- Distinct issue ids (not root causes): **{met['unique_issues'] if met['unique_issues'] is not None else 'unknown'}** "
               f"(`{met['unique_issue_identity_basis']}`)",
               f"- Proof-supported confirmation occurrences: **{met['proof_supported_confirmation_occurrences']}**",
               f"- Benchmark scope: `{met['benchmark_scope'] or 'unknown'}`"]

@@ -133,6 +133,19 @@ class AdapterAndCliTests(unittest.TestCase):
         report = build_audit([self.write("bundle.json", bundle)])
         self.assertIn("1 / 2 (50.0%)", markdown(report))
 
+    def test_markdown_counts_issue_ids_without_calling_them_unique_or_root_causes(self):
+        """EFF-3: an issue id is one unit; root causes are fewer. The report line must not read as a
+        count of unique problems. The JSON key `unique_issues` is unchanged for existing consumers."""
+        bundle = {"schema_version": "evaluation-integrity-input/v1",
+                  "findings": [{"finding_id": "f1", "issue_id": "i1"}, {"finding_id": "f2", "issue_id": "i1"},
+                               {"finding_id": "f3", "issue_id": "i2"}],
+                  "proofs": [], "cases": [], "artifacts": []}
+        report = build_audit([self.write("bundle.json", bundle)])
+        self.assertEqual(report["metrics"]["unique_issues"], 2)
+        text = markdown(report)
+        self.assertIn("- Distinct issue ids (not root causes): **2** (`production_issue_id`)", text)
+        self.assertNotIn("Unique issues", text)
+
 
 if __name__ == "__main__":
     unittest.main()
