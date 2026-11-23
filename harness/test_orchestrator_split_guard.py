@@ -54,7 +54,7 @@ def product_modules() -> list[Path]:
                   if not p.name.startswith("test_") and "__pycache__" not in p.parts)
 
 
-def test_files() -> list[Path]:
+def files_with_tests() -> list[Path]:
     roots = [HARNESS, REPO / "testing", REPO / "evaluation_integrity"]
     return sorted(p for root in roots if root.is_dir() for p in root.rglob("test_*.py")
                   if "__pycache__" not in p.parts)
@@ -219,7 +219,7 @@ class DriverContractTests(unittest.TestCase):
 class PatchTargetTests(unittest.TestCase):
     def test_every_orchestrator_patch_target_is_looked_up_by_its_module(self):
         problems = {}
-        for path in test_files():
+        for path in files_with_tests():
             if path == Path(__file__).resolve():
                 continue
             source = path.read_text(encoding="utf-8-sig")
