@@ -77,6 +77,7 @@ and a clean lockfile installation still need their own verification.
 | Are the run's own 5xx answers followed up? | `test_server_errors` | Loopback search route; sqlmap / nosql legs stubbed; also covers the NoSQL-to-nosql-leg routing |
 | Do retry rounds spend a time-boxed run's budget? | `test_retry_rounds`, `RefreshAfterRetryRoundsTests` in `test_coverage_tracker` | Stubbed worklist and review; no live model |
 | Are tests silently uncollected? | `test_no_orphan_test_files`, `test_async_test_hygiene` | Static guards plus CI wiring; runtime collection remains authoritative |
+| Did a module regrow, take a star import, or get a patch that no longer reaches its code? | `test_orchestrator_split_guard` | Static: no `import *`, orchestrator modules at most 1,200 lines, a size ratchet for the other oversized modules, and each `orchestrator*` patch target must be read by its module (`chain_patch` reaches every `orchestrator_chain*` stage) |
 
 The `test_score_provenance`, `test_evidence_audit`, `test_coverage_summary`, and
 `test_eval_health` modules are component regressions. The 2026-09-19 review found

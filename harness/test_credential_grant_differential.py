@@ -14,6 +14,8 @@ from unittest.mock import patch
 from harness import global_throttle
 from harness import orchestrator_chain as oc
 from harness.run_context import ExecutionOutcome
+from harness.chain_stage_patch import chain_patch
+from harness import orchestrator_chain_support as ocs
 
 
 class _FakeTransport:
@@ -41,7 +43,7 @@ class _FakeTransport:
 
     async def send_creds(self, method, url, *, capability, headers=None, max_redirects=0, **kw):
         headers = headers or {}
-        is_invalid = any(str(v).endswith(oc._FR6_INVALID_SENTINEL) for v in headers.values())
+        is_invalid = any(str(v).endswith(ocs._FR6_INVALID_SENTINEL) for v in headers.values())
         if is_invalid:
             self.invalid_calls += 1
             if self._invalid_exc is not None:
@@ -65,7 +67,7 @@ def _run_grant(fake_transport, *, url="http://shop.test/secret", headers=None, a
     orch = _DummyOrch(allowed_hosts=allowed_hosts)
     if headers is None:
         headers = {"Authorization": "Bearer learned"}
-    with patch("harness.orchestrator_chain.transport_for", return_value=(fake_transport, None)):
+    with chain_patch("transport_for", return_value=(fake_transport, None)):
         return asyncio.run(orch._credential_grants_access(url, headers))
 
 
@@ -267,14 +269,14 @@ class CredentialGrantDifferentialTests(unittest.TestCase):
     # ---- helper unit tests: _invalidated_headers ---------------------------
 
     def test_invalidated_headers_corrupts_authorization(self):
-        out = oc._invalidated_headers({"Authorization": "Bearer real", "X-Trace": "abc"})
+        out = ocs._invalidated_headers({"Authorization": "Bearer real", "X-Trace": "abc"})
         self.assertNotEqual(out["Authorization"], "Bearer real")
         self.assertTrue(out["Authorization"].startswith("Bearer real"))
         self.assertEqual(out["X-Trace"], "abc")  # non-credential header left alone
         self.assertEqual(set(out.keys()), {"Authorization", "X-Trace"})  # names preserved
 
     def test_invalidated_headers_corrupts_cookie(self):
-        out = oc._invalidated_headers({"Cookie": "session=abc123"})
+        out = ocs._invalidated_headers({"Cookie": "session=abc123"})
         self.assertNotEqual(out["Cookie"], "session=abc123")
         self.assertTrue(out["Cookie"].startswith("session=abc123"))
 
@@ -282,14 +284,14 @@ class CredentialGrantDifferentialTests(unittest.TestCase):
         """When none of the supplied headers are recognised credential headers
         (e.g. a bespoke X-Api-Key scheme), every header's value is corrupted
         instead, so the invalid-token control is always genuinely invalid."""
-        out = oc._invalidated_headers({"X-Api-Key": "abc123"})
+        out = ocs._invalidated_headers({"X-Api-Key": "abc123"})
         self.assertNotEqual(out["X-Api-Key"], "abc123")
         self.assertTrue(out["X-Api-Key"].startswith("abc123"))
         self.assertEqual(list(out.keys()), ["X-Api-Key"])  # name preserved
 
     def test_invalidated_headers_does_not_mutate_input(self):
         original = {"Authorization": "Bearer real"}
-        oc._invalidated_headers(original)
+        ocs._invalidated_headers(original)
         self.assertEqual(original, {"Authorization": "Bearer real"})
 
     # ---- helper unit tests: _responses_equivalent --------------------------
@@ -297,17 +299,17 @@ class CredentialGrantDifferentialTests(unittest.TestCase):
     def test_responses_equivalent_same_status_and_body(self):
         a = ExecutionOutcome(outcome="ok", status=200, body="x")
         b = ExecutionOutcome(outcome="ok", status=200, body="x")
-        self.assertTrue(oc._responses_equivalent(a, b))
+        self.assertTrue(ocs._responses_equivalent(a, b))
 
     def test_responses_equivalent_different_body_not_equivalent(self):
         a = ExecutionOutcome(outcome="ok", status=200, body="x")
         b = ExecutionOutcome(outcome="ok", status=200, body="y")
-        self.assertFalse(oc._responses_equivalent(a, b))
+        self.assertFalse(ocs._responses_equivalent(a, b))
 
     def test_responses_equivalent_different_status_not_equivalent(self):
         a = ExecutionOutcome(outcome="ok", status=200, body="x")
         b = ExecutionOutcome(outcome="ok", status=401, body="x")
-        self.assertFalse(oc._responses_equivalent(a, b))
+        self.assertFalse(ocs._responses_equivalent(a, b))
 
 
 if __name__ == "__main__":

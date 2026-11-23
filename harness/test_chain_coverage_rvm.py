@@ -34,6 +34,7 @@ from harness.engagement import EngagementState
 from harness.orchestrator import Orchestrator
 from harness.role_crawl import RoleSession
 from harness.validators.base import ValidationResult
+from harness.chain_stage_patch import chain_patch
 
 _HARNESS = Path(__file__).resolve().parent
 _PUBLIC_DOCS = ("<h1>Administrator help</h1><p>Public documentation: how to request an "
@@ -134,9 +135,9 @@ class ChainMissingAuthDeclarationTests(unittest.TestCase):
         orch.allowed_hosts = ["127.0.0.1"]
         with patch.object(engagement_builder, "build_engagement", new=build), \
                 patch.object(worklist_investigator, "investigate_worklist", new=investigate), \
-                patch("harness.orchestrator_chain.review_captured_exchanges",
+                chain_patch("review_captured_exchanges",
                       new=AsyncMock(return_value=0)), \
-                patch("harness.orchestrator_chain.universal_header_audit",
+                chain_patch("universal_header_audit",
                       new=AsyncMock(return_value=0)), \
                 patch.object(orch, "_persist_confirmation_proof",
                              new=AsyncMock(return_value=(False, None, "test"))):

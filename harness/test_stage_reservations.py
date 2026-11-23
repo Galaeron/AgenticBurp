@@ -31,6 +31,7 @@ from harness.test_coverage_tracker import _state_with as _coverage_state
 from harness.test_deterministic_first import BASE, _config
 from harness.test_worklist_investigator import ADMIN, OBJ, ROLES, _nothing
 from harness.test_worklist_investigator import _state_with as _worklist_state
+from harness.chain_stage_patch import chain_patch
 
 
 class _Clock:
@@ -336,8 +337,8 @@ class StageReservationCaller(unittest.TestCase):
                    patch.object(worklist_investigator, "investigate_worklist", new=spend_worklist),
                    patch.object(coverage_tracker, "build_coverage_driven", new=drive),
                    patch.object(coverage_tracker, "build_coverage_cases_driven", new=drive),
-                   patch("harness.orchestrator_chain.review_captured_exchanges", new=review),
-                   patch("harness.orchestrator_chain.universal_header_audit",
+                   chain_patch("review_captured_exchanges", new=review),
+                   chain_patch("universal_header_audit",
                          new=AsyncMock(return_value=0)),
                    patch("harness.browser_driver.default_driver", return_value=None),
                    *extra_patches]
@@ -431,7 +432,7 @@ class StageReservationCaller(unittest.TestCase):
 
         return self._investigate(investigation=investigation, chain_rounds=2, extra_patches=(
             patch("harness.chain_linker.link_findings", new=link),
-            patch("harness.orchestrator_chain.time", clock),
+            chain_patch("time", clock),
             patch.object(Orchestrator, "_credential_grants_access",
                          new=AsyncMock(return_value=False))))
 

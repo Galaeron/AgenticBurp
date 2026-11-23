@@ -17,6 +17,7 @@ from harness import principals
 from harness.models import AgentReport, Finding, HttpExchange
 from harness.run_context import RunContext
 from harness.validators.registry import ValidatorRegistry
+from harness.chain_stage_patch import chain_patch
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -392,8 +393,8 @@ class ChainConstructionTests(_Fixture):
                                                        finding_class="x", summary="stub"))
         with patch.object(engagement_builder, "build_engagement", new=build), \
              patch.object(worklist_investigator, "investigate_worklist", new=investigate), \
-             patch("harness.orchestrator_chain.review_captured_exchanges", new=AsyncMock(return_value=0)), \
-             patch("harness.orchestrator_chain.universal_header_audit", new=AsyncMock(return_value=0)), \
+             chain_patch("review_captured_exchanges", new=AsyncMock(return_value=0)), \
+             chain_patch("universal_header_audit", new=AsyncMock(return_value=0)), \
              patch.object(CrossIdentityValidator, "__init__", spy), \
              patch.object(IdorReadValidator, "validate", new=skip), \
              patch.object(AuthSequenceValidator, "validate", new=skip), \

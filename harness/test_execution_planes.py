@@ -32,7 +32,7 @@ from harness.execution_planes import CAPABILITY_MATRIX
 ROOT = Path(__file__).resolve().parent.parent
 VALIDATION_EXECUTOR_JAVA = ROOT / "burp-extension" / "src" / "main" / "java" / "com" / "harness" / "llm" / "ValidationExecutor.java"
 REGISTRY_PY = ROOT / "harness" / "validators" / "registry.py"
-ORCHESTRATOR_CHAIN_PY = ROOT / "harness" / "orchestrator_chain.py"
+ORCHESTRATOR_COVERAGE_PY = ROOT / "harness" / "orchestrator_chain_coverage.py"
 
 
 def _extract_balanced(text: str, open_index: int) -> str:
@@ -75,9 +75,9 @@ def _python_registry_keys() -> set[str]:
 
 def _python_val_by_conf_keys() -> set[str]:
     """Every key of the `_val_by_conf` confirmation-name map in
-    orchestrator_chain.py::investigate_engagement (dict literal + the one
+    orchestrator_chain_coverage.py (investigate_engagement's coverage stage; dict literal + the one
     conditional `_val_by_conf["sqlmap"] = ...` assignment)."""
-    text = ORCHESTRATOR_CHAIN_PY.read_text(encoding="utf-8")
+    text = ORCHESTRATOR_COVERAGE_PY.read_text(encoding="utf-8")
     literal_start = text.index("_val_by_conf = {")
     brace_start = text.index("{", literal_start)
     body = _extract_balanced(text, brace_start)

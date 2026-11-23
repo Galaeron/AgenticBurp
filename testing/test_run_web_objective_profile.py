@@ -36,6 +36,7 @@ from harness.run_context import RunContext
 from harness.validators.base import ValidationResult
 from harness.validators.cross_identity_validator import CrossIdentityValidator
 from testing import run_web_objective_smoke as smoke
+from harness.chain_stage_patch import chain_patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -178,9 +179,9 @@ class RunnerObjectiveProfileTest(unittest.TestCase):
         with patch.object(engagement_builder, "build_engagement", new=_build), \
              patch.object(worklist_investigator, "investigate_worklist",
                           new=AsyncMock(return_value=[])), \
-             patch("harness.orchestrator_chain.review_captured_exchanges",
+             chain_patch("review_captured_exchanges",
                    new=AsyncMock(return_value=0)), \
-             patch("harness.orchestrator_chain.universal_header_audit",
+             chain_patch("universal_header_audit",
                    new=AsyncMock(return_value=0)), \
              patch.object(CrossIdentityValidator, "validate",
                           new=AsyncMock(return_value=xid if idor_confirms else

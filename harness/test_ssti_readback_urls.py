@@ -21,7 +21,7 @@ from __future__ import annotations
 import unittest
 
 from harness.models import HttpExchange
-from harness.orchestrator_chain import _ssti_readback_urls
+from harness.orchestrator_chain_support import _ssti_readback_urls
 
 
 def _dict_capture(**overrides) -> dict:

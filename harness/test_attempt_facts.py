@@ -20,7 +20,7 @@ from harness.coverage_model import CellStatus, CoverageMatrix
 from harness.coverage_tracker import (CoverageTracker, build_coverage,
                                       build_coverage_cases_driven, build_coverage_driven)
 from harness.models import Finding, HttpExchange
-from harness.orchestrator_chain import _ConfirmationCache
+from harness.orchestrator_chain_support import _ConfirmationCache
 from harness.role_crawl import RoleSession
 from harness.run_context import RunContext, TypedRequest
 from harness.validators.base import ValidationResult

@@ -69,7 +69,7 @@ class PortScopeCallers(unittest.IsolatedAsyncioTestCase):
 
 class ReviewScheduling(unittest.IsolatedAsyncioTestCase):
     async def test_review_caller_deduplicates_and_gives_other_route_a_turn(self):
-        from harness.orchestrator_helpers import review_captured_exchanges
+        from harness.orchestrator_review import review_captured_exchanges
         orch = SimpleNamespace(analyze=AsyncMock(return_value=SimpleNamespace(agent_reports=[])))
         state = SimpleNamespace(record_template=lambda *args: None)
         polling = [exchange(f"http://127.0.0.1:3002/socket.io?t={i}") for i in range(10)]

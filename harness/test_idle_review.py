@@ -41,7 +41,7 @@ from harness import engagement_builder
 from harness import evidence_ledger
 from harness import global_throttle
 from harness import model_activity
-from harness import orchestrator_helpers
+from harness import orchestrator_review
 from harness import review_overlap
 from harness import role_crawl
 from harness import store
@@ -55,6 +55,7 @@ from harness.review_overlap import IdleReview
 from harness.role_crawl import RoleSession
 from harness.run_context import RunContext
 from harness.test_review_overlap import _SlowModel, _config, _install
+from harness.chain_stage_patch import chain_patch
 
 ITEMS = 24                # distinct JSON objects: each is its own review
 PAGES = 6                 # one identical page under six paths: one review, five grouped
@@ -269,7 +270,7 @@ class _Run:
                    patch.object(worklist_investigator, "investigate_worklist", new=sweep),
                    patch.object(coverage_tracker, "build_coverage_driven",
                                 new=AsyncMock(return_value={})),
-                   patch("harness.orchestrator_chain.universal_header_audit",
+                   chain_patch("universal_header_audit",
                          new=AsyncMock(return_value=0)),
                    patch("harness.ffuf_runner.ffuf_available",
                          return_value=(False, "ffuf disabled for this test")),
@@ -666,9 +667,9 @@ class ReviewGroupsAcrossCallsTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_later_call_groups_content_an_earlier_call_reviewed(self):
         orch, state, seen, groups = self._orch(), self._state(), set(), {}
         stats = {}
-        await orchestrator_helpers.review_captured_exchanges(
+        await orchestrator_review.review_captured_exchanges(
             orch, state, [_page("http://h/pages/a")], seen=seen, stats=stats, groups=groups)
-        await orchestrator_helpers.review_captured_exchanges(
+        await orchestrator_review.review_captured_exchanges(
             orch, state, [_page("http://h/pages/a"), _page("http://h/pages/b"),
                           _page("http://h/pages/c")], seen=seen, stats=stats, groups=groups)
         self.assertEqual(orch.analyze.await_count, 1)
@@ -678,9 +679,9 @@ class ReviewGroupsAcrossCallsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_negative_control_without_groups_the_content_is_reviewed_again(self):
         orch, state, seen = self._orch(), self._state(), set()
-        await orchestrator_helpers.review_captured_exchanges(
+        await orchestrator_review.review_captured_exchanges(
             orch, state, [_page("http://h/pages/a")], seen=seen)
-        await orchestrator_helpers.review_captured_exchanges(
+        await orchestrator_review.review_captured_exchanges(
             orch, state, [_page("http://h/pages/a"), _page("http://h/pages/b"),
                           _page("http://h/pages/c")], seen=seen)
         self.assertEqual(orch.analyze.await_count, 2)
@@ -690,8 +691,8 @@ class ReviewGroupsAcrossCallsTests(unittest.IsolatedAsyncioTestCase):
         items = [HttpExchange(method="GET", url=f"http://h/api/items/{n}", response_status=200,
                               response_headers={"Content-Type": "application/json"},
                               response_body=json.dumps({"id": n})) for n in range(4)]
-        await orchestrator_helpers.review_captured_exchanges(orch, state, items[:2], seen=seen)
-        await orchestrator_helpers.review_captured_exchanges(orch, state, items, seen=seen)
+        await orchestrator_review.review_captured_exchanges(orch, state, items[:2], seen=seen)
+        await orchestrator_review.review_captured_exchanges(orch, state, items, seen=seen)
         self.assertEqual([c.args[0].url for c in orch.analyze.await_args_list],
                          [i.url for i in items[:2]] + [i.url for i in items[2:]])
 
@@ -699,7 +700,7 @@ class ReviewGroupsAcrossCallsTests(unittest.IsolatedAsyncioTestCase):
         orch, state, errors, stats, outcome = self._orch(), self._state(), [], {}, {}
         pages = [HttpExchange(method="GET", url=f"http://h/api/items/{n}", response_status=200,
                               response_headers={}, response_body=str(n)) for n in range(3)]
-        await orchestrator_helpers.review_captured_exchanges(
+        await orchestrator_review.review_captured_exchanges(
             orch, state, pages, seen=set(), errors=errors, stats=stats,
             should_stop=lambda: review_overlap.MODEL_BUSY, report_left=False,
             outcome_out=outcome)

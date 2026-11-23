@@ -25,6 +25,7 @@ from harness import final_pass as final_pass_mod
 from harness.test_coverage_replay_dedupe import _seeded
 from harness.test_engagement_transport_callers import _ROLES, _EngagementCallerBase, _config
 from harness.validators.base import ValidationResult
+from harness.chain_stage_patch import chain_patch
 
 ALICE = "Bearer alice-token"
 START = 1000.0
@@ -77,7 +78,7 @@ class FinalPassDriveCallerTests(_EngagementCallerBase, unittest.TestCase):
         patches = [patch("harness.engagement_builder.build_engagement", side_effect=_seeded(captures)),
                    patch("harness.worklist_investigator.investigate_worklist", worklist),
                    patch("harness.final_pass.run_final_pass", final),
-                   patch("harness.orchestrator_chain.time", fake_time),
+                   chain_patch("time", fake_time),
                    patch("harness.coverage_tracker.time", fake_time),
                    patch("harness.validators.cross_identity_validator.CrossIdentityValidator.validate",
                          new=recorder("cross_identity")),

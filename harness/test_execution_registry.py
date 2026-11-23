@@ -23,7 +23,7 @@ from harness import engagement, worklist_investigator
 from harness.coverage_tracker import _fair_cells, build_coverage_driven
 from harness.execution_registry import SHAPE_KEYED, ExecutionRegistry, execution_key
 from harness.models import AgentReport, Finding, HttpExchange
-from harness.orchestrator_chain import _ConfirmationCache
+from harness.orchestrator_chain_support import _ConfirmationCache
 from harness.orchestrator_helpers import confirmation_cache_key
 from harness.role_crawl import RoleSession
 from harness.run_context import RequestBudget, RunContext
