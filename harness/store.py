@@ -48,10 +48,13 @@ _ENGAGEMENTS_DIRNAME = "engagements"
 _EXPORTS_DIRNAME = "engagement_exports"
 _ENGAGEMENT_DB_NAME = "harness_state.db"
 _ENGAGEMENT_MANIFEST = "engagement.json"
+_ENGAGEMENT_LOCK = "engagement.lock"
+_CLOSING_PREFIX = ".closing-"
 _STORE_LAYOUT_VERSION = 1
 _ACTIVE_ENGAGEMENT = ""
 _ACTIVE_STORE_PATH: Path | None = None
 _LEGACY_DB_PATH = Path(_DB_PATH)
+_HELD_STORE_LOCK = None   # open engagement.lock of the selected store, held while selected
 
 
 class EngagementStoreActive(ValueError):
@@ -129,25 +132,72 @@ def _claim_engagement_dir(directory: Path, engagement_id: str) -> None:
             raise ValueError("engagement store directory belongs to a different engagement") from None
 
 
+def _hold_store_lock(directory: Path):
+    """Open the store's lock file and keep it open while the store is selected,
+    so a close from another process sees the store is in use: a shared flock on
+    POSIX; on Windows the open handle alone makes the directory rename fail."""
+    stream = open(directory / _ENGAGEMENT_LOCK, "a+b")
+    if os.name != "nt":
+        import fcntl
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            stream.close()
+            raise EngagementStoreActive("that engagement store is being closed") from None
+    return stream
+
+
+def _release_store_lock() -> None:
+    global _HELD_STORE_LOCK
+    if _HELD_STORE_LOCK is not None:
+        try:
+            _HELD_STORE_LOCK.close()
+        except OSError:
+            pass
+        _HELD_STORE_LOCK = None
+
+
+def interrupted_closes(engagement_id: str | None = None) -> list[Path]:
+    """Store directories a close renamed aside and did not finish removing (a
+    crash mid-export, or files it could not delete). close_engagement recovers
+    them; selecting that engagement is refused until it does."""
+    root = engagements_root()
+    if not root.is_dir():
+        return []
+    pattern = _CLOSING_PREFIX + (f"{engagement_store_key(engagement_id)}-*" if engagement_id else "*")
+    return sorted(path for path in root.glob(pattern) if path.is_dir() and not path.is_symlink())
+
+
 def select_engagement_store(engagement_id: str) -> Path:
     """Point this process's store at one engagement's own database, creating it
     on first use; '' goes back to the legacy single store. Returns the path.
     Selecting never moves or deletes data: rows already in the legacy store stay
-    there and load again once the legacy store is selected."""
-    global _DB_PATH, _ACTIVE_ENGAGEMENT, _ACTIVE_STORE_PATH, _LEGACY_DB_PATH
+    there and load again once the legacy store is selected. The selected store's
+    lock file stays open, so another process cannot close it meanwhile."""
+    global _DB_PATH, _ACTIVE_ENGAGEMENT, _ACTIVE_STORE_PATH, _LEGACY_DB_PATH, _HELD_STORE_LOCK
     legacy = legacy_store_path()
     if engagement_id == "":
+        _release_store_lock()
         _DB_PATH, _ACTIVE_ENGAGEMENT, _ACTIVE_STORE_PATH = legacy, "", None
         return legacy
     directory = legacy.parent / _ENGAGEMENTS_DIRNAME / engagement_store_key(engagement_id)
+    if directory.parent.is_dir() and any(directory.parent.glob(f"{_CLOSING_PREFIX}{directory.name}-*")):
+        raise ValueError("an interrupted close holds this engagement's data aside; run "
+                         "close-engagement for it before storing into it again")
     _claim_engagement_dir(directory, engagement_id)
+    lock = _hold_store_lock(directory)
+    _release_store_lock()
     path = directory / _ENGAGEMENT_DB_NAME
     _LEGACY_DB_PATH, _DB_PATH, _ACTIVE_ENGAGEMENT, _ACTIVE_STORE_PATH = legacy, path, engagement_id, path
+    _HELD_STORE_LOCK = lock
     return path
 
 
 if os.environ.get(ENGAGEMENT_ENV_VAR):
-    select_engagement_store(os.environ[ENGAGEMENT_ENV_VAR])
+    try:
+        select_engagement_store(os.environ[ENGAGEMENT_ENV_VAR])
+    except ValueError as exc:
+        raise ValueError(f"{ENGAGEMENT_ENV_VAR}: {exc}") from None
 
 
 def isolate_engagement_context(fn):
@@ -4023,7 +4073,13 @@ def list_engagement_stores() -> list[dict]:
                 continue
         except ValueError:
             continue
-        mtimes = [entry.stat().st_mtime for entry in directory.iterdir() if entry.is_file()]
+        mtimes = []
+        for entry in directory.iterdir():
+            try:
+                if entry.is_file():
+                    mtimes.append(entry.stat().st_mtime)
+            except OSError:   # removed by a concurrent close
+                continue
         stores.append({"engagement_id": engagement_id, "key": directory.name, "path": str(directory),
                        "active": engagement_id == active, "last_write": max(mtimes, default=0.0)})
     return stores
@@ -4048,6 +4104,12 @@ def close_engagement(engagement_id: str, *, export_root: Path | str | None = Non
                                     "engagement (or none) before closing it")
     legacy = legacy_store_path()
     directory = engagement_store_dir(engagement_id)
+    leftovers = interrupted_closes(engagement_id)
+    if leftovers:
+        # Recover an interrupted close: put the set-aside store back, then close it.
+        if len(leftovers) > 1 or directory.exists() or _manifest_engagement(leftovers[0]) != engagement_id:
+            raise ValueError("an interrupted close left data aside that needs manual review")
+        os.rename(leftovers[0], directory)
     store_dir = None
     if directory.exists() or directory.is_symlink():
         if directory.is_symlink() or not directory.is_dir() or _manifest_engagement(directory) != engagement_id:
@@ -4057,10 +4119,16 @@ def close_engagement(engagement_id: str, *, export_root: Path | str | None = Non
     if store_dir is None and legacy_db is None:
         raise LookupError("nothing is stored for this engagement")
     root = Path(export_root) if export_root is not None else legacy.parent / _EXPORTS_DIRNAME
+    if root.resolve().is_relative_to(engagements_root().resolve()):
+        raise ValueError("the export directory must not be inside the engagement stores")
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now if now is not None else time.time()))
     export_dir = root / f"{engagement_store_key(engagement_id)}-{stamp}-{secrets.token_hex(3)}"
-    receipt = data_maintenance.close_engagement_store(
-        engagement_id, store_dir=store_dir, legacy_db=legacy_db, export_dir=export_dir)
+    try:
+        receipt = data_maintenance.close_engagement_store(
+            engagement_id, store_dir=store_dir, legacy_db=legacy_db, export_dir=export_dir)
+    except data_maintenance.StoreInUse:
+        raise EngagementStoreActive("another process is storing into that engagement; stop it "
+                                    "(or select another engagement there) before closing") from None
     for path in list(_INITIALISED):
         if store_dir is not None and Path(path).parent == Path(os.path.abspath(store_dir)):
             with _INIT_LOCK:
@@ -4098,9 +4166,16 @@ def apply_engagement_retention(retention_days: float, *, apply: bool = False,
     result = {"retention_days": retention_days, "applied": bool(apply),
               "expired": [entry["engagement_id"] for entry in expired], "closed": []}
     if apply:
+        result["failed"] = []
         for entry in expired:
-            result["closed"].append(close_engagement(entry["engagement_id"], export_root=export_root,
-                                                     now=now))
+            # One store that cannot close (in use, a locked file) must not hide
+            # the receipts of the stores already closed.
+            try:
+                result["closed"].append(close_engagement(entry["engagement_id"], export_root=export_root,
+                                                         now=now))
+            except (LookupError, ValueError, OSError, sqlite3.Error) as exc:
+                result["failed"].append({"engagement_id": entry["engagement_id"],
+                                         "error_type": type(exc).__name__})
     return result
 
 

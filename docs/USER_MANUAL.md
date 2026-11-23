@@ -279,8 +279,8 @@ secrets and PII in captured traffic; it does not redact anything.
   everything goes to the single `harness/harness_state.db` as before; data
   already there loads unchanged and is never moved. One engagement per process:
   restart to switch. The exchange cache (`harness_cache.db`) is still shared.
-- **Closing an engagement.** When the engagement ends, close it from a process
-  that is not storing into it:
+- **Closing an engagement.** When the engagement ends, stop every server or run
+  that has it selected (a close is refused while one does) and close it:
   `python -m harness.data_maintenance close-engagement --engagement-id acme-2026 --confirm acme-2026`
   (`--export-dir D` to choose where the export goes; `engagements` lists the
   stores). The same close is `POST /engagements/close` with

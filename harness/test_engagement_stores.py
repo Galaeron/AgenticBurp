@@ -67,6 +67,7 @@ class _StoreFixture(unittest.TestCase):
         self.legacy = store._DB_PATH
 
     def tearDown(self):
+        store._release_store_lock()
         (store._DB_PATH, store._ACTIVE_ENGAGEMENT, store._ACTIVE_STORE_PATH,
          store._LEGACY_DB_PATH) = self._saved
         self._tmp.cleanup()
@@ -273,6 +274,99 @@ class CloseRouteTests(_StoreFixture):
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(resp.json()["engagement_store"], _B)
         self.assertEqual(len(store.all_host_findings(_URL_B)), 0)
+
+
+_HOLDER = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "from harness import store\n"
+    "store._DB_PATH = Path(sys.argv[1])\n"
+    "store.select_engagement_store(sys.argv[2])\n"
+    "print('ready', flush=True)\n"
+    "sys.stdin.read()\n")
+
+
+def _child_env(**extra) -> dict:
+    env = {key: value for key, value in os.environ.items() if key != store.ENGAGEMENT_ENV_VAR}
+    env["PYTHONPATH"] = str(Path(store.__file__).resolve().parent.parent)
+    env.update(extra)
+    return env
+
+
+class CrossProcessAndRecoveryTests(_StoreFixture):
+
+    def test_a_store_another_process_has_selected_is_not_closed(self):
+        import subprocess
+        import sys
+        self._seed_two_engagements()
+        holder = subprocess.Popen([sys.executable, "-c", _HOLDER, str(self.legacy), _A],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=_child_env(), text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "ready")
+            with self.assertRaises(store.EngagementStoreActive):
+                store.close_engagement(_A)
+            self.assertTrue(store.engagement_store_dir(_A).is_dir())
+            self.assertEqual(self._findings_in(_A, _URL_A), 1)
+            self.assertEqual(self._exports(), [])
+            self.assertEqual(store.interrupted_closes(), [])
+        finally:
+            holder.communicate("", timeout=30)
+        # Negative control: once the holder exits, the same close goes through.
+        self.assertEqual(store.close_engagement(_A)["status"], "closed")
+
+    def test_an_interrupted_close_is_recovered_not_hidden(self):
+        self._seed_two_engagements()
+        directory = store.engagement_store_dir(_A)
+        aside = directory.with_name(f".closing-{directory.name}-deadbeef")
+        os.rename(directory, aside)                       # as if the process died mid-export
+        self.assertEqual(store.interrupted_closes(_A), [aside])
+        self.assertNotIn(_A, [entry["engagement_id"] for entry in store.list_engagement_stores()])
+        with self.assertRaises(ValueError):
+            store.select_engagement_store(_A)            # no fresh store over the set-aside data
+        receipt = store.close_engagement(_A)
+        self.assertEqual(receipt["status"], "closed")
+        self.assertEqual(_rows(Path(receipt["export_dir"]) / "engagement_store" / "harness_state.db",
+                               "SELECT case_id FROM findings"), [("A1",)])
+        self.assertFalse(aside.exists())
+        self.assertEqual(store.interrupted_closes(), [])
+        self.assertEqual(self._findings_in(_B, _URL_B), 1)
+
+    def test_export_inside_the_engagement_stores_is_refused(self):
+        self._seed_two_engagements()
+        for root in (store.engagement_store_dir(_A) / "out", store.engagements_root()):
+            with self.assertRaises(ValueError):
+                store.close_engagement(_A, export_root=root)
+        self.assertEqual(self._findings_in(_A, _URL_A), 1)
+        self.assertEqual(sorted(path.name for path in store.engagement_store_dir(_A).iterdir()),
+                         ["engagement.json", "engagement.lock", "harness_state.db"])
+
+    def test_retention_apply_reports_a_failed_close_and_continues(self):
+        self._seed_two_engagements()
+        for engagement_id in (_A, _B):
+            self._age(engagement_id, 40)
+        real = store.close_engagement
+
+        def flaky(engagement_id, **kwargs):
+            if engagement_id == _A:
+                raise PermissionError("locked")
+            return real(engagement_id, **kwargs)
+
+        with mock.patch.object(store, "close_engagement", flaky):
+            result = store.apply_engagement_retention(30, apply=True)
+        self.assertEqual(result["failed"], [{"engagement_id": _A, "error_type": "PermissionError"}])
+        self.assertEqual([receipt["engagement_id"] for receipt in result["closed"]], [_B])
+        self.assertTrue(store.engagement_store_dir(_A).is_dir())
+
+    def test_a_malformed_environment_id_names_the_variable(self):
+        import subprocess
+        import sys
+        done = subprocess.run([sys.executable, "-c", "import harness.store"], capture_output=True, text=True,
+                              env=_child_env(**{store.ENGAGEMENT_ENV_VAR: "acme "}), timeout=60)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn(store.ENGAGEMENT_ENV_VAR, done.stderr)
+
+    def _age(self, engagement_id: str, days: float) -> None:
+        RetentionTests._age(self, engagement_id, days)
 
 
 class CloseCliTests(_StoreFixture):

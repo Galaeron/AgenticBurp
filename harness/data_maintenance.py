@@ -148,6 +148,7 @@ _CONTEXT_OWNED_TABLES = ("findings", "ledger_events", "scoped_engagement_state",
                          "work_items", "exchange_observations", "observation_attributions")
 _SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 _ENGAGEMENT_MANIFEST = "engagement.json"
+_ENGAGEMENT_LOCK = "engagement.lock"
 _LEGACY_SUBSET = "legacy_store_subset.db"
 _EXPORT_MANIFEST = "export_manifest.json"
 _EXPORT_FORMAT = "sqlite-snapshot-v1"
@@ -358,10 +359,41 @@ def _store_entries(directory: Path) -> list[Path]:
             raise ValueError("Engagement store holds an unexpected entry")
         if entry.name.endswith(".db"):
             databases.append(entry)
-        elif not (entry.name == _ENGAGEMENT_MANIFEST or any(
+        elif not (entry.name in (_ENGAGEMENT_MANIFEST, _ENGAGEMENT_LOCK) or any(
                 entry.name.endswith(suffix) and entry.name[:-len(suffix)] in names for suffix in _SQLITE_SIDECARS)):
             raise ValueError("Engagement store holds an unexpected entry")
     return databases
+
+
+class StoreInUse(RuntimeError):
+    """Another process has the engagement store selected (holds its lock file)."""
+
+
+def _set_store_aside(store_dir: Path, closing: Path):
+    """Rename the store directory aside, refusing while another process has it
+    selected. POSIX: an exclusive flock on the lock file the selecting process
+    holds shared (kept until the caller closes the returned handle). Windows:
+    that process's open handle makes the rename itself fail."""
+    held = None
+    if os.name != "nt" and (store_dir / _ENGAGEMENT_LOCK).is_file():
+        import fcntl
+        held = open(store_dir / _ENGAGEMENT_LOCK, "rb")
+        try:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            held.close()
+            raise StoreInUse() from None
+    try:
+        os.rename(store_dir, closing)
+    except PermissionError:
+        if held is not None:
+            held.close()
+        raise StoreInUse() from None
+    except BaseException:
+        if held is not None:
+            held.close()
+        raise
+    return held
 
 
 def close_engagement_store(engagement_id: str, *, store_dir: Path | None, legacy_db: Path | None,
@@ -385,12 +417,14 @@ def close_engagement_store(engagement_id: str, *, store_dir: Path | None, legacy
     if os.name != "nt":
         export_dir.chmod(0o700)
     closing = None
+    held = None
     exported: dict[str, dict] = {}
     legacy = None
     try:
         if store_dir is not None:
-            closing = store_dir.with_name(f".closing-{store_dir.name}-{secrets.token_hex(4)}")
-            os.rename(store_dir, closing)
+            aside = store_dir.with_name(f".closing-{store_dir.name}-{secrets.token_hex(4)}")
+            held = _set_store_aside(store_dir, aside)
+            closing = aside
             target = export_dir / "engagement_store"
             target.mkdir()
             for database in databases:
@@ -405,8 +439,16 @@ def close_engagement_store(engagement_id: str, *, store_dir: Path | None, legacy
             exported[_LEGACY_SUBSET] = legacy["exported"]
     except BaseException:
         # Nothing was removed: close_context rolled back; move the store back.
+        # If that fails too (the directory was recreated meanwhile), the store
+        # stays aside, where store.close_engagement recovers it; the original
+        # error is the one raised.
+        if held is not None:
+            held.close()
         if closing is not None and closing.exists():
-            os.rename(closing, store_dir)
+            try:
+                os.rename(closing, store_dir)
+            except OSError:
+                pass
         shutil.rmtree(export_dir, ignore_errors=True)
         raise
     files = {name: {key: report[key] for key in ("sha256", "tables", "blob_count") if key in report}
@@ -419,6 +461,8 @@ def close_engagement_store(engagement_id: str, *, store_dir: Path | None, legacy
              "files": files}, sort_keys=True, indent=1).encode("utf-8"))
     except OSError:
         manifest_sha = None
+    if held is not None:
+        held.close()
     remaining = []
     if closing is not None:
         for entry in sorted(closing.iterdir()):
@@ -492,7 +536,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command in ("engagements", "close-engagement", "retention"):
             from harness import store
             if args.command == "engagements":
-                result = {"active": store.active_engagement(), "stores": store.list_engagement_stores()}
+                result = {"active": store.active_engagement(), "stores": store.list_engagement_stores(),
+                          "interrupted_closes": [str(path) for path in store.interrupted_closes()]}
             elif args.command == "close-engagement":
                 if args.confirm != args.engagement_id:
                     raise ValueError("--confirm must repeat the engagement ID")
