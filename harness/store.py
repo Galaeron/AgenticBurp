@@ -383,10 +383,21 @@ CREATE TABLE IF NOT EXISTS ledger_events (
     provenance_json TEXT NOT NULL DEFAULT '{}',
     engagement_id TEXT NOT NULL DEFAULT '',
     captured_principal_id TEXT NOT NULL DEFAULT '',
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    seq INTEGER NOT NULL DEFAULT 0,
+    prev_hash TEXT NOT NULL DEFAULT '',
+    row_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_finding_ref ON ledger_events(finding_ref);
 """
+# ARC-13: tamper evidence. Each row carries `seq` (a store-wide, strictly increasing
+# append number), `prev_hash` (the `row_hash` of the previous chained row of the SAME
+# finding_ref; '' for the first) and `row_hash` (sha256 over its own canonical content
+# and prev_hash -- see evidence_ledger.ledger_row_hash). The chain is per finding_ref,
+# not store-wide, because the wipe paths delete a finding_ref's events as a whole: a
+# store-wide chain would break at every legitimate wipe. Rows written before this
+# change have row_hash = '' and stay readable as "unchained legacy" rows. The columns
+# and their indexes are added by _initialise_connection, after the table exists.
 
 # FR-2 (F03): content-addressed, ALREADY-REDACTED request/response evidence blobs.
 # This is a NEW persistence sink for exchange bodies/headers (today only a URL and
@@ -696,6 +707,17 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError as exc:
             if "duplicate column name" not in str(exc):
                 raise
+    for chain_col, chain_ddl in (("seq", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("prev_hash", "TEXT NOT NULL DEFAULT ''"),
+                                 ("row_hash", "TEXT NOT NULL DEFAULT ''")):
+        if chain_col not in ledger_cols:
+            try:
+                conn.execute(f"ALTER TABLE ledger_events ADD COLUMN {chain_col} {chain_ddl}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_chain ON ledger_events(finding_ref, seq)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_seq ON ledger_events(seq)")
     # Lightweight migration for databases created by earlier builds.
     plan_cols = {row[1] for row in conn.execute("PRAGMA table_info(test_plans)")}
     for col, ddl in [
@@ -3044,19 +3066,85 @@ def persist_ledger_event(event: dict) -> None:
     caller that persists the same event twice (e.g. a retried emit) is a
     no-op, never an overwrite. Best-effort by design -- callers (evidence_
     ledger.emit) already swallow any exception this raises, so a storage
-    hiccup here can never surface as a pipeline failure."""
+    hiccup here can never surface as a pipeline failure.
+
+    ARC-13: the row is hash-chained (see _LEDGER_SCHEMA). Reading the finding's
+    chain head, taking the next `seq` and inserting happen inside ONE `BEGIN
+    IMMEDIATE` transaction: SQLite grants the write lock to one connection at a
+    time, across threads and processes, so two appends can never read the same
+    head and fork the chain."""
+    from harness.evidence_ledger import ledger_row_hash
+    fields = {
+        "event_id": event.get("event_id", ""), "event_type": event.get("event_type", ""),
+        "finding_ref": event.get("finding_ref", ""), "case_ref": event.get("case_ref", ""),
+        "summary": event.get("summary", ""),
+        "data_json": json.dumps(event.get("data", {}) or {}),
+        "provenance_json": json.dumps(event.get("provenance", {}) or {}),
+        "engagement_id": _CURRENT_ENGAGEMENT.get(),
+        "captured_principal_id": _CURRENT_CAPTURED_PRINCIPAL.get(),
+        # float() first: the column is REAL, so the hash must cover the value read back.
+        "created_at": float(event.get("created_at", time.time())),
+    }
     conn = _connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM ledger_events WHERE event_id = ?",
+                        (fields["event_id"],)).fetchone():
+            conn.rollback()          # a re-persisted event is a no-op, never an overwrite
+            return
+        head = conn.execute(
+            "SELECT row_hash FROM ledger_events WHERE finding_ref = ? AND row_hash != '' "
+            "ORDER BY seq DESC LIMIT 1", (fields["finding_ref"],)).fetchone()
+        prev_hash = head[0] if head else ""
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM ledger_events").fetchone()[0]
+        row_hash = ledger_row_hash(prev_hash=prev_hash, seq=seq, **fields)
         conn.execute(
-            "INSERT OR IGNORE INTO ledger_events "
+            "INSERT INTO ledger_events "
             "(event_id, event_type, finding_ref, case_ref, summary, data_json, "
-            "provenance_json, engagement_id, captured_principal_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (event.get("event_id", ""), event.get("event_type", ""),
-             event.get("finding_ref", ""), event.get("case_ref", ""),
-             event.get("summary", ""), json.dumps(event.get("data", {}) or {}),
-             json.dumps(event.get("provenance", {}) or {}), _CURRENT_ENGAGEMENT.get(),
-             _CURRENT_CAPTURED_PRINCIPAL.get(), event.get("created_at", time.time())))
+            "provenance_json, engagement_id, captured_principal_id, created_at, "
+            "seq, prev_hash, row_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (fields["event_id"], fields["event_type"], fields["finding_ref"], fields["case_ref"],
+             fields["summary"], fields["data_json"], fields["provenance_json"],
+             fields["engagement_id"], fields["captured_principal_id"], fields["created_at"],
+             seq, prev_hash, row_hash))
         conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+_LEDGER_CHAIN_COLUMNS = ("event_id", "event_type", "finding_ref", "case_ref", "summary", "data_json",
+                         "provenance_json", "engagement_id", "captured_principal_id", "created_at",
+                         "seq", "prev_hash", "row_hash")
+
+
+def _open_read_only(db_path) -> sqlite3.Connection:
+    """A read-only connection that never creates, migrates or locks the file --
+    what a verifier run against a delivered copy of the store needs."""
+    path = Path(db_path if db_path is not None else _DB_PATH)
+    if not path.is_file():
+        raise FileNotFoundError(f"no store at {path}")
+    return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=10.0)
+
+
+def iter_ledger_chain_rows(db_path=None):
+    """Every ledger_events row as a dict of _LEDGER_CHAIN_COLUMNS, in append order
+    (`seq`, then insertion order), for harness.evidence_ledger.verify_ledger_rows.
+
+    Reads the file at `db_path` (default: the live store) read-only and tolerates a
+    store written before ARC-13: columns that do not exist yet read as the legacy
+    defaults, so every such row verifies as "unchained legacy"."""
+    conn = _open_read_only(db_path)
+    try:
+        present = {row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
+        if not present:
+            return
+        select = ", ".join(c if c in present else f"{'0' if c == 'seq' else repr('')} AS {c}"
+                           for c in _LEDGER_CHAIN_COLUMNS)
+        for row in conn.execute(f"SELECT {select} FROM ledger_events ORDER BY seq, rowid"):
+            yield dict(zip(_LEDGER_CHAIN_COLUMNS, row))
     finally:
         conn.close()
 
@@ -3424,15 +3512,68 @@ def engagement_budget_reserved(engagement_id: str) -> float:
 # no redaction logic of its own and persists exactly what it is given.
 # ---------------------------------------------------------------------------
 
-def put_evidence_blob(data: bytes) -> str:
+# ARC-13: the redaction assertion. Callers redact, but nothing checked it. Every blob
+# is now re-run through the project's own redactors (harness.evidence_redaction); a
+# correctly redacted blob changes nothing. What happens when one would change is
+# EVIDENCE_BLOB_UNREDACTED_POLICY:
+#   "flag"   -- store the blob as before, count it and log a warning (no values).
+#               The DEFAULT: it changes no live behaviour. `verify_evidence_ledger
+#               --check-blobs` lists the flagged blobs from the stored data.
+#   "refuse" -- raise UnredactedEvidenceError and store nothing. The callers already
+#               catch a failed write and mark the evidence degraded.
+# "refuse" is the safer end state but is an owner decision: it could degrade evidence
+# if a caller's redaction is weaker than this check, which only a live run can show.
+# A call can override the policy with `unredacted=`.
+EVIDENCE_BLOB_UNREDACTED_POLICY = "flag"
+_UNREDACTED_BLOB_FLAGS = 0
+
+
+class UnredactedEvidenceError(ValueError):
+    """put_evidence_blob refused a blob the redactors would still change."""
+
+
+def evidence_blob_redaction_status() -> dict:
+    """Process-lifetime count of blobs stored under the "flag" policy that the
+    redactors would still have changed, plus the policy in force."""
+    with _STATS_LOCK:
+        flags = _UNREDACTED_BLOB_FLAGS
+    return {"policy": EVIDENCE_BLOB_UNREDACTED_POLICY, "unredacted_flags": flags,
+            "lifetime": "process"}
+
+
+def put_evidence_blob(data: bytes, *, unredacted: str | None = None) -> str:
     """Store `data` keyed by its own sha256 hex digest; returns that digest.
 
     Idempotent: INSERT OR IGNORE means storing the same bytes twice is a
     no-op, never a duplicate row or an overwrite -- the table is content-
     addressed, so the same hash always means the same bytes.
+
+    `data` must already be redacted (see the comment above): a blob the
+    redactors would still change is handled per `unredacted` ("flag" or
+    "refuse"; default EVIDENCE_BLOB_UNREDACTED_POLICY).
     """
+    global _UNREDACTED_BLOB_FLAGS
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError(f"evidence blob data must be bytes, got {type(data).__name__}")
+    policy = unredacted or EVIDENCE_BLOB_UNREDACTED_POLICY
+    if policy not in ("flag", "refuse"):
+        raise ValueError(f"unredacted must be 'flag' or 'refuse', got {policy!r}")
+    from harness.evidence_redaction import redaction_findings
+    try:
+        findings = redaction_findings(data)
+    except Exception:       # e.g. RecursionError on a hostile body: unverifiable, not unstorable
+        findings = [("check-failed", "")]
+    if findings:
+        kinds = ", ".join(sorted({kind for kind, _ in findings}))
+        if policy == "refuse":
+            raise UnredactedEvidenceError(
+                f"evidence blob not stored: {len(findings)} unredacted field(s) ({kinds})")
+        with _STATS_LOCK:
+            _UNREDACTED_BLOB_FLAGS += 1
+        import logging
+        logging.getLogger("harness.store").warning(
+            "evidence blob stored with %d unredacted field(s) (%s); the caller must redact "
+            "before put_evidence_blob", len(findings), kinds)
     digest = hashlib.sha256(data).hexdigest()
     conn = _connect()
     try:
@@ -3443,6 +3584,18 @@ def put_evidence_blob(data: bytes) -> str:
     finally:
         conn.close()
     return digest
+
+
+def iter_evidence_blobs(db_path=None):
+    """`(sha256, bytes)` for every stored blob, read-only, for the ledger verifier."""
+    conn = _open_read_only(db_path)
+    try:
+        for digest, data in conn.execute("SELECT sha256, data FROM evidence_blobs ORDER BY sha256"):
+            yield digest, bytes(data)
+    except sqlite3.OperationalError:     # a store with no blob table yet has nothing to check
+        return
+    finally:
+        conn.close()
 
 
 def get_evidence_blob(h: str, *, conn: "sqlite3.Connection | None" = None) -> bytes | None:

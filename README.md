@@ -75,7 +75,7 @@ This is the core path. When the Burp extension sends an HTTP exchange to `POST /
 
 ### Evidence ledger
 
-Every step emits events to an append-only ledger (`evidence_ledger.py`). Events carry a `Provenance` envelope (code version, config fingerprint, model tag). The ledger is wired into agents (HYPOTHESIS events), validators (EXECUTION events), the confirmation gate (FINDING_REVISION events), and the orchestrator (RUN_SUMMARY). Persisted to SQLite and exposed via `GET /findings/{finding_ref}/evidence`.
+Every step emits events to an append-only ledger (`evidence_ledger.py`). Events carry a `Provenance` envelope (code version, config fingerprint, model tag). The ledger is wired into agents (HYPOTHESIS events), validators (EXECUTION events), the confirmation gate (FINDING_REVISION events), and the orchestrator (RUN_SUMMARY). Persisted to SQLite and exposed via `GET /findings/{finding_ref}/evidence`. Persisted rows are hash-chained per finding; `python tools/verify_evidence_ledger.py` reports an edited, deleted, inserted or reordered row (see the script header for what the chain cannot show).
 
 ## Components
 
