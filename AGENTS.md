@@ -65,6 +65,8 @@ No offline tier establishes current model accuracy or blind-target recall.
 Most usage is long contexts (>150k), so keep sessions short:
 - One batch per session: start from `.test-work/<batch>/BATCH.md` and end with its
   `HANDOFF.md`. Start the next batch in a fresh session, never by continuing this one.
+- Session handoff file: [NOTES.md](NOTES.md). At session end overwrite it (40 lines at most: the exact
+  next step, the files, the verification, links to the batch `HANDOFF.md`); do not append history.
 - Near ~150k context mid-batch, write HANDOFF.md with the exact next step and stop.
 - Never read full suite logs (they run to MB). Have the run script write exit codes/counts to a
   summary file; read that, and grep only failures.

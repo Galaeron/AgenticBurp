@@ -3,11 +3,13 @@
 A Burp Suite copilot that uses locally-hosted LLMs to analyze captured HTTP traffic for security vulnerabilities, then confirms or refutes those findings with deterministic validators.
 
 > **Status: working research prototype, effectiveness unproven.** The software
-> runs and ~2,400 Python / ~230 Java tests pass, but nothing in the repo
-> measures how well it finds real bugs on an unfamiliar app, and its tuning
+> runs and its Python and Java test suites are run in CI (`docs/TESTING.md`), but
+> nothing in the repo measures how well it finds real bugs on an unfamiliar app, and its tuning
 > corpora ship with answer keys. Read **[docs/LIMITATIONS.md](docs/LIMITATIONS.md)**
 > before trusting any result, and **[docs/USER_MANUAL.md](docs/USER_MANUAL.md)**
 > to run it safely.
+> Report a vulnerability privately as described in **[SECURITY.md](SECURITY.md)**;
+> changes are in **[CHANGELOG.md](CHANGELOG.md)**.
 >
 > **Out of the box it is passive and deliberately quiet:** active testing,
 > autonomous discovery and the cloud seams are OFF and no scope is set, so it
@@ -26,7 +28,7 @@ A Burp Suite copilot that uses locally-hosted LLMs to analyze captured HTTP traf
 |                   |                 |                   |             +-------------+
 |  2 suite tabs:    |                 |  Orchestrator     |
 |  - LLM Harness    |                 |    |              |
-|  - Harness Tools  |                 |    +-> Agents (36)|
+|  - Harness Tools  |                 |    +-> Agents     |
 |  + context menu   |                 |    +-> Validators |
 +-------------------+                 |    +-> Ledger     |
                                       +-------------------+
@@ -40,7 +42,7 @@ This is the core path. When the Burp extension sends an HTTP exchange to `POST /
 2. **Scope check** -- reject if the host is outside `server.allowed_hosts` (when configured).
 3. **Budget check** -- reject if the effort budget is exhausted.
 4. **Agent selection** -- `fast_path.py` tries deterministic pattern matching first (URL regexes, header patterns, response signatures, body anomalies). If no strong signal, falls back to the **coordinator LLM** which picks agents from the available set. On coordinator failure, fails open to all agents (or a curated core subset, depending on `coordinator.fail_open_mode`).
-5. **Agent dispatch** -- `AgentManager.run_multiple_agents()` runs selected agents in parallel, bounded by an asyncio semaphore (`concurrency.max_parallel_agents`). Each agent sends a vulnerability-class-specific prompt + the exchange to Ollama and returns structured findings. Optionally, agents can be grouped into 6 families for fewer model calls (`coordinator.routing_mode: "families"`, ships OFF).
+5. **Agent dispatch** -- `AgentManager.run_multiple_agents()` runs selected agents in parallel, bounded by an asyncio semaphore (`concurrency.max_parallel_agents`). Each agent sends a vulnerability-class-specific prompt + the exchange to Ollama and returns structured findings. Optionally, agents can be grouped into families for fewer model calls (`coordinator.routing_mode: "families"`, ships OFF).
 6. **Access control gate** -- caps IDOR/authz findings that are refuted by 401/403/405 status codes.
 7. **Header noise gate** -- caps CORS/CSP/clickjacking findings to "low" severity.
 8. **Critique** -- adversarial LLM review of surviving findings. Each is verdicted "survived", "downgraded", or "rejected". Rejected findings are removed.
@@ -79,7 +81,7 @@ Every step emits events to an append-only ledger (`evidence_ledger.py`). Events 
 
 ### Harness Server (`harness/server.py`)
 
-FastAPI on `127.0.0.1:8787`. At startup: loads and validates config, constructs a single `Orchestrator`, generates an ephemeral bearer token (or uses configured one), installs trusted-host and CSRF middleware. ~50 endpoints including:
+FastAPI on `127.0.0.1:8787`. At startup: loads and validates config, constructs a single `Orchestrator`, generates an ephemeral bearer token (or uses configured one), installs trusted-host and CSRF middleware. Its routes are listed in `harness/server.py` (the `@app.get/post/put/delete` decorators); the main ones:
 
 | Endpoint | Purpose |
 |---|---|
@@ -95,11 +97,28 @@ FastAPI on `127.0.0.1:8787`. At startup: loads and validates config, constructs 
 | `GET /settings` / `POST /settings` | Runtime toggles: active validation, cross-identity, throttle, cloud reasoning |
 | `POST /scan/confidential` | Deterministic regex secrets/PII scan (no model) |
 | `GET /findings/{ref}/evidence` | Evidence ledger reconstruction + reproduction recipe |
-| `POST /validation-results` | Accept Burp-side validation submissions |
+| `POST /test-plans/{id}/dispatch` | Issue the single-use nonce and the live policy for one Burp-plane run (below) |
+| `POST /validation-results` | Accept a Burp-side validation submission, once, under that nonce (below) |
+
+**Burp-plane dispatch.** The Burp extension runs a test plan with its own HTTP stack, so the harness
+decides what it may send. `POST /test-plans/{id}/dispatch` (token required) returns
+`{plan_id, dispatch_nonce, policy: {active_enabled, allow_mutating_replay}, request_budget}`: the live
+values of the two flags and the run request ceiling (`runs.max_requests`). The plane sends mutating
+requests only when both flags are on, and stops at the budget. `POST /validation-results` accepts a
+result only under the plan's current, unconsumed nonce, for a plan that holds no verdict. A refusal
+consumes nothing and answers `{"detail": {"reason": <code>, "message": ...}}`:
+
+| Status | Reason codes |
+|---|---|
+| 404 | `unknown_plan` |
+| 409 | `not_dispatched`, `dispatch_nonce_mismatch`, `duplicate_submission`, `plan_terminal` |
+| 422 | `dispatch_nonce_required`, `wrong_execution_plane`, `binding_mismatch`, `executor_mismatch`, `capability_cannot_confirm`, `confirmed_status_invalid` |
+
+The harness and the Burp jar must be upgraded together: an older harness fails the dispatch with a version hint.
 
 ### Orchestrator (`harness/orchestrator.py`)
 
-Assembled from four mixins. `__init__` constructs: `OllamaClient`, coordinator + critique LLM providers (local Ollama or optional remote), `Coordinator`, `AgentManager`, `AnalysisPipeline`, `FastPathSelector`, `ValidatorRegistry`, `EffortBudget`, GitHub Advisory + KEV + package registry clients, engagement policy, global throttle.
+Assembled from the mixins below. `__init__` constructs: `OllamaClient`, coordinator + critique LLM providers (local Ollama or optional remote), `Coordinator`, `AgentManager`, `AnalysisPipeline`, `FastPathSelector`, `ValidatorRegistry`, `EffortBudget`, GitHub Advisory + KEV + package registry clients, engagement policy, global throttle.
 
 | Mixin | Module | Key methods |
 |---|---|---|
@@ -110,9 +129,9 @@ Assembled from four mixins. `__init__` constructs: `OllamaClient`, coordinator +
 
 ### Agents (`harness/agents/`)
 
-36 specialist agents, each a `BaseAgent` subclass with a `name` attribute, discovered at runtime by `AgentPluginSystem` (file scan of the `agents/` directory). `BaseAgent` handles: prompt construction with exchange body truncation (preserves high-signal content like stack traces beyond the truncation point via regex), quarantine fencing (random-nonce boundaries to contain prompt injection from target responses), and structured finding extraction.
+The specialist agents are `BaseAgent` subclasses, each with a `name` attribute, discovered at runtime by `AgentPluginSystem` (file scan of the `agents/` directory). `BaseAgent` handles: prompt construction with exchange body truncation (preserves high-signal content like stack traces beyond the truncation point via regex), quarantine fencing (random-nonce boundaries to contain prompt injection from target responses), and structured finding extraction.
 
-The default routing mode dispatches each agent as an individual model call. An opt-in family routing mode (`coordinator.routing_mode: "families"`) groups all 36 into 6 families and issues one composed call per family:
+The default routing mode dispatches each agent as an individual model call. An opt-in family routing mode (`coordinator.routing_mode: "families"`) groups them into the families below and issues one composed call per family:
 
 | Family | Members |
 |---|---|
@@ -127,7 +146,7 @@ Family routing ships OFF. Any agent not in a family falls back to a solo call.
 
 ### Validators (`harness/validators/registry.py`)
 
-35 validators registered in `ValidatorRegistry.__init__()`, each togglable. Matched to findings via `for_finding()` based on vulnerability class. Categories:
+The validators are registered in `ValidatorRegistry.__init__()`, each togglable. Matched to findings via `for_finding()` based on vulnerability class. Categories:
 
 **Passive (no network):** `deserialization` (format fingerprinting), `verbose_error` (stack trace/debug detection).
 
@@ -157,7 +176,7 @@ Java plugin using Burp's Montoya API. Connects to `http://localhost:8787`. Regis
 - **"Harness Tools" tab** -- `HarnessToolsPanel` with model selection, discovery controls, active testing toggles, budget/effort display, tool catalog, confidential scan, activity feed.
 - **Context menu** -- `HarnessContextMenu` for right-click "Send to LLM Harness" from Proxy/Repeater/Target.
 - **`ValidationExecutor`** -- executes test plans returned by the server using Burp's HTTP stack.
-- **`logic/` package** -- 32 client-side modules: most are per-vulnerability-class deterministic checks (SQLi, XSS, SSRF, XXE, JWT forgery, CSRF, mass assignment, etc.), plus shared identity/URL/pool-comparison helpers (`IdentityCompareLogic`, `UrlIdentifierDiff`, `PoolCandidateResolver`, `WorkflowReplayLogic`) they build on.
+- **`logic/` package** -- the client-side modules: most are per-vulnerability-class deterministic checks (SQLi, XSS, SSRF, XXE, JWT forgery, CSRF, mass assignment, etc.), plus shared identity/URL/pool-comparison helpers (`IdentityCompareLogic`, `UrlIdentifierDiff`, `PoolCandidateResolver`, `WorkflowReplayLogic`) they build on.
 
 ### Configuration
 
@@ -178,31 +197,101 @@ An operator's explicit `config.local.yaml` value wins over a profile preset (exc
 
 ## Prerequisites
 
-- **Python 3.12+** with dependencies (FastAPI, httpx, PyYAML, pydantic)
-- **Ollama** running locally with a pulled model (e.g. `ollama pull qwen3:8b`)
-- **Docker** (optional) -- sqlmap validator runs in a container
-- **JDK + Gradle** (optional) -- to build the Burp extension JAR
-- **Burp Suite** (Community or Pro) -- for the extension UI
+- **Python 3.11 or newer** (`requires-python` in `pyproject.toml`). CI and the
+  lock file use **Python 3.14**, so use 3.14 if you can; see
+  [USER_MANUAL.md](docs/USER_MANUAL.md) §8 for the 3.12 proxy-extra caveat.
+- **A model backend** -- Ollama with a pulled model (e.g. `ollama pull qwen3:8b`),
+  or an OpenAI-compatible server such as llama.cpp's `llama-server`.
+- **Docker** (optional) -- the sqlmap validator runs in a container.
+- **JDK 17** (optional) -- only to build the Burp extension; the repository ships
+  the Gradle wrapper.
+- **Burp Suite** (Community or Pro) -- for the extension UI.
 
 ## Quick Start
 
+The first-run steps, in order. [docs/USER_MANUAL.md](docs/USER_MANUAL.md) §1 has the
+same list with the reasoning. Not yet walked through on a clean machine by someone
+new to the tool (**unverified**: the 30-minute target is an owner/live step).
+
+**1. Python.** Python 3.11 or newer; Python 3.14 is what CI tests.
+
+**2. Install from the lock** (from the repo root; the lock is the dependency set CI tests):
+
 ```bash
-# 0. Install the tested dependency set (from the repo root, Python 3.14 recommended)
 pip install -r harness/requirements.lock
 pip install -e . --no-deps
 python -m harness.lock_preflight   # warns if installed versions differ from the lock
-
-# 1. Start Ollama
-ollama serve
-
-# 2. Start the harness server (127.0.0.1:8787)
-python -m harness.server
-
-# 3. (Optional) Build and load the Burp extension
-cd burp-extension
-./gradlew shadowJar     # Windows: gradlew.bat shadowJar; JDK 17-21 on JAVA_HOME
-# Load build/libs/*-all.jar in Burp Suite > Extensions
 ```
+
+**3. Model and context settings.** Start the backend (`ollama serve`, then
+`ollama pull qwen3:8b`) and put your overrides in the git-ignored
+`harness/config.local.yaml`:
+
+```yaml
+ollama:
+  num_ctx: 16384            # context window to ask Ollama for (llama-server: its per-slot window)
+  # allow_cloud_models: true   # leave unset unless the engagement permits sending content to Ollama's cloud
+```
+
+- `num_ctx`: Ollama loads a model at its own small default window and truncates a
+  longer prompt; the harness discards such a reply and marks the run `degraded`, so
+  set the window up front. 16384 holds the largest prompt measured.
+- Prompt fitting: the harness asks the model server for the window it actually
+  has, uses the smaller of that and `num_ctx`, and cuts prompts to fit, listing the
+  cuts in the job result's `review_stats.elided`. When it cannot find a window it
+  fits to `prompt_budget.unknown_context_tokens` (4096); it never sends unfitted. A call
+  that still overflows is discarded and the run is marked `degraded`.
+- `ollama.allow_cloud_models` is `false`: a model named `*-cloud` or `*:cloud`
+  runs on Ollama's cloud and sends exchange content off this machine, so a run
+  that would use one is refused before its first model call (HTTP 409).
+- `ollama.rate_limit` paces model calls (shipped: `enabled: true`, `burst_calls: 10`,
+  `calls_per_minute: 10`, `max_wait_seconds: 300`). Raising or disabling it
+  loosens a safeguard, so do that in `config.local.yaml` only. The run manifest
+  records the values under `model_rate_limit`.
+
+**4. Build the Burp extension** (optional; JDK 17 installed, JDK 17-21 on `JAVA_HOME`):
+
+```bash
+cd burp-extension
+./gradlew shadowJar     # Windows: gradlew.bat shadowJar -> build/libs/*-all.jar
+```
+
+The wrapper pins Gradle 8.7 by checksum and the build compiles and tests with a
+Java 17 toolchain. Load the `*-all.jar` in Burp Suite > Extensions.
+
+**5. Start the server and pair.**
+
+```bash
+python -m harness.server     # 127.0.0.1:8787
+```
+
+Every state-changing route needs a token, even from loopback. It is your
+`server.auth_token` / `HARNESS_BEARER_TOKEN` if set, else the ephemeral token the
+server writes to `harness/.harness_token.lock` at each start. Paste it into the
+**Pairing token** field of Burp's LLM Harness tab (or export `HARNESS_BEARER_TOKEN`
+before starting Burp). Check it with `GET /pairing/check`, then read readiness at
+`GET /health/details` (`/health` is liveness only).
+
+**6. A first `/analyze`.** Save one captured exchange as `exchange.json`:
+
+```json
+{"exchange": {"url": "http://127.0.0.1:8080/rest/user/login", "method": "POST",
+              "request_headers": {"Content-Type": "application/json"},
+              "request_body": "{\"email\":\"a@b.test\",\"password\":\"x\"}",
+              "response_status": 401, "response_headers": {"Content-Type": "application/json"},
+              "response_body": "{\"error\":\"Invalid email or password.\"}"}}
+```
+
+```bash
+# $HARNESS_TOKEN is the pairing token from step 5; in PowerShell use curl.exe
+curl -s -X POST http://127.0.0.1:8787/analyze \
+  -H "Authorization: Bearer $HARNESS_TOKEN" -H "Content-Type: application/json" \
+  --data @exchange.json
+```
+
+The answer lists `dispatched_agents`, `agent_reports` and a `summary`. If
+`degraded` is true or `agent_errors` is non-empty, the model did not answer: fix
+that first. The committed defaults are passive, so a first result may be nearly empty.
 
 ## Testing
 
@@ -216,8 +305,8 @@ python -m harness.suite full    # unittest + pytest + evaluation integrity
 ```
 AgenticVibe/
 +-- harness/                 # Python backend (FastAPI)
-|   +-- agents/              # 36 specialist agents (plugin-discovered)
-|   +-- validators/          # 35 deterministic validators
+|   +-- agents/              # specialist agents (plugin-discovered)
+|   +-- validators/          # deterministic validators
 |   +-- server.py            # API entry point (:8787)
 |   +-- orchestrator.py      # Mixin assembly
 |   +-- agent_families.py    # Opt-in family routing (ships OFF)

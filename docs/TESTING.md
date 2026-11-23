@@ -87,6 +87,20 @@ helper tests before declaring an integration requirement met. The separate
 `evaluation_integrity/` contract suite does not itself prove every score/export
 path enforces that contract.
 
+## Import isolation (`sitecustomize.py`)
+
+The tracked `sitecustomize.py` at the repository root is a test-environment hook, not part of the
+product: `pyproject.toml` packages only `harness*`, so an installed harness has none. Python
+imports it at startup when the root is on `PYTHONPATH`, which `python -m harness.suite` arranges
+for every child process it starts and `PYTHONPATH=<worktree>` does by hand. It removes the
+editable-install finders, so a module missing from the checkout under test raises `ImportError`
+instead of loading from another checkout that a venv's `pip install -e .` points at. Tests run
+through it therefore see a stricter import environment than an installed package, or than
+`python -m harness.server` in a shell without `PYTHONPATH`; a passing run does not show that the
+installed package imports. `harness/test_sitecustomize_header.py` pins the header and the
+behaviour. A verification snapshot (`docs/VERIFICATION_SNAPSHOTS.md`) generates its own, stricter
+`sitecustomize.py`; that is a different file.
+
 ## CI and live evidence
 
 Read from `.github/workflows/ci.yml`. Smoke is a local fast subset; CI does not run it.
@@ -135,6 +149,13 @@ from a helper unit test or compare different corpora as a model-only effect.
   async egress and requires every bound test to fail. A test with an optional
   prerequisite (Playwright, curl) cannot honestly be bound unless CI provides it:
   a skip leaves the declared aspect unproven and fails the evidence gate.
+- Harness safety properties (`HS-*`: the rebinding pin, caller `Host`, environment proxies,
+  redirect re-checks, cleanup after a mutating leg) are a separate section of the same
+  ledger, `coverage_manifest.SAFETY_PROPERTIES`, bound the same way (`_SAFETY_EVIDENCE`) to
+  the real-socket tests in `harness/test_live_safety_loopback.py`. They are not WSTG rows
+  and not in the requirement totals; `coverage_manifest --check` blocks on them like on any
+  declared automated aspect, so a failing `HS-*` test fails the smoke and full tiers.
+  `LIMITATIONS.md` says what the ledger does and does not claim.
 - A failing old assertion is not automatically obsolete. Check the intended
   contract and caller before updating it. Do not hide known defects by deletion,
   broad skips, weakened assertions or a lower expected count.
