@@ -35,8 +35,9 @@
   (`tools/backlog_index.py`). What is redacted before a model call: USER_MANUAL section 5.
 
 ## Verification (system Python 3.14.7; CI runs 3.14)
-- This branch (e1), 2026-11-23: smoke and `harness.test_orchestrator_precondition` and the new
-  doc checks: see the e1 HANDOFF for counts. The full suite was not run locally (CI runs it once on the PR).
+- This branch (e1), 2026-11-23: smoke exit 0 (241 tests, coverage gate passed); precondition 74 OK;
+  the 8 new doc checks and 10 neighbouring modules OK (one process each); evaluation_integrity 60 OK.
+  The full suite was not run locally (CI runs it once on the PR).
 - Integration tip `6fe5538c`: a gate run (smoke, precondition, per-module sweep, pytest-native, Java)
   was in progress when this was written; its result is not recorded here. Per-batch gates are in the
   HANDOFFs and are reported, not re-run: smoke 182 to 241, precondition 74; Java 417 tests, 0 failures
