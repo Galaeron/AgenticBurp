@@ -19,6 +19,8 @@ SMOKE_MODULES = (
     # (coverage_manifest._CALLER_EVIDENCE names a test class in each of these modules).
     'harness.test_leg_live_verification',
     'harness.test_auth_logout_invalidation', 'harness.test_file_upload_busl08',
+    # GAP-4: the harness safety properties (coverage_manifest._SAFETY_EVIDENCE).
+    'harness.test_live_safety_loopback',
 )
 PYTEST_NATIVE = (
     'harness/test_plugin_system.py', 'harness/test_execution_protocol.py',

@@ -298,9 +298,74 @@ class ModelExtensionTests(unittest.TestCase):
         self.assertNotEqual(CHECKS_BY_ID["WSTG-CONF-09"].vulnerability_class, "api_security")
 
 
+class SafetyPropertyLedgerTests(unittest.TestCase):
+    """GAP-4: the harness safety properties have their own section of the ledger."""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="cov_safety_"))
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+
+    def _pass_all(self, specs):
+        for s in specs:
+            _write(self._tmp, s.check_id, s.aspect, TestStatus.PASS, test_id=s.test_id)
+
+    def test_every_property_has_an_automated_spec_and_is_not_a_catalog_row(self):
+        declared = {s.check_id for s in cm.SAFETY_TESTS if s.mode == "automated"}
+        self.assertEqual(declared, set(cm.SAFETY_PROPERTIES_BY_ID))
+        for pid in cm.SAFETY_PROPERTIES_BY_ID:
+            self.assertTrue(pid.startswith("HS-"), pid)
+            self.assertNotIn(pid, CHECKS_BY_ID)
+        self.assertFalse({s.check_id for s in cm.REQUIREMENT_TESTS} & set(cm.SAFETY_PROPERTIES_BY_ID))
+
+    def test_properties_report_separately_and_leave_requirement_totals_alone(self):
+        empty = reconcile(evidence_dir=self._tmp, run_id=RUN)
+        self._pass_all(cm.SAFETY_TESTS)
+        rep = reconcile(evidence_dir=self._tmp, run_id=RUN)
+        self.assertEqual(rep["totals"]["requirements"], empty["totals"]["requirements"])
+        self.assertEqual(rep["totals"]["requirement_status_counts"],
+                         empty["totals"]["requirement_status_counts"])
+        self.assertFalse({r["check_id"] for r in rep["requirements"]} & set(cm.SAFETY_PROPERTIES_BY_ID))
+        props = {p["check_id"]: p for p in rep["safety_properties"]}
+        self.assertEqual(set(props), set(cm.SAFETY_PROPERTIES_BY_ID))
+        for p in props.values():
+            self.assertEqual(p["requirement_status"], RequirementStatus.COVERED_PARTIAL.value)
+            self.assertFalse(p["is_wstg"])
+        self.assertEqual(rep["totals"]["safety_property_status_counts"],
+                         {RequirementStatus.COVERED_PARTIAL.value: len(cm.SAFETY_PROPERTIES)})
+        self.assertIn("Harness safety properties", render_markdown(rep))
+
+    def test_gate_blocks_on_a_missing_or_failing_safety_aspect(self):
+        first, *rest = cm.SAFETY_TESTS
+        self._pass_all(rest)
+        ok, problems = declared_coverage_ok(reconcile(evidence_dir=self._tmp, run_id=RUN))
+        self.assertFalse(ok)
+        self.assertTrue(any(first.check_id in p and "not_implemented" in p for p in problems), problems)
+        _write(self._tmp, first.check_id, first.aspect, TestStatus.FAIL, test_id=first.test_id)
+        ok, problems = declared_coverage_ok(reconcile(evidence_dir=self._tmp, run_id=RUN))
+        self.assertFalse(ok)
+        self.assertTrue(any(first.check_id in p and "'fail'" in p for p in problems), problems)
+        md = render_markdown(reconcile(evidence_dir=self._tmp, run_id=RUN))
+        self.assertIn(f"**{first.check_id}** [harness_safety] fail: {first.aspect}", md)
+
+    def test_safety_ids_are_written_as_is_and_unknown_ids_still_refused(self):
+        path = _write(self._tmp, "HS-PIN-01", "an aspect", TestStatus.PASS)
+        self.assertTrue(path.name.startswith("HS-PIN-01__"))
+        self.assertIn(("HS-PIN-01", "an aspect"), load_evidence(self._tmp, run_id=RUN))
+        with self.assertRaises(ValueError):
+            _write(self._tmp, "HS-NOPE-99", "x", TestStatus.PASS)
+        with self.assertRaises(ValueError):
+            TestSpec("HS-NOPE-99", "m.T.test_x", "x")
+
+    def test_custom_specs_reconcile_without_the_declared_safety_specs(self):
+        rep = reconcile((), evidence_dir=self._tmp, run_id=RUN)
+        self.assertTrue(all(p["requirement_status"] == RequirementStatus.GAP_UNIMPLEMENTED.value
+                            for p in rep["safety_properties"]))
+        self.assertTrue(declared_coverage_ok(rep)[0])
+
+
 class DeclaredIdentityTests(unittest.TestCase):
     def test_declared_automated_ids_resolve_to_runner_ids(self):
-        for spec in cm.REQUIREMENT_TESTS:
+        for spec in cm.REQUIREMENT_TESTS + cm.SAFETY_TESTS:
             if spec.mode != "automated":
                 continue
             with self.subTest(test_id=spec.test_id):
@@ -313,7 +378,7 @@ class DeclaredIdentityTests(unittest.TestCase):
     def test_declared_specs_are_unique_per_aspect_and_evidence_file(self):
         # Two aspects of one check must never share a (check, aspect) key or an evidence
         # basename (the slug is truncated), or one artifact would overwrite the other.
-        automated = [s for s in cm.REQUIREMENT_TESTS if s.mode == "automated"]
+        automated = [s for s in cm.REQUIREMENT_TESTS + cm.SAFETY_TESTS if s.mode == "automated"]
         keys = [(s.check_id, s.aspect) for s in automated]
         self.assertEqual(len(keys), len(set(keys)), "duplicate (check_id, aspect) declaration")
         files = [(s.check_id, s.evidence_file) for s in automated]
@@ -326,7 +391,7 @@ class DeclaredIdentityTests(unittest.TestCase):
         # that drifted from its declaration would only surface as a missing aspect at the
         # end of a full run. Pin them statically: each declared test carries exactly the
         # evidence metadata its spec names.
-        for spec in cm.REQUIREMENT_TESTS:
+        for spec in cm.REQUIREMENT_TESTS + cm.SAFETY_TESTS:
             if spec.mode != "automated":
                 continue
             with self.subTest(test_id=spec.test_id):
