@@ -31,10 +31,8 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
     `testing/blind-target-2/ANSWER_KEY.md`), so good scores there may reflect
     tuning, not capability. Measure against an untuned app
     (WebGoat/DVWA/PortSwigger); runbook in [USER_MANUAL.md](USER_MANUAL.md) §7.
-  - Note: the in-flight scope migration (below) currently blocks the live-leg
-    suite in a working tree with no scope set — the fixture host is refused as
-    out of scope — so run it with `server.allowed_hosts` including the loopback
-    fixture host.
+  - Note: the live-leg tests pass the loopback fixture host as each validator's
+    `allowed_hosts` themselves, so they do not depend on `server.allowed_hosts`.
 - **[partial] The coverage ledger still under-reports what exists.** `harness/
   coverage_manifest.py` registers loopback confirm/control tests for **20 of 67**
   requirements, plus 3 manual-only ones; the other 44 are `gap_unimplemented`,
@@ -82,13 +80,15 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
   `/crawl-roles` now fail closed on an empty `allowed_hosts` and require
   `active_enabled`, with a clear 403; `crawler._host_allowed` fails closed at the
   chokepoint. Regression-tested.
-- **[partial] Empty scope is handled inconsistently across the codebase.** The
-  main analysis path and crawler fail closed in active mode, but `scope_lock`,
-  `safety_gate` and several validators' own inline checks are mid-migration to
-  the same fail-closed contract. The safety guarantee currently leans on the
-  top-level check; set `server.allowed_hosts` explicitly and do not rely on a
-  single backstop. (This migration is in-flight in the working tree and is why
-  some active-gate unit tests are red.)
+- **[partial] Empty scope is not one contract everywhere.** Every route that sends
+  target traffic needs `active_enabled`, and a run's transport
+  (`run_context.ScopePolicy`) permits nothing on an empty `allowed_hosts`. The
+  crawlers, the missing-auth probe, API-surface discovery and the standalone
+  active probe (`transport_for`, `standalone_context`) also fail closed on an
+  empty scope. `scope_lock.host_in_scope`, which the safety gate and the validators'
+  inline checks call, still reads an empty list as "no restriction", and the raw
+  no-run clients below are not scope-checked at all. Set `server.allowed_hosts`
+  explicitly and do not rely on a single backstop.
 - **[partial] A legacy, unscoped transport path still exists in some
   validators.** ARC-7 removed the raw HTTP clients from the crawlers, discovery,
   feature workflow, the missing-auth probe and the cross-identity probe; they send
@@ -132,13 +132,26 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
   oversized prompt from the start (where the agent's instructions are) with no
   error; r3 (gemma4 at `num_ctx` 4096) logged 88 truncations. When `num_ctx` (or
   `prompt_budget.model_context_tokens`) is set, agent and critique prompts are
-  now fitted to it, every cut marked and listed in `review_stats.elided`. Token
-  counts are estimated, not measured; the context of an unset `num_ctx` is not
-  auto-detected; families routing (`coordinator.routing_mode: families`) is not
-  fitted.
-- **[open] Bodies sent to the model unredacted; cloud egress needs a policy.**
-  Only auth headers are masked. `cloud_reasoning` sends real content off-host.
-  See USER_MANUAL §5. Redaction before cloud is not implemented.
+  now fitted to it, every cut marked and listed in `review_stats.elided`. With
+  `num_ctx` unset, the harness asks the model server for the window it has
+  (llama-server `/props`; Ollama `/api/ps`, then `/api/show`) and fits to the
+  window it reports, never above the model's trained maximum; with none known it fits to
+  `prompt_budget.unknown_context_tokens` (4096), never unfitted. Token counts are
+  estimated, not measured; the discovered window is not refreshed after a server
+  restart; families routing (`coordinator.routing_mode: families`) is not fitted.
+- **[partial] Redaction is by name only; PII is not redacted.** Every model call
+  passes `security.sanitize_for_inference`, which withholds the values of
+  secret-named fields, URL parameters and inline assignments, and of the
+  Authorization, Cookie, Set-Cookie, X-API-Key, X-Auth-Token and
+  Proxy-Authorization headers. It scans no values: personal data (names, e-mail,
+  phone, address, card and ID numbers) and a secret under an unlisted name or in
+  prose reach the model as captured. The exact classes are in USER_MANUAL §5, and
+  `harness/test_data_handling_docs.py` checks them against `security.py`.
+- **[mitigated] Cloud egress is opt-in and refused by default (SEC-1).**
+  `cloud_reasoning` sends the real, name-redacted content off-host, and an Ollama
+  cloud model (`*-cloud`, `*:cloud`) is refused unless `ollama.allow_cloud_models`
+  is true; the flag does not cover a role routed to another provider. A client
+  data-handling statement still needs the policy decision (USER_MANUAL §5).
 - **[open] "Passive" analysis looks up components at third-party services.**
   With the shipped config (`github_advisories`, `package_registry_checks` and
   `kev_check` all enabled), a component that an agent names and that is literally

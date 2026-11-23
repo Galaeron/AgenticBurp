@@ -135,6 +135,13 @@ from a helper unit test or compare different corpora as a model-only effect.
   async egress and requires every bound test to fail. A test with an optional
   prerequisite (Playwright, curl) cannot honestly be bound unless CI provides it:
   a skip leaves the declared aspect unproven and fails the evidence gate.
+- Harness safety properties (`HS-*`: the rebinding pin, caller `Host`, environment proxies,
+  redirect re-checks, cleanup after a mutating leg) are a separate section of the same
+  ledger, `coverage_manifest.SAFETY_PROPERTIES`, bound the same way (`_SAFETY_EVIDENCE`) to
+  the real-socket tests in `harness/test_live_safety_loopback.py`. They are not WSTG rows
+  and not in the requirement totals; `coverage_manifest --check` blocks on them like on any
+  declared automated aspect, so a failing `HS-*` test fails the smoke and full tiers.
+  `LIMITATIONS.md` says what the ledger does and does not claim.
 - A failing old assertion is not automatically obsolete. Check the intended
   contract and caller before updating it. Do not hide known defects by deletion,
   broad skips, weakened assertions or a lower expected count.

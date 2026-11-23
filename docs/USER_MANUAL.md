@@ -228,14 +228,48 @@ slow serial dispatch does not time out mid-run); it is adjustable at runtime via
 
 ## 5. Data handling (important for client engagements)
 
-- Request/response **bodies are sent to the model unredacted.** Only auth
-  *headers* are masked. Bodies routinely carry tokens, PII and passwords.
-- The cloud seams are OFF by default. `coordinator.cloud_reasoning: true` sends
-  **real request content off the machine**; `cloud_primary` sends only an
-  anonymized structural projection. Many testing contracts forbid off-host
-  egress — confirm before enabling either.
-- Findings, cached analyses and logs are written as **unencrypted files** under
-  the tool's folder, with no per-engagement separation. There is a
+**What reaches a model.** Every model call (local Ollama, llama-server, and any
+opt-in cloud role) passes `security.sanitize_for_inference` at the provider
+boundary, and agents and the coordinator prompt from `security.sanitized_exchange`.
+The redaction is **by name, not by content**: it withholds the value of a field
+or header whose *name* is a recognised secret name, and it never scans values. A
+withheld value becomes `[REDACTED-SECRET]` (a header value:
+`[REDACTED -- header present, value withheld from model]`). This is best effort,
+not a guarantee that no secret or personal datum reaches the model.
+
+| Class | Treatment | What it covers |
+|---|---|---|
+| `header-values` | withheld | The values of the Authorization, Cookie, Set-Cookie, X-API-Key, X-Auth-Token and Proxy-Authorization headers. A JWT-shaped `Authorization: Bearer` token keeps only its `alg` and `typ`, never its payload or signature. |
+| `secret-named-fields` | withheld | The value of a JSON (including nested), form or `key: value` field whose name is a secret name: `password`, `token`, `secret`, `api_key`, `session`, `csrf` and the rest of `security.SECRET_FIELD_NAMES`. |
+| `url-secrets` | withheld | `user:password@` in a URL and the values of secret-named query and fragment parameters, including URLs inside text. |
+| `inline-assignments` | withheld | `name=value` and `"name": "value"` assignments in free text, and `Authorization:`-style header lines, for the same names (written with or without `_`, `-` or a space: `accessToken=...`). |
+| `known-values` | withheld | Opaque values a caller passes explicitly for one call. There is no global registry of secrets. |
+| `pii` | **sent** | Names, e-mail addresses, phone numbers, postal addresses, dates of birth, card numbers and government ID numbers, unless they sit in a field with a secret name. There is no PII detector. |
+| `unlisted-names` | **sent** | A secret under a name that is not on the list (for example a `jwt` field). |
+| `unlabelled-values` | **sent** | A secret in prose or in a field with an ordinary name. Nothing is detected by pattern or entropy. |
+| `injection-payloads` | **sent** | A payload in a non-secret field (a `<script>` in a search box). It is kept on purpose: the detectors need it. |
+
+The deterministic `POST /scan/confidential` is a separate scan that reports
+secrets and PII in captured traffic; it does not redact anything.
+
+- **Cloud.** The cloud seams are OFF. `coordinator.cloud_primary: true` sends only an
+  anonymized structural projection (method, path, parameter *names*, status,
+  response shape). `coordinator.cloud_reasoning: true` sends the real exchange
+  content, **after the redaction above**, so personal data and unlisted secrets
+  leave the machine. An Ollama cloud model (`*-cloud` or `*:cloud`) is refused
+  unless `ollama.allow_cloud_models` is true (SEC-1): a run that would use one is
+  rejected before its first call (HTTP 409), and `/health/details` and the run
+  manifest record the state under `model_egress`. That flag covers Ollama cloud
+  models only; a role you route to another provider with a `provider:` key gets
+  the same redacted prompts and is its own egress decision. Many testing
+  contracts forbid off-host egress, so confirm before enabling either.
+- **Third-party lookups.** Passive analysis also looks up component names at
+  third-party services unless `privacy.external_lookups` is false (see
+  [LIMITATIONS.md](LIMITATIONS.md), "Model backend & data").
+- **On disk.** Findings, cached analyses and logs are written as **unencrypted
+  files** under the tool's folder, with no per-engagement separation. Log
+  messages and the evidence objects stored for an observation go through the same
+  sanitiser, but nothing else is encrypted or redacted at rest. There is a
   `DELETE /engagement/{host}/evidence` wipe (enable `server.enable_wipe_endpoint`).
   Active file-upload / stored-XSS tests may **leave artifacts on the target** and
   there is no automatic cleanup — track and remove them manually.
