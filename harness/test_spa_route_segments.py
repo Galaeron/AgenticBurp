@@ -46,6 +46,7 @@ from harness.test_spa_route_xss import _CHROMIUM, _config
 from harness.validators.browser_xss_validator import BrowserXssValidator
 from harness.validators.dom_xss_validator import DomXssValidator
 from harness.validators.injection_targets import NAMED_PARAMETER_UNTESTED, case_target
+from harness.chain_stage_patch import chain_patch
 
 ROLES = [RoleSession("anonymous", {})]
 REFLECTED, DOM = "WSTG-INJT-01", "WSTG-CLNT-01"
@@ -321,7 +322,7 @@ class SegmentCoverageCallerTest(_Server):
                     cls.base, ROLES, max_nodes=0, step_budget=4, max_chain_rounds=0,
                     run_context=ctx)
 
-        with patch("harness.orchestrator_chain.shape_precondition_legs", return_value=[]):
+        with chain_patch("shape_precondition_legs", return_value=[]):
             cls.result = asyncio.run(investigate())
         coverage = cls.result.get("coverage") or {}
         assert "cases_driven" in coverage, "the case-driven coverage path did not run"

@@ -30,7 +30,7 @@ from harness import store
 from harness.assessment_health import confirmed_issue_accounting, stored_proof_artifacts_resolve
 from harness.models import AgentReport
 from harness.orchestrator import Orchestrator
-from harness.orchestrator_chain import _ConfirmationCache
+from harness.orchestrator_chain_support import _ConfirmationCache
 from harness.run_context import (_CREDENTIAL_HEADERS, ExecutionOutcome, RunContext, ScopePolicy,
                                  TypedRequest, case_scope, current_case_ref)
 from harness.test_confirmation_soundness_rve import _CallerBase, _finding, _json_exchange, _verdicts

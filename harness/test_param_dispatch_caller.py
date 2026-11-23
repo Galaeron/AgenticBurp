@@ -44,6 +44,7 @@ from harness.coverage_model import CellStatus, CoverageMatrix
 from harness.models import HttpExchange
 from harness.orchestrator import Orchestrator
 from harness.role_crawl import RoleSession
+from harness.chain_stage_patch import chain_patch
 
 _HARNESS = Path(__file__).resolve().parent
 _JINJA_MUL = re.compile(r"\{\{(\d+)\*(\d+)\}\}")
@@ -183,7 +184,7 @@ class _LoopbackDrive(unittest.TestCase):
                 return await orch.investigate_engagement(
                     base, ROLES, max_nodes=0, step_budget=4, max_chain_rounds=0, run_context=ctx)
 
-        with patch("harness.engagement_builder.build_engagement", side_effect=canned),                 patch("harness.orchestrator_chain.shape_precondition_legs", return_value=[]):
+        with patch("harness.engagement_builder.build_engagement", side_effect=canned),                 chain_patch("shape_precondition_legs", return_value=[]):
             result = asyncio.run(investigate())
         coverage = result.get("coverage") or {}
         self.assertIn("cases_driven", coverage, "the case-driven coverage path did not run")
@@ -534,7 +535,7 @@ class PathTraversalPerPointCallerTest(_LoopbackDrive):
         """Defect injection: the request-level attempt is not bound to the path
         segment, so it probes the parameter again with it: 32 probes on one
         account, cut at the hard cap. The concluding test above sees it."""
-        with patch("harness.orchestrator_chain.REQUEST_LEVEL_INPUTS", {}):
+        with chain_patch("REQUEST_LEVEL_INPUTS", {}):
             matrix, key, cases = self._point_run("/files/view", 20)
         rep = cases(TRAVERSAL)[""]
         self.assertEqual(rep.status, CellStatus.INCONCLUSIVE, rep.reason)

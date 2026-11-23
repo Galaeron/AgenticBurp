@@ -29,6 +29,7 @@ import yaml
 from harness import engagement
 from harness import evidence_ledger
 from harness import orchestrator_chain
+from harness import orchestrator_chain_worklist
 from harness import business_context_agent
 from harness.business_context_agent import BusinessContextAgent
 from harness.application_semantic_model import (
@@ -226,7 +227,7 @@ class CallerSeamTests(unittest.TestCase):
         # live Ollama/transport stack -- so assert the production call site in
         # source, the same pattern test_engagement_policy uses for the driver
         # gate). This is what keeps the seam from being a dead helper.
-        src = inspect.getsource(orchestrator_chain.ChainMixin.investigate_engagement)
+        src = inspect.getsource(orchestrator_chain_worklist.ChainWorklistMixin._engagement_stage_worklist)
         self.assertIn("self._apply_business_context(", src)
         self.assertIn("application_semantic_model", src)
         gate_src = inspect.getsource(orchestrator_chain.ChainMixin._apply_business_context)

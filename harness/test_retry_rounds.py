@@ -23,13 +23,14 @@ from harness import (cache, config_schema, coverage_tracker, engagement_builder,
 from harness.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitState
 from harness.models import AgentReport, HttpExchange
 from harness.orchestrator import Orchestrator
-from harness.orchestrator_helpers import review_captured_exchanges
+from harness.orchestrator_review import review_captured_exchanges
 from harness.retry_rounds import RetryLedger, RetryRoundsConfig, is_settled, round_budgets
 from harness.role_crawl import RoleSession
 from harness.run_context import RunContext
 from harness.test_deterministic_first import BASE, _config
 from harness.test_stage_reservations import _build
 from harness.test_worklist_investigator import BENIGN, OBJ, ROLES, _nothing, _state_with
+from harness.chain_stage_patch import chain_patch
 
 BASE_BUDGETS = {"max_nodes": 10, "step_budget": 64, "max_precondition_legs": 24, "max_reviews": 200}
 
@@ -427,8 +428,8 @@ class RetryRoundsCallerTests(unittest.TestCase):
                    patch.object(worklist_investigator, "investigate_worklist", new=worklist),
                    patch.object(coverage_tracker, "build_coverage_driven",
                                 new=AsyncMock(return_value={})),
-                   patch("harness.orchestrator_chain.review_captured_exchanges", new=review),
-                   patch("harness.orchestrator_chain.universal_header_audit",
+                   chain_patch("review_captured_exchanges", new=review),
+                   chain_patch("universal_header_audit",
                          new=AsyncMock(return_value=0)),
                    patch("harness.browser_driver.default_driver", return_value=None),
                    patch.object(retry_rounds, "_breaker_retry_after", return_value=0.0)]

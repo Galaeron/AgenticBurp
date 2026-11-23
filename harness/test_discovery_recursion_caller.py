@@ -41,6 +41,7 @@ from harness.orchestrator import Orchestrator
 from harness.test_discovery_ffuf_in_run import _FAKE_FFUF, _IMAGE_ID, _REPO_DIGEST
 from harness.test_engagement_transport_callers import _Model, _install_model
 from harness.test_param_dispatch_caller import ROLES, _config
+from harness.chain_stage_patch import chain_patch
 
 _REAL_POPEN = subprocess.Popen
 _WORDS = ("static", "files", "reports", "export", "archive", "backup", "mirror", "config")
@@ -177,7 +178,7 @@ class DiscoveryRecursionCallerTests(unittest.TestCase):
                    patch.object(api_surface_discovery, "DEFAULT_SENSITIVE_FILES", ()),
                    patch.object(SurfaceDiscovery, "_probe", new=probe_spy),
                    patch("harness.browser_driver.default_driver", return_value=None),
-                   patch("harness.orchestrator_chain.shape_precondition_legs", return_value=[]),
+                   chain_patch("shape_precondition_legs", return_value=[]),
                    *extra_patches]
         for p in patches:
             p.start()

@@ -31,6 +31,7 @@ from harness.engagement import EngagementState
 from harness.models import HttpExchange
 from harness.orchestrator import Orchestrator
 from harness.role_crawl import RoleSession
+from harness.chain_stage_patch import chain_patch
 
 _ENDPOINTS = 40
 
@@ -256,8 +257,8 @@ class WorklistResultTests(unittest.TestCase):
         orch.allowed_hosts = ["shop.test"]
         with patch.object(engagement_builder, "build_engagement", new=build), \
              patch.object(worklist_investigator, "investigate_worklist", new=investigate), \
-             patch("harness.orchestrator_chain.review_captured_exchanges", new=AsyncMock(return_value=0)), \
-             patch("harness.orchestrator_chain.universal_header_audit", new=AsyncMock(return_value=0)):
+             chain_patch("review_captured_exchanges", new=AsyncMock(return_value=0)), \
+             chain_patch("universal_header_audit", new=AsyncMock(return_value=0)):
             result = asyncio.run(orch.investigate_engagement(
                 _BASE, [RoleSession("anonymous", {})], max_nodes=1, max_chain_rounds=0,
                 discovery_max_probes=1, **kwargs))

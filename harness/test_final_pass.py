@@ -30,6 +30,7 @@ from harness.run_context import RunContext
 from harness.run_manifest import RunManifest
 from harness.test_deterministic_first import BASE, _config
 from harness.test_stage_reservations import _build
+from harness.chain_stage_patch import chain_patch
 
 
 class _Clock:
@@ -357,11 +358,11 @@ class FinalPassCallerTests(unittest.TestCase):
                    patch.object(worklist_investigator, "investigate_worklist", new=worklist),
                    patch.object(coverage_tracker, "build_coverage_driven",
                                 new=AsyncMock(return_value={})),
-                   patch("harness.orchestrator_chain.review_captured_exchanges",
+                   chain_patch("review_captured_exchanges",
                          new=AsyncMock(return_value=0)),
-                   patch("harness.orchestrator_chain.universal_header_audit",
+                   chain_patch("universal_header_audit",
                          new=AsyncMock(return_value=0)),
-                   patch("harness.orchestrator_chain.time", new=SimpleNamespace(monotonic=clock, time=time.time)),
+                   chain_patch("time", new=SimpleNamespace(monotonic=clock, time=time.time)),
                    patch("harness.browser_driver.default_driver", return_value=None),
                    patch.object(retry_rounds, "_breaker_retry_after", return_value=0.0)]
         if experiments_final is not None:

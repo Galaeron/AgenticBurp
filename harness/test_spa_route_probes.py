@@ -43,6 +43,7 @@ from harness import cache, engagement_builder, store
 from harness.client_routes import (ClientRouteMap, fragment_route, probe_url, read_names_of)
 from harness.role_crawl import RoleSession
 from harness.spa_navigation import crawl_views, view_key
+from harness.chain_stage_patch import chain_patch
 
 _HARNESS = Path(__file__).resolve().parent
 ROLES = [RoleSession("anonymous", {})]
@@ -427,7 +428,7 @@ class ProbedRouteCoverageCallerTest(_Server):
                     cls.base, ROLES, max_nodes=0, step_budget=4, max_chain_rounds=0,
                     run_context=ctx)
 
-        with patch("harness.orchestrator_chain.shape_precondition_legs", return_value=[]):
+        with chain_patch("shape_precondition_legs", return_value=[]):
             cls.result = asyncio.run(investigate())
         coverage = cls.result.get("coverage") or {}
         assert "cases_driven" in coverage, "the case-driven coverage path did not run"

@@ -8,7 +8,7 @@ mixins; searching only that file misses the implementation.
 | Captured exchange to findings | `orchestrator_detect.py`, `analysis_pipeline.py`, `agent_manager.py` | `test_smoke_detection.py` |
 | Discovered routes to confirmed findings | `orchestrator_chain.py`, `engagement_builder.py`, `worklist_investigator.py` | `test_pipeline_gate.py` |
 | Validator dispatch/proof binding | `orchestrator_confirm.py`, `validators/registry.py`, `evidence_ledger.py` | `test_evidence_ledger.py`, `test_oracle_wiring.py` |
-| Endpoint shape warrants a confirmation attempt | `orchestrator_helpers.py`, `orchestrator_chain.py` | `test_smoke_shape_precondition.py`, `test_orchestrator_precondition.py` |
+| Endpoint shape warrants a confirmation attempt | `orchestrator_helpers.py`, `orchestrator_chain_legs.py` | `test_smoke_shape_precondition.py`, `test_orchestrator_precondition.py` |
 | Discovery and request templates | `api_surface_discovery.py`, `role_crawl.py`, `openapi_ingest.py` | `test_api_surface_discovery.py`, `test_role_crawl.py` |
 | Invocation isolation, scope and credentials | `run_context.py` (`TargetTransport`), `transport_inventory.py`, `safety_gate.py`, `scope_lock.py` | `test_run_context.py`, `test_offscope_host_lock.py` |
 | Stateful workflows | `workflow_engine.py`, `feature_workflow.py` | `test_workflow_engine.py` |

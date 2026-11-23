@@ -42,6 +42,7 @@ from harness.session_freshness import FreshnessConfig, SessionFreshness, login_r
 from harness.spa_navigation import crawl_views, resolve_view, view_key
 from harness.test_deterministic_first import BASE, _config
 from harness.test_stage_reservations import _build
+from harness.chain_stage_patch import chain_patch
 
 TOKEN = "CRAWL-LOOP-TOKEN"
 IDENTITY = {"Authorization": f"Bearer {TOKEN}"}
@@ -880,8 +881,8 @@ class CrawlLoopCallerTests(unittest.TestCase):
                    patch.object(worklist_investigator, "investigate_worklist", new=worklist),
                    patch.object(coverage_tracker, "build_coverage_driven",
                                 new=AsyncMock(return_value={})),
-                   patch("harness.orchestrator_chain.review_captured_exchanges", new=review),
-                   patch("harness.orchestrator_chain.universal_header_audit",
+                   chain_patch("review_captured_exchanges", new=review),
+                   chain_patch("universal_header_audit",
                          new=AsyncMock(return_value=0)),
                    patch("harness.browser_driver.default_driver", return_value=None)]
 
@@ -953,7 +954,7 @@ class CrawlLoopCallerTests(unittest.TestCase):
 
     def test_control_overwriting_summary_reports_only_the_last_sweep(self):
         from harness import orchestrator_chain
-        with patch.object(orchestrator_chain, "_fold_worklist_summary",
+        with chain_patch("_fold_worklist_summary",
                           lambda total, sweep, outs: total.update(sweep)):
             result, _ = self._investigate({"recrawl": {"enabled": True}}, sweeps=self._SWEEPS)
         ws = result["worklist_summary"]

@@ -3,6 +3,7 @@ turned into findings and injection leads (harness.server_errors)."""
 import unittest
 
 from harness.server_errors import ServerErrorLedger, suspect_parameters
+from harness.chain_stage_patch import chain_patch
 
 ORIGIN = "http://127.0.0.1:3000"
 _STACK = ("Error: SQLITE_ERROR: near \"'\": syntax error\n"
@@ -273,9 +274,9 @@ class ChainFollowUpTests(unittest.TestCase):
                 await ctx.aclose()
         with patch.object(engagement_builder, "build_engagement", new=build), \
                 patch.object(worklist_investigator, "investigate_worklist", new=investigate), \
-                patch("harness.orchestrator_chain.review_captured_exchanges",
+                chain_patch("review_captured_exchanges",
                       new=AsyncMock(return_value=0)), \
-                patch("harness.orchestrator_chain.universal_header_audit",
+                chain_patch("universal_header_audit",
                       new=AsyncMock(return_value=0)), \
                 patch.object(SqlmapValidator, "validate", new=validate), \
                 patch.object(NosqlValidator, "validate", new=nosql_validate), \

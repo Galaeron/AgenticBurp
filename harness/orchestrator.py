@@ -26,28 +26,80 @@ W-15 decomposition: the ~2,500-line Orchestrator class was split by concern into
 mixins, each in its own module, so this file is now just the shared-state __init__
 plus the assembly. Behavior is unchanged -- the methods moved verbatim and every
 `self.` call still resolves across the mixins via the MRO:
-- orchestrator_helpers.py -- shared imports, constants, and the free helper
-  functions (leaf module; re-exported here so `from orchestrator import <helper>`
-  and `orchestrator.<helper>` keep working).
-- orchestrator_detect.py  (DetectMixin)  -- agent selection, adaptive re-spin,
-  known-vuln resolution/rediscovery, and analyze().
+- orchestrator_helpers.py -- shared constants and the free helper functions (leaf
+  module); orchestrator_review.py holds the capture-review passes. The names other
+  modules import from here are re-exported explicitly (`__all__` below).
+- orchestrator_detect.py  (DetectMixin)  -- analyze(); its steps (agent selection,
+  adaptive re-spin, known-vuln resolution/rediscovery) are in orchestrator_detect_steps.py.
 - orchestrator_confirm.py (ConfirmMixin) -- coverage-proof binding, _validate_findings,
   active-probe and retry-agent entry points.
 - orchestrator_chain.py   (ChainMixin)   -- the graph-driven engagement loop
-  (plan/run_engagement, auto-escalation, investigate_engagement).
+  (plan/run_engagement, auto-escalation, the investigate_engagement driver); the
+  investigate_engagement stages are the orchestrator_chain_*.py mixins (ARC-9).
 - orchestrator_report.py  (ReportMixin)  -- allocation planning, cost estimation,
   and the model/agent/effort management surface.
 """
 from __future__ import annotations
+
 import uuid
 
-from harness import config_schema
-from harness import run_inference
-from harness.orchestrator_helpers import *  # noqa: F401,F403  (re-export shared namespace)
-from harness.orchestrator_detect import DetectMixin
-from harness.orchestrator_confirm import ConfirmMixin
+from harness import config_schema, fast_path, run_inference, store
+from harness.agent_manager import AgentManager
+from harness.analysis_pipeline import AnalysisPipeline
+from harness.coordinator import Coordinator
+from harness.effort import BudgetMode, EffortBudget
+from harness.github_advisories import GitHubAdvisoryClient
+from harness.kev_check import KevClient
+from harness.ollama_client import OllamaClient, backend_options
 from harness.orchestrator_chain import ChainMixin
+from harness.orchestrator_confirm import ConfirmMixin
+from harness.orchestrator_detect import DetectMixin
+from harness.orchestrator_helpers import (
+    _accepts_xml,
+    _carries_jwt,
+    _exchange_text,
+    _has_file_shape,
+    _has_injectable_param,
+    _has_redirect_param,
+    _has_url_param,
+    _jwt_identity,
+    _verify_component_observation,
+    bounded_gather,
+    confirmation_cache_key,
+    coverage_confirmation_finding,
+    log,
+    second_order_identities,
+    shape_precondition_findings,
+    shape_precondition_legs,
+)
 from harness.orchestrator_report import ReportMixin
+from harness.orchestrator_review import review_captured_exchanges
+from harness.package_registry_checks import PackageRegistryClient
+from harness.validators import ValidatorRegistry
+
+
+# Names other modules and tests import from `harness.orchestrator` (it used to expose the whole
+# orchestrator_helpers namespace through a star import). ARC-9: the surface is now this explicit list;
+# add a name here only for an importer that cannot take it from its defining module.
+__all__ = [
+    "Orchestrator",
+    "_accepts_xml",
+    "_carries_jwt",
+    "_exchange_text",
+    "_has_file_shape",
+    "_has_injectable_param",
+    "_has_redirect_param",
+    "_has_url_param",
+    "_jwt_identity",
+    "_verify_component_observation",
+    "bounded_gather",
+    "confirmation_cache_key",
+    "coverage_confirmation_finding",
+    "review_captured_exchanges",
+    "second_order_identities",
+    "shape_precondition_findings",
+    "shape_precondition_legs",
+]
 
 
 class Orchestrator(DetectMixin, ConfirmMixin, ChainMixin, ReportMixin):

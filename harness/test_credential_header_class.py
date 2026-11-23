@@ -21,7 +21,7 @@ from unittest.mock import patch
 from harness import engagement, engagement_builder, feature_workflow, global_throttle
 from harness import run_context, security
 from harness.models import HttpExchange
-from harness.orchestrator_chain import _invalidated_headers
+from harness.orchestrator_chain_support import _invalidated_headers
 from harness.orchestrator_detect import DetectMixin
 from harness.role_crawl import RoleSession
 from harness.run_context import RunContext, ScopePolicy, TypedRequest

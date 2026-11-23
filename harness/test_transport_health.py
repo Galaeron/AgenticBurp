@@ -492,7 +492,7 @@ class AttributionTests(unittest.TestCase):
         self.assertEqual(ctx.health_report()["budget_by_label"], ctx.budget.by_label)
 
     def test_a_driver_child_budget_forwards_the_label_to_the_run(self):
-        from harness.orchestrator_chain import _driver_scope
+        from harness.orchestrator_chain_support import _driver_scope
         srv = _Target(lambda path, auth, s: (200, "ok"))
         self.addCleanup(srv.close)
         ctx = _ctx(max_requests=50)

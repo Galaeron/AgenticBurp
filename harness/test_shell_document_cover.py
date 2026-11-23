@@ -20,7 +20,7 @@ from unittest.mock import patch
 from harness import execution_registry
 from harness.execution_registry import ExecutionRegistry
 from harness.models import HttpExchange
-from harness.orchestrator_chain import _ConfirmationCache
+from harness.orchestrator_chain_support import _ConfirmationCache
 from harness.test_execution_registry import _Counting, _finding_of
 
 ORIGIN = "http://127.0.0.1:3000"

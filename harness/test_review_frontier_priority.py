@@ -29,9 +29,10 @@ from unittest.mock import AsyncMock, patch
 from harness import assessment_health, cache, store
 from harness.models import AgentReport, HttpExchange, StageOutcome
 from harness.orchestrator import Orchestrator
-from harness.orchestrator_helpers import review_captured_exchanges
+from harness.orchestrator_review import review_captured_exchanges
 from harness.run_context import RunContext
 from harness.test_smoke_phase0_capture_review import _test_config
+from harness.chain_stage_patch import chain_patch
 
 _SHELL = "<html><body><app-root></app-root><script src='main.js'></script></body></html>"
 
@@ -477,8 +478,8 @@ class HardeningReuseTests(unittest.IsolatedAsyncioTestCase):
                          self.dispatches)
 
     async def test_control_header_only_key_skips_misconfig_on_another_path(self):
-        from harness import orchestrator_detect
-        with patch.object(orchestrator_detect, "_CONTENT_HARDENING_AGENTS", frozenset()):
+        from harness import orchestrator_detect_steps
+        with patch.object(orchestrator_detect_steps, "_CONTENT_HARDENING_AGENTS", frozenset()):
             await self.analyse(json_cap("/rest/products", headers=_CORS_OPEN),
                                json_cap("/rest/admin/application-configuration",
                                         body='{"config": 1}', headers=_CORS_OPEN))
@@ -555,7 +556,7 @@ class ReviewStatsInResultTests(unittest.TestCase):
              patch.object(worklist_investigator, "investigate_worklist", new=no_outcomes), \
              patch.object(chain_linker, "link_findings", return_value=link), \
              patch.object(orch, "_credential_grants_access", new=AsyncMock(return_value=True)), \
-             patch("harness.orchestrator_chain.universal_header_audit", new=AsyncMock(return_value=0)):
+             chain_patch("universal_header_audit", new=AsyncMock(return_value=0)):
             result = asyncio.run(orch.investigate_engagement(
                 BASE, [RoleSession("anonymous", {})], max_nodes=1, max_chain_rounds=1,
                 discovery_max_probes=1))

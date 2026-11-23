@@ -199,7 +199,7 @@ class FileUploadDriveBindingTests(unittest.TestCase):
         from harness.coverage_tracker import _LEG_CONFIRMATIONS
         from harness.engagement import EngagementState
         from harness.orchestrator import Orchestrator
-        from harness.orchestrator_chain import _ConfirmationCache
+        from harness.orchestrator_chain_support import _ConfirmationCache
         from harness.role_crawl import RoleCrawlResult
         from harness.test_coverage_capabilities import _controlled_model
         from harness.validators.base import ValidationResult

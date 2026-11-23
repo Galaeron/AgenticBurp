@@ -39,6 +39,7 @@ from harness.run_context import RunContext, current_run_context, transport_for
 from harness.validators.base import ValidationResult
 from harness.test_engagement_transport_callers import (
     _ROLES, _Model, _Target, _canned, _config, _install_model)
+from harness.chain_stage_patch import chain_patch
 
 # Reachable and captured by both identities. These coverage caller tests suppress
 # earlier shape dispatch so a cached worklist result cannot replace the SQL leg.
@@ -128,7 +129,7 @@ class CoverageDriveSqlmapLegTests(_IsolatedStateBase, unittest.TestCase):
         patches = [patch("harness.engagement_builder.build_engagement",
                          side_effect=_canned([_ITEM_NODE], [_captured_search, _captured_alice_search])),
                    patch("harness.browser_driver.default_driver", return_value=None),
-                   patch("harness.orchestrator_chain.shape_precondition_legs", return_value=[]),
+                   chain_patch("shape_precondition_legs", return_value=[]),
                    patch("harness.validators.command_injection_validator."
                          "CommandInjectionValidator.validate", _skip_timing_leg),
                    *extra_patches]

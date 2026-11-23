@@ -25,6 +25,7 @@ from harness.role_crawl import RoleSession
 from harness.run_context import RunContext
 from harness.run_journal import RunJournal
 from harness.test_run_journal import _USER_TOKEN, ROUTES, _Crash, _EngagementBase
+from harness.chain_stage_patch import chain_patch
 
 SECOND_LOGIN = "Bearer second-login-token-9876543210"
 
@@ -59,7 +60,7 @@ class ReloginResumeTests(_EngagementBase):
                 run.run_journal = journal
                 patches = [patch("harness.engagement_builder.build_engagement", new=self._discover)]
                 if review is not None:
-                    patches.append(patch("harness.orchestrator_chain.review_captured_exchanges",
+                    patches.append(chain_patch("review_captured_exchanges",
                                          new=review))
                 patches.extend(extra)
                 for p in patches:
