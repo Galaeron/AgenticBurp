@@ -8,6 +8,8 @@ A Burp Suite copilot that uses locally-hosted LLMs to analyze captured HTTP traf
 > corpora ship with answer keys. Read **[docs/LIMITATIONS.md](docs/LIMITATIONS.md)**
 > before trusting any result, and **[docs/USER_MANUAL.md](docs/USER_MANUAL.md)**
 > to run it safely.
+> Report a vulnerability privately as described in **[SECURITY.md](SECURITY.md)**;
+> changes are in **[CHANGELOG.md](CHANGELOG.md)**.
 >
 > **Out of the box it is passive and deliberately quiet:** active testing,
 > autonomous discovery and the cloud seams are OFF and no scope is set, so it
