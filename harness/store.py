@@ -562,21 +562,31 @@ CREATE TABLE IF NOT EXISTS ledger_events (
     provenance_json TEXT NOT NULL DEFAULT '{}',
     engagement_id TEXT NOT NULL DEFAULT '',
     captured_principal_id TEXT NOT NULL DEFAULT '',
-    created_at REAL NOT NULL,
-    seq INTEGER NOT NULL DEFAULT 0,
-    prev_hash TEXT NOT NULL DEFAULT '',
-    row_hash TEXT NOT NULL DEFAULT ''
+    created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_finding_ref ON ledger_events(finding_ref);
 """
-# ARC-13: tamper evidence. Each row carries `seq` (a store-wide, strictly increasing
-# append number), `prev_hash` (the `row_hash` of the previous chained row of the SAME
-# finding_ref; '' for the first) and `row_hash` (sha256 over its own canonical content
-# and prev_hash -- see evidence_ledger.ledger_row_hash). The chain is per finding_ref,
-# not store-wide, because the wipe paths delete a finding_ref's events as a whole: a
-# store-wide chain would break at every legitimate wipe. Rows written before this
-# change have row_hash = '' and stay readable as "unchained legacy" rows. The columns
-# and their indexes are added by _initialise_connection, after the table exists.
+# ARC-13 (2026-11-23): tamper evidence for ledger_events. One ledger_chain row per
+# chained event (keyed on ledger_events.event_id) holds `seq` (a store-wide,
+# increasing append number), `prev_hash` (the `row_hash` of the previous chained
+# event of the SAME finding_ref; '' for the first) and `row_hash` (sha256 over the
+# event's canonical content and prev_hash -- see evidence_ledger.ledger_row_hash).
+# The chain is per finding_ref, not store-wide, because the wipe paths delete a
+# finding_ref's events as a whole: a store-wide chain would break at every
+# legitimate wipe. Events written before this change have no ledger_chain row and
+# read as "unchained legacy". Versioned additive side table plus the
+# 'ledger-chain-schema' marker; ledger_events itself is unchanged. Rollback: DROP
+# TABLE ledger_chain and delete the marker; the previous build never reads either.
+_LEDGER_CHAIN_VERSION = 1
+_LEDGER_CHAIN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ledger_chain (
+    event_id TEXT PRIMARY KEY,
+    seq INTEGER NOT NULL,
+    prev_hash TEXT NOT NULL,
+    row_hash TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_chain_seq ON ledger_chain(seq);
+"""
 
 # FR-2 (F03): content-addressed, ALREADY-REDACTED request/response evidence blobs.
 # This is a NEW persistence sink for exchange bodies/headers (today only a URL and
@@ -855,6 +865,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_PRINCIPAL_SCHEMA)
     conn.executescript(_ISSUE_MERGE_SCHEMA)
     conn.executescript(_LEDGER_SCHEMA)
+    conn.executescript(_LEDGER_CHAIN_SCHEMA)
     conn.executescript(_EVIDENCE_BLOB_SCHEMA)
     conn.executescript(_WORK_ITEM_SCHEMA)
     conn.executescript(_OBSERVATION_SCHEMA)
@@ -873,6 +884,8 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
                  (str(_PLAN_DISPATCH_VERSION),))
     conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('plane-dispatch-schema', ?)",
                  (str(_PLANE_DISPATCH_VERSION),))
+    conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('ledger-chain-schema', ?)",
+                 (str(_LEDGER_CHAIN_VERSION),))
     ledger_cols ={row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
     if "engagement_id" not in ledger_cols:
         try:
@@ -886,17 +899,6 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError as exc:
             if "duplicate column name" not in str(exc):
                 raise
-    for chain_col, chain_ddl in (("seq", "INTEGER NOT NULL DEFAULT 0"),
-                                 ("prev_hash", "TEXT NOT NULL DEFAULT ''"),
-                                 ("row_hash", "TEXT NOT NULL DEFAULT ''")):
-        if chain_col not in ledger_cols:
-            try:
-                conn.execute(f"ALTER TABLE ledger_events ADD COLUMN {chain_col} {chain_ddl}")
-            except sqlite3.OperationalError as exc:
-                if "duplicate column name" not in str(exc):
-                    raise
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_chain ON ledger_events(finding_ref, seq)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_seq ON ledger_events(seq)")
     # Lightweight migration for databases created by earlier builds.
     plan_cols = {row[1] for row in conn.execute("PRAGMA table_info(test_plans)")}
     for col, ddl in [
@@ -3247,11 +3249,12 @@ def persist_ledger_event(event: dict) -> None:
     ledger.emit) already swallow any exception this raises, so a storage
     hiccup here can never surface as a pipeline failure.
 
-    ARC-13: the row is hash-chained (see _LEDGER_SCHEMA). Reading the finding's
-    chain head, taking the next `seq` and inserting happen inside ONE `BEGIN
-    IMMEDIATE` transaction: SQLite grants the write lock to one connection at a
-    time, across threads and processes, so two appends can never read the same
-    head and fork the chain."""
+    ARC-13: the event is hash-chained in ledger_chain (see _LEDGER_CHAIN_SCHEMA).
+    Reading the finding's chain head, taking the next `seq` and inserting both rows
+    happen inside ONE `BEGIN IMMEDIATE` transaction: SQLite grants the write lock to
+    one connection at a time, across threads and processes, so two appends can
+    never read the same head and fork the chain, and no event is stored without
+    its chain row."""
     from harness.evidence_ledger import ledger_row_hash
     fields = {
         "event_id": event.get("event_id", ""), "event_type": event.get("event_type", ""),
@@ -3272,20 +3275,21 @@ def persist_ledger_event(event: dict) -> None:
             conn.rollback()          # a re-persisted event is a no-op, never an overwrite
             return
         head = conn.execute(
-            "SELECT row_hash FROM ledger_events WHERE finding_ref = ? AND row_hash != '' "
-            "ORDER BY seq DESC LIMIT 1", (fields["finding_ref"],)).fetchone()
+            "SELECT c.row_hash FROM ledger_chain c JOIN ledger_events e ON e.event_id = c.event_id "
+            "WHERE e.finding_ref = ? ORDER BY c.seq DESC LIMIT 1", (fields["finding_ref"],)).fetchone()
         prev_hash = head[0] if head else ""
-        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM ledger_events").fetchone()[0]
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM ledger_chain").fetchone()[0]
         row_hash = ledger_row_hash(prev_hash=prev_hash, seq=seq, **fields)
         conn.execute(
             "INSERT INTO ledger_events "
             "(event_id, event_type, finding_ref, case_ref, summary, data_json, "
-            "provenance_json, engagement_id, captured_principal_id, created_at, "
-            "seq, prev_hash, row_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "provenance_json, engagement_id, captured_principal_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (fields["event_id"], fields["event_type"], fields["finding_ref"], fields["case_ref"],
              fields["summary"], fields["data_json"], fields["provenance_json"],
-             fields["engagement_id"], fields["captured_principal_id"], fields["created_at"],
-             seq, prev_hash, row_hash))
+             fields["engagement_id"], fields["captured_principal_id"], fields["created_at"]))
+        conn.execute("INSERT INTO ledger_chain (event_id, seq, prev_hash, row_hash) VALUES (?, ?, ?, ?)",
+                     (fields["event_id"], seq, prev_hash, row_hash))
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -3308,21 +3312,35 @@ def _open_read_only(db_path) -> sqlite3.Connection:
     return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=10.0)
 
 
+_LEDGER_CHAIN_LINK = ("seq", "prev_hash", "row_hash")
+
+
 def iter_ledger_chain_rows(db_path=None):
-    """Every ledger_events row as a dict of _LEDGER_CHAIN_COLUMNS, in append order
-    (`seq`, then insertion order), for harness.evidence_ledger.verify_ledger_rows.
+    """Every ledger_events row, joined to its ledger_chain row, as a dict of
+    _LEDGER_CHAIN_COLUMNS in append order (`seq`, then insertion order), for
+    harness.evidence_ledger.verify_ledger_rows.
 
     Reads the file at `db_path` (default: the live store) read-only and tolerates a
-    store written before ARC-13: columns that do not exist yet read as the legacy
-    defaults, so every such row verifies as "unchained legacy"."""
+    store written before ARC-13: an event without a chain row (or a store without
+    ledger_chain, or a column an older build never added) reads as the legacy
+    defaults, so it verifies as "unchained legacy"."""
     conn = _open_read_only(db_path)
     try:
         present = {row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
         if not present:
             return
-        select = ", ".join(c if c in present else f"{'0' if c == 'seq' else repr('')} AS {c}"
-                           for c in _LEDGER_CHAIN_COLUMNS)
-        for row in conn.execute(f"SELECT {select} FROM ledger_events ORDER BY seq, rowid"):
+        chained = bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_chain'").fetchone())
+        columns = []
+        for c in _LEDGER_CHAIN_COLUMNS:
+            default = "0" if c == "seq" else "''"
+            if c in _LEDGER_CHAIN_LINK:
+                columns.append(f"COALESCE(c.{c}, {default}) AS {c}" if chained else f"{default} AS {c}")
+            else:
+                columns.append(f"e.{c}" if c in present else f"{default} AS {c}")
+        join = " LEFT JOIN ledger_chain c ON c.event_id = e.event_id" if chained else ""
+        order = "COALESCE(c.seq, 0), e.rowid" if chained else "e.rowid"
+        for row in conn.execute(f"SELECT {', '.join(columns)} FROM ledger_events e{join} ORDER BY {order}"):
             yield dict(zip(_LEDGER_CHAIN_COLUMNS, row))
     finally:
         conn.close()
@@ -3903,6 +3921,8 @@ def apply_retention_from_config(cfg: dict, *, now: float | None = None) -> int:
 #     ledger_events          -- finding_ref (sizes case_ids UNION finding_ids
 #                                of the target host's findings -- see the
 #                                blob-guard comment below for why)
+#     ledger_chain           -- event_id of those ledger_events (ARC-13),
+#                                deleted just before them
 #     evidence_blobs         -- sha256, but ONLY the `candidate -
 #                                other_referenced` subset (see below); this
 #                                table has no host column at all -- it is
@@ -3911,7 +3931,8 @@ def apply_retention_from_config(cfg: dict, *, now: float | None = None) -> int:
 #
 #     plane_dispatches / plan_dispatch_notes -- plan_id into test_plans.host,
 #                          deleted the same way as validation_runs below; the
-#                          plane's "plan:<plan_id>" ledger events go with them
+#                          plane's "plan:<plan_id>" ledger events (and their
+#                          ledger_chain rows) go with them
 #
 #     validation_runs  -- no host column of its own; scoped via `plan_id` FK
 #                          into test_plans.host and wiped with the correlated
@@ -4066,16 +4087,20 @@ def wipe_engagement(host: str) -> dict:
         else:
             counts["evidence_blobs"] = 0
 
-        # (d) ledger_events -- finding_ref IN (case_ids UNION finding_ids).
+        # (d) ledger_events -- finding_ref IN (case_ids UNION finding_ids). ARC-13:
+        # their ledger_chain rows go first (the subquery needs the events).
         if target_refs:
             placeholders = ",".join("?" for _ in target_refs)
+            counts["ledger_chain"] = conn.execute(
+                "DELETE FROM ledger_chain WHERE event_id IN (SELECT event_id FROM ledger_events "
+                f"WHERE finding_ref IN ({placeholders}))", list(target_refs)).rowcount
             cur = conn.execute(
                 f"DELETE FROM ledger_events WHERE finding_ref IN ({placeholders})",
                 list(target_refs),
             )
             counts["ledger_events"] = cur.rowcount
         else:
-            counts["ledger_events"] = 0
+            counts["ledger_chain"] = counts["ledger_events"] = 0
 
         # (e) proof_records -- case_id, finding_ref, and proof_id are all
         # real, confirmed columns on this table; a row matching any of them
@@ -4142,6 +4167,10 @@ def wipe_engagement(host: str) -> dict:
         # ledger events the server keys on "plan:<plan_id>".
         conn.execute("DELETE FROM plane_dispatches WHERE plan_id IN "
                      "(SELECT plan_id FROM test_plans WHERE host = ?)", (host,))
+        counts["ledger_chain"] += conn.execute(
+            "DELETE FROM ledger_chain WHERE event_id IN (SELECT event_id FROM ledger_events "
+            "WHERE finding_ref IN (SELECT 'plan:' || plan_id FROM test_plans WHERE host = ?))",
+            (host,)).rowcount
         counts["ledger_events"] += conn.execute(
             "DELETE FROM ledger_events WHERE finding_ref IN "
             "(SELECT 'plan:' || plan_id FROM test_plans WHERE host = ?)", (host,)).rowcount

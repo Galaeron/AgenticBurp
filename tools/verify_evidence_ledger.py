@@ -8,10 +8,11 @@
     python tools/verify_evidence_ledger.py --expect-digest HEX  # compare with a recorded digest
 
 Reads the store read-only. Exit 0: every chained row verifies; 1: a check failed (the first
-bad row is named); 2: the store could not be read. Each ledger row stores the hash of the
-previous row of its finding and a hash of its own content, so an edited, deleted, inserted or
-reordered row breaks the chain at that point. Rows written before the chain existed are
-reported as unchained legacy rows, not failures (use --strict to fail them).
+bad row is named); 2: the store could not be read. Each ledger event has a row in the
+ledger_chain table holding the hash of the previous event of its finding and a hash of its own
+content, so an edited, deleted, inserted or reordered row breaks the chain at that point. Events
+written before the chain existed have no chain row and are reported as unchained legacy rows,
+not failures (use --strict to fail them).
 
 The chain is unkeyed. It does not show removal of the newest rows of a finding, a deleted
 finding, or a rewrite by someone who recomputes every later hash. To cover those, record the

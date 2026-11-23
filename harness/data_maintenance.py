@@ -146,6 +146,9 @@ def snapshot(source: Path, destination: Path, *, expected_sha256: str | None = N
 
 _CONTEXT_OWNED_TABLES = ("findings", "ledger_events", "scoped_engagement_state", "knowledge_notes",
                          "work_items", "exchange_observations", "observation_attributions")
+# ARC-13: ledger_chain has no engagement_id; a context owns the chain rows of its events.
+_LEDGER_CHAIN = "ledger_chain"
+_CONTEXT_CHAIN_ROWS = "event_id IN (SELECT event_id FROM ledger_events WHERE engagement_id=?)"
 _SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 _ENGAGEMENT_MANIFEST = "engagement.json"
 _ENGAGEMENT_LOCK = "engagement.lock"
@@ -188,6 +191,10 @@ def _context_blobs(conn: sqlite3.Connection, engagement_id: str, columns: dict) 
 def _delete_context(conn: sqlite3.Connection, engagement_id: str, inventory: dict, columns: dict,
                     candidate: set, surviving: set) -> dict:
     counts = {}
+    if _LEDGER_CHAIN in inventory["tables"]:
+        # ARC-13: an event's chain row goes with it (first: the subquery needs the events).
+        counts[_LEDGER_CHAIN] = conn.execute(
+            f"DELETE FROM {_LEDGER_CHAIN} WHERE {_CONTEXT_CHAIN_ROWS}", (engagement_id,)).rowcount
     for name in _CONTEXT_OWNED_TABLES:
         if "engagement_id" in columns.get(name, set()):
             counts[name] = conn.execute(f'DELETE FROM "{name}" WHERE engagement_id=?', (engagement_id,)).rowcount
@@ -197,7 +204,8 @@ def _delete_context(conn: sqlite3.Connection, engagement_id: str, inventory: dic
             counts["evidence_blobs"] += conn.execute("DELETE FROM evidence_blobs WHERE sha256=?", (digest,)).rowcount
     return {"deleted": counts, "scope": "explicit engagement-owned subset across hosts",
             "preserved_unowned_tables": [name for name in inventory["tables"]
-                                         if name not in _CONTEXT_OWNED_TABLES and name != "evidence_blobs"],
+                                         if name not in _CONTEXT_OWNED_TABLES
+                                         and name not in ("evidence_blobs", _LEDGER_CHAIN)],
             "external_artifacts": "untouched; separate operator maintenance required"}
 
 
@@ -299,6 +307,8 @@ def _extract_context(conn: sqlite3.Connection, engagement_id: str, inventory: di
         copied = sqlite3.connect(temporary)
         try:
             tables = [name for name in _CONTEXT_OWNED_TABLES if "engagement_id" in columns.get(name, set())]
+            if _LEDGER_CHAIN in inventory["tables"]:
+                tables.append(_LEDGER_CHAIN)   # so the export's ledger still verifies (ARC-13)
             if "evidence_blobs" in inventory["tables"]:
                 tables.append("evidence_blobs")
             for name in tables:
@@ -310,6 +320,9 @@ def _extract_context(conn: sqlite3.Connection, engagement_id: str, inventory: di
                 if name == "evidence_blobs":
                     rows = (row for digest in sorted(blobs)
                             for row in conn.execute(f"SELECT {quoted} FROM evidence_blobs WHERE sha256=?", (digest,)))
+                elif name == _LEDGER_CHAIN:
+                    rows = conn.execute(f"SELECT {quoted} FROM {_LEDGER_CHAIN} WHERE {_CONTEXT_CHAIN_ROWS}",
+                                        (engagement_id,))
                 else:
                     rows = conn.execute(f'SELECT {quoted} FROM "{name}" WHERE engagement_id=?', (engagement_id,))
                 copied.executemany(insert, rows)

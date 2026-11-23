@@ -1,5 +1,6 @@
 """ARC-13: the durable evidence ledger is hash-chained and verifiable, and
-`put_evidence_blob` asserts that what it is given was redacted.
+`put_evidence_blob` asserts that what it is given was redacted. The chain lives in
+the `ledger_chain` side table (one row per event); `ledger_events` keeps its schema.
 
 Every test writes through the REAL path (`evidence_ledger.emit` ->
 `store.persist_ledger_event`, or a real `TargetTransport.execute` send against a
@@ -14,6 +15,7 @@ an operator with sqlite3 would and runs the verifier. Negative controls:
 """
 from __future__ import annotations
 
+import contextvars
 import io
 import json
 import shutil
@@ -30,12 +32,16 @@ from unittest.mock import patch
 
 import httpx
 
-from harness import evidence_ledger, evidence_redaction, security, store
+from harness import data_maintenance, evidence_ledger, evidence_redaction, security, store
 from harness.models import Finding, HttpExchange
 from harness.run_context import RunContext, TypedRequest
 
 ROOT = Path(__file__).resolve().parent.parent
 EL = evidence_ledger
+# Each event joined to its chain row.
+CHAINED = "ledger_events e JOIN ledger_chain c ON c.event_id = e.event_id"
+LEGACY_LEDGER_COLUMNS = ["event_id", "event_type", "finding_ref", "case_ref", "summary", "data_json",
+                         "provenance_json", "engagement_id", "captured_principal_id", "created_at"]
 
 
 class _StoreCase(unittest.TestCase):
@@ -67,7 +73,16 @@ class _StoreCase(unittest.TestCase):
 
     def event_ids(self, ref: str) -> list:
         return [r[0] for r in self.sql(
-            "SELECT event_id FROM ledger_events WHERE finding_ref = ? ORDER BY seq", (ref,))]
+            f"SELECT e.event_id FROM {CHAINED} WHERE e.finding_ref = ? ORDER BY c.seq", (ref,))]
+
+    def delete_event(self, event_id: str) -> None:
+        """What a forger who knows the layout does: remove the event and its chain row."""
+        self.sql("DELETE FROM ledger_chain WHERE event_id = ?", (event_id,))
+        self.sql("DELETE FROM ledger_events WHERE event_id = ?", (event_id,))
+
+    def orphan_chain_rows(self) -> int:
+        return self.sql("SELECT count(*) FROM ledger_chain "
+                        "WHERE event_id NOT IN (SELECT event_id FROM ledger_events)")[0][0]
 
 
 class ChainWriteTests(_StoreCase):
@@ -75,7 +90,7 @@ class ChainWriteTests(_StoreCase):
         self.emit_many("f1", 3)
         self.emit_many("f2", 2)
         self.emit_many("f1", 1, start=3)
-        rows = self.sql("SELECT finding_ref, seq, prev_hash, row_hash FROM ledger_events ORDER BY seq")
+        rows = self.sql(f"SELECT e.finding_ref, c.seq, c.prev_hash, c.row_hash FROM {CHAINED} ORDER BY c.seq")
         self.assertEqual([r[1] for r in rows], [1, 2, 3, 4, 5, 6])
         by_ref = {}
         for ref, _seq, prev, row_hash in rows:
@@ -90,12 +105,21 @@ class ChainWriteTests(_StoreCase):
 
     def test_re_persisting_an_event_is_a_no_op_and_does_not_fork_the_chain(self):
         event = EL.emit(EL.EventType.OBSERVATION, "f1", "once")
-        before = self.sql("SELECT seq, row_hash FROM ledger_events")
+        before = self.sql("SELECT seq, row_hash FROM ledger_chain")
         store.persist_ledger_event(event.to_dict())
         store.persist_ledger_event(event.to_dict())
-        self.assertEqual(self.sql("SELECT seq, row_hash FROM ledger_events"), before)
+        self.assertEqual(self.sql("SELECT seq, row_hash FROM ledger_chain"), before)
+        self.assertEqual(self.sql("SELECT count(*) FROM ledger_events")[0][0], 1)
         self.emit_many("f1", 1, start=1)
         self.assertTrue(self.verify()["ok"])
+
+    def test_ledger_events_keeps_its_schema_and_the_chain_is_a_versioned_side_table(self):
+        self.emit_many("f1", 2)
+        self.assertEqual([r[1] for r in self.sql("PRAGMA table_info(ledger_events)")], LEGACY_LEDGER_COLUMNS)
+        self.assertEqual(self.sql("SELECT value FROM state_metadata WHERE name = 'ledger-chain-schema'"),
+                         [("1",)])
+        self.assertEqual(self.sql("SELECT count(*) FROM ledger_chain")[0][0], 2)
+        self.assertEqual(self.orphan_chain_rows(), 0)
 
     def test_read_path_row_shape_is_unchanged(self):
         self.emit_many("f1", 1)
@@ -125,9 +149,9 @@ class ChainWriteTests(_StoreCase):
         report = self.verify()
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["chained"], 6 * 12 + 3 * 8)
-        seqs = [r[0] for r in self.sql("SELECT seq FROM ledger_events ORDER BY seq")]
+        seqs = [r[0] for r in self.sql("SELECT seq FROM ledger_chain ORDER BY seq")]
         self.assertEqual(seqs, list(range(1, len(seqs) + 1)), "seq must be unique and gap free")
-        prevs = [r[0] for r in self.sql("SELECT prev_hash FROM ledger_events WHERE finding_ref = 'shared'")]
+        prevs = [r[0] for r in self.sql(f"SELECT c.prev_hash FROM {CHAINED} WHERE e.finding_ref = 'shared'")]
         self.assertEqual(len(prevs), len(set(prevs)), "two rows share a prev_hash: the chain forked")
 
     def test_wiping_one_finding_leaves_every_other_chain_valid(self):
@@ -142,7 +166,8 @@ class ChainWriteTests(_StoreCase):
             self.emit_many(case, 3)
         self.assertTrue(self.verify()["ok"])
         counts = store.wipe_engagement("a.example.com")
-        self.assertEqual(counts["ledger_events"], 3)
+        self.assertEqual((counts["ledger_events"], counts["ledger_chain"]), (3, 3))
+        self.assertEqual(self.orphan_chain_rows(), 0, "a wiped event's chain row must go with it")
         report = self.verify()
         self.assertTrue(report["ok"], report)
         self.assertEqual((report["chained"], report["findings"]), (3, 1))
@@ -183,15 +208,27 @@ class TamperDetectionTests(_StoreCase):
                 self.assertTrue(self.verify()["ok"], f"restoring {column} should verify again")
 
     def test_deleted_middle_row_is_named_at_the_row_after_the_gap(self):
+        self.delete_event(self.ids[2])
+        self.assertBadAt(self.verify(), self.ids[3], "prev-mismatch")
+
+    def test_deleted_event_with_its_chain_row_left_behind_is_still_named(self):
         self.sql("DELETE FROM ledger_events WHERE event_id = ?", (self.ids[2],))
         self.assertBadAt(self.verify(), self.ids[3], "prev-mismatch")
 
     def test_deleted_first_row_is_a_missing_predecessor(self):
-        self.sql("DELETE FROM ledger_events WHERE event_id = ?", (self.ids[0],))
+        self.delete_event(self.ids[0])
         self.assertBadAt(self.verify(), self.ids[1], "missing-predecessor")
 
+    def test_deleting_only_the_chain_row_unchains_the_event_and_is_flagged(self):
+        self.sql("DELETE FROM ledger_chain WHERE event_id = ?", (self.ids[2],))
+        report = self.verify()
+        self.assertFalse(report["ok"], report)
+        flagged = {p["event_id"]: p["reasons"] for p in report["problems"]}
+        self.assertIn("unchained-after-chain", flagged[self.ids[2]])
+        self.assertIn("prev-mismatch", flagged[self.ids[3]])
+
     def test_inserted_row_with_a_valid_own_hash_still_breaks_the_chain(self):
-        rows = self.sql("SELECT row_hash, seq FROM ledger_events WHERE event_id = ?", (self.ids[1],))
+        rows = self.sql("SELECT row_hash, seq FROM ledger_chain WHERE event_id = ?", (self.ids[1],))
         anchor_hash, anchor_seq = rows[0]
         forged_hash = EL.ledger_row_hash(
             prev_hash=anchor_hash, seq=anchor_seq, event_id="forged-event", event_type="observation",
@@ -199,9 +236,10 @@ class TamperDetectionTests(_StoreCase):
             engagement_id="", captured_principal_id="", created_at=7.0)
         # Same seq as the row it follows is the only slot a forger can pick without renumbering.
         self.sql("INSERT INTO ledger_events (event_id, event_type, finding_ref, case_ref, summary, "
-                 "data_json, provenance_json, engagement_id, captured_principal_id, created_at, "
-                 "seq, prev_hash, row_hash) VALUES ('forged-event', 'observation', 'f1', '', "
-                 "'inserted', '{}', '{}', '', '', 7.0, ?, ?, ?)", (anchor_seq, anchor_hash, forged_hash))
+                 "data_json, provenance_json, engagement_id, captured_principal_id, created_at) "
+                 "VALUES ('forged-event', 'observation', 'f1', '', 'inserted', '{}', '{}', '', '', 7.0)")
+        self.sql("INSERT INTO ledger_chain (event_id, seq, prev_hash, row_hash) VALUES ('forged-event', ?, ?, ?)",
+                 (anchor_seq, anchor_hash, forged_hash))
         report = self.verify()
         self.assertFalse(report["ok"], report)
         reasons = {r for p in report["problems"] for r in p["reasons"]}
@@ -209,9 +247,9 @@ class TamperDetectionTests(_StoreCase):
 
     def test_reordered_rows_are_detected(self):
         a, b = self.ids[1], self.ids[2]
-        seq_a, seq_b = (self.sql("SELECT seq FROM ledger_events WHERE event_id = ?", (e,))[0][0] for e in (a, b))
-        self.sql("UPDATE ledger_events SET seq = ? WHERE event_id = ?", (seq_b, a))
-        self.sql("UPDATE ledger_events SET seq = ? WHERE event_id = ?", (seq_a, b))
+        seq_a, seq_b = (self.sql("SELECT seq FROM ledger_chain WHERE event_id = ?", (e,))[0][0] for e in (a, b))
+        self.sql("UPDATE ledger_chain SET seq = ? WHERE event_id = ?", (seq_b, a))
+        self.sql("UPDATE ledger_chain SET seq = ? WHERE event_id = ?", (seq_a, b))
         report = self.verify()
         self.assertFalse(report["ok"], report)
         self.assertEqual(report["first_bad"]["event_id"], b, "b now sorts first and fails its prev link")
@@ -223,8 +261,8 @@ class TamperDetectionTests(_StoreCase):
         self.assertEqual(report["first_bad"]["event_id"], self.ids[1])
 
     def test_a_row_turned_unchained_after_the_chain_started_is_flagged(self):
-        self.sql("UPDATE ledger_events SET row_hash = '', prev_hash = '', seq = 0, "
-                 "created_at = created_at + 1000 WHERE event_id = ?", (self.ids[2],))
+        self.sql("DELETE FROM ledger_chain WHERE event_id = ?", (self.ids[2],))
+        self.sql("UPDATE ledger_events SET created_at = created_at + 1000 WHERE event_id = ?", (self.ids[2],))
         report = self.verify()
         self.assertFalse(report["ok"], report)
         reasons = {r for p in report["problems"] for r in p["reasons"]}
@@ -232,7 +270,7 @@ class TamperDetectionTests(_StoreCase):
         self.assertEqual(report["first_bad"]["event_id"], self.ids[2])
 
     def test_malformed_values_are_reported_not_raised(self):
-        self.sql("UPDATE ledger_events SET seq = 'abc' WHERE event_id = ?", (self.ids[1],))
+        self.sql("UPDATE ledger_chain SET seq = 'abc' WHERE event_id = ?", (self.ids[1],))
         report = self.verify()
         self.assertFalse(report["ok"], report)
         reasons = {r for p in report["problems"] for r in p["reasons"]}
@@ -240,7 +278,7 @@ class TamperDetectionTests(_StoreCase):
 
     def test_digest_anchor_catches_removal_of_the_newest_row(self):
         digest = self.verify()["digest"]
-        self.sql("DELETE FROM ledger_events WHERE event_id = ?", (self.ids[-1],))
+        self.delete_event(self.ids[-1])
         chain_only = self.verify()
         self.assertTrue(chain_only["ok"], "the chain alone cannot see a removed newest row")
         anchored = self.verify(expect_digest=digest)
@@ -263,7 +301,7 @@ class TamperDetectionTests(_StoreCase):
         self.assertTrue(report["ok"], "bypassing the hash check must let the edit through: " + str(report))
 
     def test_negative_control_unchained_rows_hide_the_edit(self):
-        self.sql("UPDATE ledger_events SET row_hash = '', prev_hash = '', seq = 0")
+        self.sql("DELETE FROM ledger_chain")
         self.sql("UPDATE ledger_events SET summary = 'forged' WHERE event_id = ?", (self.ids[2],))
         report = self.verify()
         self.assertTrue(report["ok"], report)
@@ -299,8 +337,8 @@ class LegacyLedgerTests(_StoreCase):
         self.assertTrue(report["ok"], report)
         self.assertEqual((report["rows"], report["chained"], report["legacy_unchained"]), (3, 0, 3))
         self.assertEqual(self.db.stat().st_size, size)
-        cols = {r[1] for r in self.sql("PRAGMA table_info(ledger_events)")}
-        self.assertNotIn("row_hash", cols, "the verifier must not migrate the file it inspects")
+        tables = {r[0] for r in self.sql("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        self.assertNotIn("ledger_chain", tables, "the verifier must not migrate the file it inspects")
         self.assertFalse(self.verify(strict=True)["ok"])
 
     def test_legacy_rows_still_load_and_new_rows_chain_after_them(self):
@@ -312,7 +350,9 @@ class LegacyLedgerTests(_StoreCase):
         report = self.verify()
         self.assertTrue(report["ok"], report)
         self.assertEqual((report["chained"], report["legacy_unchained"]), (2, 3))
-        first = self.sql("SELECT prev_hash FROM ledger_events WHERE summary = 'new after legacy'")[0][0]
+        first = self.sql(f"SELECT c.prev_hash FROM {CHAINED} WHERE e.summary = 'new after legacy'")[0][0]
+        self.assertEqual([r[1] for r in self.sql("PRAGMA table_info(ledger_events)")], LEGACY_LEDGER_COLUMNS,
+                         "opening a legacy store must not alter ledger_events")
         self.assertEqual(first, "", "the first chained row of a finding with legacy history starts the chain")
         self.assertEqual(len(store.ledger_events_for("old")), 5)
 
@@ -338,6 +378,55 @@ class LegacyLedgerTests(_StoreCase):
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["legacy_unchained"], 2)
         self.assertFalse(self.verify(strict=True)["ok"])
+
+
+class ContextCloseTests(_StoreCase):
+    """OPS-5's close and wipe of one engagement's rows in a shared store
+    (data_maintenance.close_context / wipe_context) must take the events' chain
+    rows with them and carry them into the export, so both files still verify."""
+
+    def emit_as(self, engagement_id: str, ref: str, count: int, *, start: int = 0) -> None:
+        def run():
+            store.bind_engagement_context(engagement_id)
+            self.emit_many(ref, count, start=start)
+        contextvars.copy_context().run(run)
+
+    def setUp(self):
+        super().setUp()
+        self.emit_as("eng-A", "fa", 3)
+        self.emit_as("eng-B", "fb", 2)
+        self.emit_as("eng-A", "fa", 1, start=3)
+        self.assertTrue(self.verify(strict=True)["ok"])
+
+    def test_close_exports_the_chain_rows_and_leaves_both_files_verifiable(self):
+        export = Path(self._tmp) / "eng-A-export.db"
+        receipt = data_maintenance.close_context(self.db, "eng-A", export)
+        self.assertEqual((receipt["deleted"]["ledger_events"], receipt["deleted"]["ledger_chain"]), (4, 4))
+        self.assertNotIn("ledger_chain", receipt["preserved_unowned_tables"])
+        self.assertEqual(self.orphan_chain_rows(), 0)
+        kept = self.verify(strict=True)
+        self.assertTrue(kept["ok"], kept)
+        self.assertEqual((kept["chained"], kept["findings"]), (2, 1))
+        exported = EL.verify_ledger(export, strict=True)
+        self.assertTrue(exported["ok"], exported)
+        self.assertEqual((exported["chained"], exported["findings"]), (4, 1))
+
+    def test_wipe_takes_the_chain_rows(self):
+        receipt = data_maintenance.wipe_context(self.db, "eng-B")
+        self.assertEqual(receipt["deleted"]["ledger_chain"], 2)
+        self.assertEqual(self.orphan_chain_rows(), 0)
+        self.assertTrue(self.verify(strict=True)["ok"])
+
+    def test_negative_control_close_without_the_chain_handling(self):
+        """With ledger_chain left out of the close (the ARC-13 handling removed), the
+        export's events are unchained and the source keeps orphan chain rows."""
+        export = Path(self._tmp) / "eng-A-blind.db"
+        with patch.object(data_maintenance, "_LEDGER_CHAIN", "no_such_table"):
+            data_maintenance.close_context(self.db, "eng-A", export)
+        self.assertEqual(self.orphan_chain_rows(), 4)
+        exported = EL.verify_ledger(export, strict=True)
+        self.assertFalse(exported["ok"])
+        self.assertEqual((exported["chained"], exported["legacy_unchained"]), (0, 4))
 
 
 class RedactionAssertionTests(_StoreCase):
