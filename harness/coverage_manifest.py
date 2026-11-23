@@ -32,6 +32,21 @@ Guiding rules (each one is a fix for a real hole the reviewer found):
 Report vocabulary: pass / fail / skipped / manual / not_applicable, plus
 `not_implemented` flagged SEPARATELY (a declared automated aspect with no fresh
 evidence, or a requirement with no test at all).
+
+What blocks `--check` (`declared_coverage_ok`, run after the unit tests of the smoke
+and full tiers): every DECLARED automated aspect, of a requirement or a harness safety
+property, must have fresh `pass` evidence. It blocks on
+
+- `fail`: the test failed or errored, or its artifact was invalid, duplicated, or
+  carried an empty or mismatched `test_id`;
+- `skipped`: the test ran and was skipped;
+- `not_implemented`: no fresh artifact for this run (the test did not run).
+
+It does NOT block on `manual` aspects, `not_applicable` requirements, or
+`gap_unimplemented` requirements. `gap_unimplemented` means "no test is registered in
+this ledger"; it does not mean no test exists, and it never means the weakness was
+verified absent. The requirement rollup (`covered_partial`, `gap_*`) is a report; the
+gate checks each declared aspect on its own.
 """
 from __future__ import annotations
 
@@ -146,7 +161,7 @@ class TestSpec:
     evidence_file: str = ""       # basename under the evidence dir (automated specs)
 
     def __post_init__(self):
-        if self.check_id not in CHECKS_BY_ID:
+        if self.check_id not in CHECKS_BY_ID and self.check_id not in SAFETY_PROPERTIES_BY_ID:
             raise ValueError(f"TestSpec references unknown check id {self.check_id!r}")
         if self.mode not in ("automated", "manual"):
             raise ValueError(f"TestSpec.mode must be 'automated' or 'manual', got {self.mode!r}")
@@ -196,6 +211,9 @@ _LEG = "harness.test_leg_live_verification.LiveLegVerificationTest"
 _AUTHZ = "harness.test_smoke_authorization_workflow.AuthorizationSliceSmokeTest"
 _LOGOUT = "harness.test_auth_logout_invalidation.LogoutInvalidationCallerTests"
 _UPLOAD = "harness.test_file_upload_busl08.FileUploadCallerTests"
+_RACE = "harness.test_oracle_gaps_race.OracleGapRaceTests"
+_NOSQL = "harness.test_oracle_gaps_nosql.OracleGapNosqlTests"
+_CORS = "harness.test_cors_transport.CorsDecodedResponseTests"
 _CONFIRM, _CONTROL = "harness_confirmation", "harness_control"
 
 # key -> (check_id, test class, test method, label, aspect)
@@ -307,20 +325,158 @@ _CALLER_EVIDENCE: dict[str, tuple[str, str, str, str, str]] = {
     "deser_control": ("WSTG-INJT-23", _LEG, "test_deserialization_oob_silent_on_json_control", _CONTROL,
                       "harness DeserializationOobValidator returns a controlled negative where "
                       "the cookie is parsed as JSON"),
+    # GAP-2: live loopback legs that existed but were not registered in this ledger.
+    "enum_confirm": ("WSTG-IDNT-04", _LEG, "test_auth_username_enum_confirms", _CONFIRM,
+                     "harness AuthSequenceValidator confirms username enumeration (the login "
+                     "response for a known username differs from an unknown one)"),
+    "enum_control": ("WSTG-IDNT-04", _LEG, "test_auth_username_enum_silent_on_uniform_control",
+                     _CONTROL,
+                     "harness AuthSequenceValidator returns a controlled negative where the "
+                     "login response is uniform for known and unknown usernames"),
+    "client_trust_confirm": ("WSTG-BUSL-02", _LEG, "test_client_trust_confirms_reflected_price",
+                             _CONFIRM,
+                             "harness ClientTrustValidator confirms a client-supplied price is "
+                             "trusted (the tampered price is reflected back by the cart)"),
+    "client_trust_control": ("WSTG-BUSL-02", _LEG, "test_client_trust_silent_on_server_priced_control",
+                             _CONTROL,
+                             "harness ClientTrustValidator returns a controlled negative where "
+                             "the server prices the item itself"),
+    "race_confirm": ("WSTG-BUSL-05", _RACE,
+                     "test_once_only_like_raced_past_its_check_confirms_by_read_back", _CONFIRM,
+                     "harness RaceConditionValidator confirms a once-only operation raced past "
+                     "its check (a concurrent burst records the effect several times, a "
+                     "sequential repeat is refused, and a read-back shows the duplicates)"),
+    "race_control": ("WSTG-BUSL-05", _RACE, "test_control_operation_holding_its_limit_is_a_negative",
+                     _CONTROL,
+                     "harness RaceConditionValidator returns a controlled negative where the "
+                     "operation holds its limit under the concurrent burst"),
+    "nosql_confirm": ("WSTG-INJT-05.6", _NOSQL, "test_quoted_where_on_a_string_path_id_is_confirmed",
+                      _CONFIRM,
+                      "harness NosqlValidator confirms NoSQL injection through a single-quoted "
+                      "$where on a string path id (true and false probes split the response)"),
+    "nosql_control": ("WSTG-INJT-05.6", _NOSQL, "test_control_plain_string_route_is_a_negative",
+                      _CONTROL,
+                      "harness NosqlValidator returns a controlled negative where the path id "
+                      "is matched as a plain string"),
+    "cors_confirm": ("WSTG-CLNT-07", _CORS, "test_compressed_and_plain_grants_agree", _CONFIRM,
+                     "harness CorsValidator confirms a credentialed CORS grant to a reflected "
+                     "foreign origin (plain, gzip and br responses agree)"),
+    "cors_control": ("WSTG-CLNT-07", _CORS, "test_compressed_and_plain_secure_controls_agree",
+                     _CONTROL,
+                     "harness CorsValidator reports safe where the server grants no foreign "
+                     "origin (plain, gzip and br responses agree)"),
+}
+
+
+# ---- harness safety properties (GAP-4): NOT security requirements of the target ----
+#
+# These are properties of the harness's OWN transport and cleanup, proven over loopback
+# sockets by `harness.test_live_safety_loopback`. They are not WSTG checks and are not
+# catalog rows: they never appear under `requirements`, never change the requirement
+# counts, and are reported in their own `safety_properties` section. The declared
+# coverage gate holds their automated aspects to the same fresh-pass rule.
+
+@dataclass(frozen=True)
+class SafetyProperty:
+    id: str           # "HS-*": harness safety, never a WSTG id
+    name: str
+    description: str
+
+
+SAFETY_PROPERTIES: tuple[SafetyProperty, ...] = (
+    SafetyProperty("HS-PIN-01", "DNS-rebinding address pin",
+                   "every target send connects to the address the name resolved to when it "
+                   "was checked; a special-purpose answer is refused before any connect"),
+    SafetyProperty("HS-HOST-01", "Caller-set Host is not sent",
+                   "a Host header from a caller or the agent never reaches the target; the "
+                   "URL authority is sent"),
+    SafetyProperty("HS-PROXY-01", "Environment proxies are ignored",
+                   "target sends never go through an HTTP(S)_PROXY / ALL_PROXY from the "
+                   "environment, and the address pin still holds"),
+    SafetyProperty("HS-REDIR-01", "Redirect hops are re-checked",
+                   "each redirect hop is re-checked against scope and the gate before it is "
+                   "followed"),
+    SafetyProperty("HS-CLEAN-01", "Cleanup after a mutating leg",
+                   "a mutating leg that raises, is cancelled or fails its undo still sends its "
+                   "cleanup, and the write is marked restored or restore_failed"),
+)
+SAFETY_PROPERTIES_BY_ID: dict[str, SafetyProperty] = {p.id: p for p in SAFETY_PROPERTIES}
+
+_LOOP = "harness.test_live_safety_loopback"
+_SAFETY = "harness_safety"
+
+# key -> (property id, test class, test method, label, aspect); same shape as above.
+_SAFETY_EVIDENCE: dict[str, tuple[str, str, str, str, str]] = {
+    "safety_pin_rebinding": (
+        "HS-PIN-01", f"{_LOOP}.DnsRebindingPinTests",
+        "test_rebound_name_is_sent_to_its_pinned_address", _SAFETY,
+        "rebound name: sends and a redirect hop reach only the address pinned at check "
+        "time (127.0.0.1), never the rebound 127.0.0.2"),
+    "safety_pin_special_purpose": (
+        "HS-PIN-01", f"{_LOOP}.DnsRebindingPinTests",
+        "test_special_purpose_first_answer_is_refused_before_connect", _SAFETY,
+        "special-purpose first answer (169.254.169.254) is refused as destination_blocked "
+        "before any connect"),
+    "safety_host_header": (
+        "HS-HOST-01", f"{_LOOP}.CallerHostHeaderTests",
+        "test_caller_set_host_is_stripped_before_the_send", _SAFETY,
+        "caller-set Host (any case or padding) on send and send_creds is stripped; the "
+        "server sees the URL authority"),
+    "safety_host_agent": (
+        "HS-HOST-01", f"{_LOOP}.CallerHostHeaderTests",
+        "test_agent_set_header_host_is_refused_with_zero_sends", _SAFETY,
+        "agent set_header Host is refused with zero sends; an allowed header from the same "
+        "agent is sent"),
+    "safety_env_proxy": (
+        "HS-PROXY-01", f"{_LOOP}.EnvironmentProxyTests",
+        "test_target_sends_bypass_environment_proxies_and_keep_pins", _SAFETY,
+        "with env proxies set, default, session and GatedAsyncClient sends reach the target "
+        "directly and the pin holds"),
+    "safety_redirect_recheck": (
+        "HS-REDIR-01", f"{_LOOP}.RedirectRecheckTests",
+        "test_redirect_to_out_of_scope_host_is_not_followed", _SAFETY,
+        "302 to an out-of-scope host or metadata address is not followed; a same-origin 302 "
+        "is"),
+    "safety_cleanup_on_error": (
+        "HS-CLEAN-01", f"{_LOOP}.MutatingCleanupTests",
+        "test_cleanup_runs_when_the_leg_raises_part_way", _SAFETY,
+        "workflow leg raising after its create still sends the DELETE; the write is marked "
+        "restored"),
+    "safety_cleanup_on_cancel": (
+        "HS-CLEAN-01", f"{_LOOP}.MutatingCleanupTests",
+        "test_cleanup_runs_after_cancellation", _SAFETY,
+        "cancelled workflow leg still sends its cleanup; the write is marked restored"),
+    "safety_cleanup_owed": (
+        "HS-CLEAN-01", f"{_LOOP}.MutatingCleanupTests",
+        "test_failed_cleanup_is_recorded_as_owed", _SAFETY,
+        "failed cleanup (DELETE answers 500) is recorded as restore_failed at level error"),
+    "safety_cleanup_write_integrity": (
+        "HS-CLEAN-01", f"{_LOOP}.WriteIntegrityCleanupTests",
+        "test_write_integrity_leg_raising_part_way_deletes_its_creates", _SAFETY,
+        "write-integrity leg raising after an attack create deletes every create and marks "
+        "each restored"),
 }
 
 
 def caller_evidence(key: str) -> dict:
-    """The `@evidence_for` keyword arguments for one declared caller-evidence row."""
-    check_id, _cls, _method, label, aspect = _CALLER_EVIDENCE[key]
+    """The `@evidence_for` keyword arguments for one declared caller-evidence row
+    (a requirement row or a harness safety-property row)."""
+    check_id, _cls, _method, label, aspect = (_CALLER_EVIDENCE.get(key)
+                                              or _SAFETY_EVIDENCE[key])
     return {"check_id": check_id, "aspect": aspect, "label": label}
 
 
-def _caller_specs() -> tuple[TestSpec, ...]:
+def _caller_specs(table: dict | None = None) -> tuple[TestSpec, ...]:
     return tuple(
         TestSpec(check_id, f"{cls}.{method}", aspect, mode="automated", label=label,
                  evidence_file=evidence_basename(check_id, aspect))
-        for check_id, cls, method, label, aspect in _CALLER_EVIDENCE.values())
+        for check_id, cls, method, label, aspect in
+        (_CALLER_EVIDENCE if table is None else table).values())
+
+
+# The harness safety-property specs; kept OUT of REQUIREMENT_TESTS (which lists only
+# catalog requirements).
+SAFETY_TESTS: tuple[TestSpec, ...] = _caller_specs(_SAFETY_EVIDENCE)
 
 
 REQUIREMENT_TESTS: tuple[TestSpec, ...] = (
@@ -482,10 +638,11 @@ def write_evidence(*, check_id: str, aspect: str, status, test_id: str,
     run-specific dir by default."""
     # WG-1: a legacy (pre-WG-1) id is written under its current id; anything else
     # is refused.
-    try:
-        check_id = resolve_check_id(check_id)
-    except UnknownCheckIdError:
-        raise ValueError(f"evidence references unknown check id {check_id!r}") from None
+    if check_id not in SAFETY_PROPERTIES_BY_ID:
+        try:
+            check_id = resolve_check_id(check_id)
+        except UnknownCheckIdError:
+            raise ValueError(f"evidence references unknown check id {check_id!r}") from None
     st = status if isinstance(status, TestStatus) else TestStatus.coerce(status)
     rid = run_id or current_run_id()
     rec = EvidenceRecord(
@@ -592,31 +749,45 @@ def _resolve_spec(spec: TestSpec, evidence: dict) -> dict:
             "reason": rec.reason or f"evidence status={rec.status.value}"}
 
 
-def _rollup(check: Check, resolved: list[dict], applicable: bool, rationale: str) -> dict:
-    """Roll resolved specs up into a single requirement-coverage verdict."""
-    covered = [r for r in resolved if r["status"] in _COVERING_STATUSES]
-    covered_aspects = [r["aspect"] for r in covered]
+def _status_of(resolved: list[dict], applicable: bool = True) -> RequirementStatus:
+    """The rollup verdict for one requirement (or safety property) from its resolved
+    aspects. See the module docstring for which of these the gate blocks on."""
+    if not applicable:
+        return RequirementStatus.NOT_APPLICABLE
+    if not resolved:
+        return RequirementStatus.GAP_UNIMPLEMENTED
+    if any(r["status"] in _COVERING_STATUSES for r in resolved):
+        return RequirementStatus.COVERED_PARTIAL  # a pass covers only its aspect
+    if any(r["status"] == TestStatus.FAIL for r in resolved):
+        return RequirementStatus.GAP_FAILED
+    if any(r["status"] in (TestStatus.SKIPPED, TestStatus.NOT_IMPLEMENTED) for r in resolved):
+        return RequirementStatus.GAP_SKIPPED
+    if all(r["status"] == TestStatus.MANUAL for r in resolved):
+        return RequirementStatus.GAP_MANUAL
+    return RequirementStatus.GAP_SKIPPED
+
+
+def _residual(resolved: list[dict]) -> list[dict]:
     # Residual gaps: every resolved aspect that did NOT contribute passing evidence --
     # retained EVEN when the requirement is partially covered (issue 6).
-    residual = [{"aspect": r["aspect"], "label": r["label"], "status": r["status"].value,
-                 "reason": r["reason"]}
-                for r in resolved if r["status"] not in _COVERING_STATUSES]
+    return [{"aspect": r["aspect"], "label": r["label"], "status": r["status"].value,
+             "reason": r["reason"]}
+            for r in resolved if r["status"] not in _COVERING_STATUSES]
 
-    if not applicable:
-        status = RequirementStatus.NOT_APPLICABLE
-    elif not resolved:
-        status = RequirementStatus.GAP_UNIMPLEMENTED
-    elif covered:
-        status = RequirementStatus.COVERED_PARTIAL  # a pass covers only its aspect
-    elif any(r["status"] == TestStatus.FAIL for r in resolved):
-        status = RequirementStatus.GAP_FAILED
-    elif any(r["status"] in (TestStatus.SKIPPED, TestStatus.NOT_IMPLEMENTED) for r in resolved):
-        status = RequirementStatus.GAP_SKIPPED
-    elif all(r["status"] == TestStatus.MANUAL for r in resolved):
-        status = RequirementStatus.GAP_MANUAL
-    else:
-        status = RequirementStatus.GAP_SKIPPED
 
+def _test_rows(resolved: list[dict]) -> list[dict]:
+    return [{"test_id": r["test_id"], "aspect": r["aspect"], "mode": r["mode"],
+             "label": r["label"], "status": r["status"].value,
+             "evidence_path": r["evidence_path"], "reason": r["reason"]}
+            for r in resolved]
+
+
+def _rollup(check: Check, resolved: list[dict], applicable: bool, rationale: str) -> dict:
+    """Roll resolved specs up into a single requirement-coverage verdict."""
+    covered_aspects = [r["aspect"] for r in resolved if r["status"] in _COVERING_STATUSES]
+    residual = _residual(resolved)
+
+    status = _status_of(resolved, applicable)
     note = ""
     if status == RequirementStatus.COVERED_PARTIAL:
         note = ("partial coverage: the passing aspect(s) are verified; other scenarios of "
@@ -637,10 +808,23 @@ def _rollup(check: Check, resolved: list[dict], applicable: bool, rationale: str
         "covered_aspects": covered_aspects,
         "residual_gaps": residual,
         "note": note,
-        "tests": [{"test_id": r["test_id"], "aspect": r["aspect"], "mode": r["mode"],
-                   "label": r["label"], "status": r["status"].value,
-                   "evidence_path": r["evidence_path"], "reason": r["reason"]}
-                  for r in resolved],
+        "tests": _test_rows(resolved),
+    }
+
+
+def _rollup_property(prop: SafetyProperty, resolved: list[dict]) -> dict:
+    """A harness safety property's verdict, in the same per-aspect shape as a
+    requirement but marked `kind: harness_safety_property` (never WSTG)."""
+    return {
+        "check_id": prop.id,
+        "name": prop.name,
+        "description": prop.description,
+        "kind": "harness_safety_property",
+        "is_wstg": False,
+        "requirement_status": _status_of(resolved).value,
+        "covered_aspects": [r["aspect"] for r in resolved if r["status"] in _COVERING_STATUSES],
+        "residual_gaps": _residual(resolved),
+        "tests": _test_rows(resolved),
     }
 
 
@@ -658,15 +842,31 @@ def _is_gap(req: dict) -> bool:
 def reconcile(specs: tuple[TestSpec, ...] = REQUIREMENT_TESTS, *,
               evidence_dir: Path | str | None = None, run_id: str | None = None,
               checks: tuple[Check, ...] = CHECK_CATALOG,
-              applicability: dict[str, tuple[bool, str]] | None = None) -> dict:
+              applicability: dict[str, tuple[bool, str]] | None = None,
+              safety_specs: tuple[TestSpec, ...] | None = None,
+              properties: tuple[SafetyProperty, ...] = SAFETY_PROPERTIES) -> dict:
     """Reconcile declared specs + this run's evidence into a requirement-coverage
-    report over the whole catalog. `run_id` defaults to the current run (so only
-    fresh evidence counts); pass an explicit one in tests."""
+    report over the whole catalog, plus the harness safety properties in their own
+    `safety_properties` list (never mixed into the requirement totals). `run_id`
+    defaults to the current run (so only fresh evidence counts); pass an explicit
+    one in tests. `safety_specs` defaults to the declared SAFETY_TESTS only when
+    `specs` is the declared REQUIREMENT_TESTS; a caller passing its own `specs`
+    reconciles exactly those unless it also passes `safety_specs`."""
+    if safety_specs is None:
+        safety_specs = SAFETY_TESTS if specs is REQUIREMENT_TESTS else ()
     rid = run_id if run_id is not None else current_run_id()
     evidence = load_evidence(evidence_dir, run_id=rid)
     by_check: dict[str, list[TestSpec]] = {}
     for spec in specs:
         by_check.setdefault(spec.check_id, []).append(spec)
+    by_property: dict[str, list[TestSpec]] = {}
+    for spec in safety_specs:
+        by_property.setdefault(spec.check_id, []).append(spec)
+    safety = [_rollup_property(p, [_resolve_spec(s, evidence) for s in by_property.get(p.id, [])])
+              for p in properties]
+    safety_counts: dict[str, int] = {}
+    for p in safety:
+        safety_counts[p["requirement_status"]] = safety_counts.get(p["requirement_status"], 0) + 1
 
     requirements: list[dict] = []
     for check in checks:
@@ -696,8 +896,11 @@ def reconcile(specs: tuple[TestSpec, ...] = REQUIREMENT_TESTS, *,
             "gaps": len(gaps),
             "requirement_status_counts": req_by_status,
             "test_status_counts": test_by_status,
+            "safety_properties": len(safety),
+            "safety_property_status_counts": safety_counts,
         },
         "requirements": requirements,
+        "safety_properties": safety,
         "gaps": gaps,
         "unimplemented": [r["check_id"] for r in requirements
                           if r["requirement_status"] == RequirementStatus.GAP_UNIMPLEMENTED.value],
@@ -714,7 +917,7 @@ def declared_coverage_ok(report: dict) -> tuple[bool, list[str]]:
     (issue 1). Manual aspects and requirements declared not-applicable are known,
     non-regression states and are skipped."""
     problems: list[str] = []
-    for r in report.get("requirements", []):
+    for r in [*report.get("requirements", []), *report.get("safety_properties", [])]:
         if r["requirement_status"] == RequirementStatus.NOT_APPLICABLE.value:
             continue
         for t in r["tests"]:
@@ -759,6 +962,20 @@ def render_markdown(report: dict) -> str:
             tests_cell, ev_cell = "-", "-"
         lines.append(f"| {r['ref']} | {r['name']} | {r['requirement_status']} "
                      f"| {tests_cell} | {ev_cell} |")
+    if report.get("safety_properties"):
+        lines += ["", "## Harness safety properties (the harness's own transport and "
+                  "cleanup; not WSTG requirements)", "",
+                  "| Id | Property | Status | Aspects (status) |", "| --- | --- | --- | --- |"]
+        for p in report["safety_properties"]:
+            cell = "<br>".join(f"{x['status']}: {x['aspect']}" for x in p["tests"]) or "-"
+            lines.append(f"| {p['check_id']} | {p['name']} | {p['requirement_status']} | {cell} |")
+        owed = [(p, rg) for p in report["safety_properties"] for rg in p["residual_gaps"]]
+        if owed:
+            lines += ["", "Safety-property aspects without fresh passing evidence (these block "
+                      "`--check`):", ""]
+            for p, rg in owed:
+                lines.append(f"- **{p['check_id']}** [{rg['label']}] {rg['status']}: "
+                             f"{rg['aspect']} — {rg['reason']}")
     if report.get("gaps"):
         lines += ["", "## Gaps (flagged, incl. residual aspects under partial coverage)", ""]
         for g in report["gaps"]:

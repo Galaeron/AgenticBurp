@@ -22,6 +22,9 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
+import harness.coverage_manifest as cm
+from harness.coverage_evidence_case import EvidenceCase, evidence_for
+from harness.testing_fixtures.leg_fault import bound_test_names, outcomes_with_leg_severed
 from harness import global_throttle
 from harness.models import Finding, HttpExchange
 from harness.run_context import RunContext
@@ -111,7 +114,7 @@ class _Backend(BaseHTTPRequestHandler):
         pass
 
 
-class OracleGapNosqlTests(unittest.TestCase):
+class OracleGapNosqlTests(EvidenceCase):
     @classmethod
     def setUpClass(cls):
         global_throttle.configure(0)
@@ -157,9 +160,11 @@ class OracleGapNosqlTests(unittest.TestCase):
         self.assertEqual(segs("/api/users/profile"), [])
         self.assertEqual(path_id_segments(HttpExchange(url="http://h/a/1", method="POST")), [])
 
+    @evidence_for(**cm.caller_evidence("nosql_confirm"))
     def test_quoted_where_on_a_string_path_id_is_confirmed(self):
         result, sent = self.run_leg("GET", "/q/shops/s1001/reviews",
                                     response=json.dumps({"data": _REVIEWS[:2]}))
+        self.record_observation({"status": result.status, "requests": len(sent)})
         self.assertEqual(result.status, "confirmed", result.summary)
         self.assertIn("single-quoted", result.summary)
         self.assertGreaterEqual(result.confidence, 0.9)
@@ -171,8 +176,10 @@ class OracleGapNosqlTests(unittest.TestCase):
         self.assertEqual(result.status, "confirmed", result.summary)
         self.assertIn("unquoted", result.summary)
 
+    @evidence_for(**cm.caller_evidence("nosql_control"))
     def test_control_plain_string_route_is_a_negative(self):
         result, sent = self.run_leg("GET", "/plain/shops/s1001/reviews")
+        self.record_observation({"status": result.status, "requests": len(sent)})
         self.assertTrue(sent)
         self.assertEqual((result.status, result.control_outcome), ("not_confirmed", ""),
                          result.summary)
@@ -223,6 +230,15 @@ class OracleGapNosqlTests(unittest.TestCase):
         result, sent = self.run_leg("PATCH", "/api/notes", body=body, mutating=False)
         self.assertEqual([s for s in sent if s[0] == "PATCH"], [])
         self.assertFalse(result.confirmed)
+
+    # --- Fault injection: a bound aspect must notice a disconnected leg ---------
+    def test_bound_aspects_fail_when_the_leg_is_disconnected(self):
+        names = bound_test_names(type(self))
+        self.assertEqual(len(names), 2, f"bound tests went missing: {names}")
+        for name, outcome in outcomes_with_leg_severed(type(self), names).items():
+            with self.subTest(test=name):
+                self.assertNotEqual(outcome, "passed",
+                                    f"{name} still passes with the leg disconnected: not evidence")
 
 
 if __name__ == "__main__":

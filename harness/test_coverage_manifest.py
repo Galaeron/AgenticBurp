@@ -298,9 +298,159 @@ class ModelExtensionTests(unittest.TestCase):
         self.assertNotEqual(CHECKS_BY_ID["WSTG-CONF-09"].vulnerability_class, "api_security")
 
 
+class SafetyPropertyLedgerTests(unittest.TestCase):
+    """GAP-4: the harness safety properties have their own section of the ledger."""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="cov_safety_"))
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+
+    def _pass_all(self, specs):
+        for s in specs:
+            _write(self._tmp, s.check_id, s.aspect, TestStatus.PASS, test_id=s.test_id)
+
+    def test_every_property_has_an_automated_spec_and_is_not_a_catalog_row(self):
+        declared = {s.check_id for s in cm.SAFETY_TESTS if s.mode == "automated"}
+        self.assertEqual(declared, set(cm.SAFETY_PROPERTIES_BY_ID))
+        for pid in cm.SAFETY_PROPERTIES_BY_ID:
+            self.assertTrue(pid.startswith("HS-"), pid)
+            self.assertNotIn(pid, CHECKS_BY_ID)
+        self.assertFalse({s.check_id for s in cm.REQUIREMENT_TESTS} & set(cm.SAFETY_PROPERTIES_BY_ID))
+
+    def test_properties_report_separately_and_leave_requirement_totals_alone(self):
+        empty = reconcile(evidence_dir=self._tmp, run_id=RUN)
+        self._pass_all(cm.SAFETY_TESTS)
+        rep = reconcile(evidence_dir=self._tmp, run_id=RUN)
+        self.assertEqual(rep["totals"]["requirements"], empty["totals"]["requirements"])
+        self.assertEqual(rep["totals"]["requirement_status_counts"],
+                         empty["totals"]["requirement_status_counts"])
+        self.assertFalse({r["check_id"] for r in rep["requirements"]} & set(cm.SAFETY_PROPERTIES_BY_ID))
+        props = {p["check_id"]: p for p in rep["safety_properties"]}
+        self.assertEqual(set(props), set(cm.SAFETY_PROPERTIES_BY_ID))
+        for p in props.values():
+            self.assertEqual(p["requirement_status"], RequirementStatus.COVERED_PARTIAL.value)
+            self.assertFalse(p["is_wstg"])
+        self.assertEqual(rep["totals"]["safety_property_status_counts"],
+                         {RequirementStatus.COVERED_PARTIAL.value: len(cm.SAFETY_PROPERTIES)})
+        self.assertIn("Harness safety properties", render_markdown(rep))
+
+    def test_gate_blocks_on_a_missing_or_failing_safety_aspect(self):
+        first, *rest = cm.SAFETY_TESTS
+        self._pass_all(rest)
+        ok, problems = declared_coverage_ok(reconcile(evidence_dir=self._tmp, run_id=RUN))
+        self.assertFalse(ok)
+        self.assertTrue(any(first.check_id in p and "not_implemented" in p for p in problems), problems)
+        _write(self._tmp, first.check_id, first.aspect, TestStatus.FAIL, test_id=first.test_id)
+        ok, problems = declared_coverage_ok(reconcile(evidence_dir=self._tmp, run_id=RUN))
+        self.assertFalse(ok)
+        self.assertTrue(any(first.check_id in p and "'fail'" in p for p in problems), problems)
+        md = render_markdown(reconcile(evidence_dir=self._tmp, run_id=RUN))
+        self.assertIn(f"**{first.check_id}** [harness_safety] fail: {first.aspect}", md)
+
+    def test_safety_ids_are_written_as_is_and_unknown_ids_still_refused(self):
+        path = _write(self._tmp, "HS-PIN-01", "an aspect", TestStatus.PASS)
+        self.assertTrue(path.name.startswith("HS-PIN-01__"))
+        self.assertIn(("HS-PIN-01", "an aspect"), load_evidence(self._tmp, run_id=RUN))
+        with self.assertRaises(ValueError):
+            _write(self._tmp, "HS-NOPE-99", "x", TestStatus.PASS)
+        with self.assertRaises(ValueError):
+            TestSpec("HS-NOPE-99", "m.T.test_x", "x")
+
+    def test_custom_specs_reconcile_without_the_declared_safety_specs(self):
+        rep = reconcile((), evidence_dir=self._tmp, run_id=RUN)
+        self.assertTrue(all(p["requirement_status"] == RequirementStatus.GAP_UNIMPLEMENTED.value
+                            for p in rep["safety_properties"]))
+        self.assertTrue(declared_coverage_ok(rep)[0])
+
+
+class RegisteredLiveTestStatusTests(unittest.TestCase):
+    """GAP-2: a requirement with a registered live test reports that test's real status,
+    never `gap_unimplemented`, and the statuses that block the gate are the documented ones."""
+
+    #: requirements GAP-2 registered from live loopback legs that already existed.
+    GAP2_REGISTERED = {"WSTG-IDNT-04", "WSTG-BUSL-02", "WSTG-BUSL-05", "WSTG-INJT-05.6",
+                       "WSTG-CLNT-07"}
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="cov_gap2_"))
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+
+    @staticmethod
+    def _automated():
+        return {s.check_id for s in cm.REQUIREMENT_TESTS if s.mode == "automated"}
+
+    def _statuses(self):
+        rep = reconcile(evidence_dir=self._tmp, run_id=RUN)
+        return rep, {r["check_id"]: r["requirement_status"] for r in rep["requirements"]}
+
+    def _pass(self, specs):
+        for s in specs:
+            if s.mode == "automated":
+                _write(self._tmp, s.check_id, s.aspect, TestStatus.PASS, test_id=s.test_id)
+
+    def test_gap2_requirements_are_registered_with_a_confirm_and_a_control(self):
+        for cid in sorted(self.GAP2_REGISTERED):
+            labels = {s.label for s in cm.REQUIREMENT_TESTS if s.check_id == cid}
+            with self.subTest(check_id=cid):
+                self.assertEqual(labels, {"harness_confirmation", "harness_control"})
+
+    def test_negative_control_without_the_registrations_the_rows_are_gap_unimplemented(self):
+        specs = tuple(s for s in cm.REQUIREMENT_TESTS if s.check_id not in self.GAP2_REGISTERED)
+        self._pass(specs)
+        rep = reconcile(specs, evidence_dir=self._tmp, run_id=RUN)
+        statuses = {r["check_id"]: r["requirement_status"] for r in rep["requirements"]}
+        for cid in sorted(self.GAP2_REGISTERED):
+            with self.subTest(check_id=cid):
+                self.assertEqual(statuses[cid], RequirementStatus.GAP_UNIMPLEMENTED.value)
+
+    def test_no_registered_requirement_reports_gap_unimplemented(self):
+        _, without_evidence = self._statuses()
+        for cid in sorted(self._automated()):
+            with self.subTest(check_id=cid):
+                # No evidence yet: the declared test did not run, which blocks; it is not
+                # "no test exists".
+                self.assertEqual(without_evidence[cid], RequirementStatus.GAP_SKIPPED.value)
+        self._pass(cm.REQUIREMENT_TESTS + cm.SAFETY_TESTS)
+        rep, passed = self._statuses()
+        for cid in sorted(self._automated()):
+            with self.subTest(check_id=cid):
+                self.assertEqual(passed[cid], RequirementStatus.COVERED_PARTIAL.value)
+        self.assertTrue(declared_coverage_ok(rep)[0])
+        unimplemented = {c for c, st in passed.items()
+                         if st == RequirementStatus.GAP_UNIMPLEMENTED.value}
+        self.assertFalse(unimplemented & self._automated())
+        self.assertEqual(rep["totals"]["requirement_status_counts"].get(
+            RequirementStatus.COVERED_PARTIAL.value), len(self._automated()))
+
+    def test_blocking_statuses_are_the_documented_ones(self):
+        spec = next(s for s in cm.REQUIREMENT_TESTS if s.check_id == "WSTG-BUSL-05")
+        self._pass([s for s in cm.REQUIREMENT_TESTS + cm.SAFETY_TESTS if s is not spec])
+        blocked = {}
+        for status in (None, TestStatus.FAIL, TestStatus.SKIPPED):
+            if status is not None:
+                _write(self._tmp, spec.check_id, spec.aspect, status, test_id=spec.test_id)
+            ok, problems = declared_coverage_ok(reconcile(evidence_dir=self._tmp, run_id=RUN))
+            blocked[status] = ok
+            self.assertTrue(any(spec.check_id in p for p in problems), (status, problems))
+        self.assertEqual(set(blocked.values()), {False})
+        # manual aspects, N/A rows and unregistered rows do not block on their own.
+        _write(self._tmp, spec.check_id, spec.aspect, TestStatus.PASS, test_id=spec.test_id)
+        rep = reconcile(evidence_dir=self._tmp, run_id=RUN)
+        self.assertTrue(declared_coverage_ok(rep)[0])
+        counts = rep["totals"]["requirement_status_counts"]
+        self.assertGreater(counts.get(RequirementStatus.GAP_MANUAL.value, 0), 0)
+        self.assertGreater(counts.get(RequirementStatus.GAP_UNIMPLEMENTED.value, 0), 0)
+        # A requirement declared N/A does not block even when its declared test failed.
+        _write(self._tmp, spec.check_id, spec.aspect, TestStatus.FAIL, test_id=spec.test_id)
+        self.assertFalse(declared_coverage_ok(reconcile(evidence_dir=self._tmp, run_id=RUN))[0])
+        na = reconcile(evidence_dir=self._tmp, run_id=RUN,
+                       applicability={spec.check_id: (False, "no concurrent operation")})
+        self.assertTrue(declared_coverage_ok(na)[0])
+
+
 class DeclaredIdentityTests(unittest.TestCase):
     def test_declared_automated_ids_resolve_to_runner_ids(self):
-        for spec in cm.REQUIREMENT_TESTS:
+        for spec in cm.REQUIREMENT_TESTS + cm.SAFETY_TESTS:
             if spec.mode != "automated":
                 continue
             with self.subTest(test_id=spec.test_id):
@@ -313,7 +463,7 @@ class DeclaredIdentityTests(unittest.TestCase):
     def test_declared_specs_are_unique_per_aspect_and_evidence_file(self):
         # Two aspects of one check must never share a (check, aspect) key or an evidence
         # basename (the slug is truncated), or one artifact would overwrite the other.
-        automated = [s for s in cm.REQUIREMENT_TESTS if s.mode == "automated"]
+        automated = [s for s in cm.REQUIREMENT_TESTS + cm.SAFETY_TESTS if s.mode == "automated"]
         keys = [(s.check_id, s.aspect) for s in automated]
         self.assertEqual(len(keys), len(set(keys)), "duplicate (check_id, aspect) declaration")
         files = [(s.check_id, s.evidence_file) for s in automated]
@@ -326,7 +476,7 @@ class DeclaredIdentityTests(unittest.TestCase):
         # that drifted from its declaration would only surface as a missing aspect at the
         # end of a full run. Pin them statically: each declared test carries exactly the
         # evidence metadata its spec names.
-        for spec in cm.REQUIREMENT_TESTS:
+        for spec in cm.REQUIREMENT_TESTS + cm.SAFETY_TESTS:
             if spec.mode != "automated":
                 continue
             with self.subTest(test_id=spec.test_id):

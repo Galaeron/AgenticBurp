@@ -35,14 +35,19 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
     suite in a working tree with no scope set — the fixture host is refused as
     out of scope — so run it with `server.allowed_hosts` including the loopback
     fixture host.
-- **[partial] The coverage ledger under-reports what exists.** `harness/
-  coverage_manifest.py` only has **two** requirements registered (mass assignment
-  and open redirect), so every other requirement is reported as
-  `gap_unimplemented` — which means "not registered in this ledger," **not** "no
-  test exists." Real live validator evidence for many more classes lives in
-  `test_leg_live_verification.py` (above); it just isn't wired into the ledger.
-  Two honest issues remain: the ledger should register the tests that exist, and
-  the coverage report does **not** block (it is a report, not a gate).
+- **[partial] The coverage ledger still under-reports what exists.** `harness/
+  coverage_manifest.py` registers loopback confirm/control tests for **20 of 67**
+  requirements, plus 3 manual-only ones; the other 44 are `gap_unimplemented`,
+  which means "no test registered in this ledger," **not** "no test exists" and
+  never "verified absent." `covered_partial` means one scenario of the
+  requirement passed on an owned loopback fixture in this run, not that the
+  requirement is covered. The smoke and full tiers run
+  `coverage_manifest --check` after their unit tests; it **blocks** when a registered test fails, is
+  skipped, or left no fresh evidence; manual, N/A and unregistered rows do not
+  block. Still unregistered: live tests that need Playwright or sqlmap, slow
+  loopback modules kept out of smoke (write integrity, business flows, exposure
+  leads), and legs with no paired control. The `HS-*` harness safety properties
+  are reported in their own section and are not WSTG coverage.
 - **[open] "Blind" is a misnomer for the committed targets.** `test-target`
   (PixelMart) and `blind-target-2` are developed-against tuning corpora. The only
   genuinely-blind mechanism is `testing/blind-test-kit/` (its target has no
