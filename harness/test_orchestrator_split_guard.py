@@ -36,7 +36,6 @@ OVERSIZED_CEILING = {
     "experiment.py": 1721,
     "coverage_tracker.py": 1707,
     "run_context.py": 1706,
-    "validators/business_flow_validator.py": 1514,
     "validators/auth_sequence_validator.py": 1514,
     "engagement.py": 1446,
     "validators/cross_identity_validator.py": 1381,
