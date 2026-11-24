@@ -15,8 +15,9 @@ from unittest.mock import patch
 
 import harness.transport_inventory as ti
 
-# A target send: the run executor, or the standalone transport_for path.
-_SENDS = re.compile(r"executor\(\)\.execute\(|\btransport_for\(")
+# A target send: the run executor, the standalone transport_for path, or a client from
+# run_context's target client builder.
+_SENDS = re.compile(r"executor\(\)\.execute\(|\btransport_for\(|\b_target_client\(")
 
 
 class InventoryEnforcementTests(unittest.TestCase):
@@ -268,39 +269,62 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertEqual(by_mod["validators/web_cache_poisoning_validator.py"].routing,
                          ti.ROUTING_EXECUTOR)
 
-    @staticmethod
-    def _api_surface_senders(texts):
-        """The api_surface_* modules whose source sends through the executor or transport_for."""
-        return sorted(name for name, text in texts.items()
-                      if _SENDS.search(text))
+    # ARC-9 wave 6 split these registered modules into a facade plus siblings. The
+    # registry must name each file that now holds a send, not only the facade.
+    _ARC9_FAMILIES = {
+        # prefix: (facade, modules expected to send, routing they must be registered with)
+        "api_surface": ("api_surface_discovery.py", ["api_surface_probe.py"], ti.ROUTING_EXECUTOR),
+        "browser_driver": ("browser_driver.py", ["browser_driver_router.py"], ti.ROUTING_ADAPTER),
+        "run_context": ("run_context.py", ["run_context.py", "run_context_sessions.py"],
+                        ti.ROUTING_ADAPTER),
+    }
 
-    def test_arc9_api_surface_sends_are_registered_where_they_live(self):
-        """ARC-9 split api_surface_discovery.py into siblings. The registry must name the
-        file that holds the sends (api_surface_probe.py), as an executor-routed site
-        without its own client, not only the facade that keeps SurfaceDiscovery."""
+    @staticmethod
+    def _senders(texts):
+        """The modules whose source sends through the executor, transport_for or
+        run_context's target client builder."""
+        return sorted(name for name, text in texts.items() if _SENDS.search(text))
+
+    @staticmethod
+    def _family_texts(prefix):
         root = ti.harness_dir()
         texts = {}
         for name in os.listdir(root):
-            if name.startswith("api_surface") and name.endswith(".py"):
+            if name.startswith(prefix) and name.endswith(".py"):
                 with open(os.path.join(root, name), encoding="utf-8") as f:
                     texts[name] = f.read()
-        senders = self._api_surface_senders(texts)
-        self.assertEqual(senders, ["api_surface_probe.py"])
-        by_mod = {s.module: s for s in ti.TRANSPORT_SITES}
-        for name in senders:
-            self.assertIn(name, by_mod, f"{name} sends to the target but is not in TRANSPORT_SITES")
-            self.assertEqual(by_mod[name].routing, ti.ROUTING_EXECUTOR)
-            self.assertFalse(by_mod[name].constructs_client)
+        return texts
 
-    def test_control_a_send_moved_into_another_api_surface_sibling_is_seen(self):
+    def test_arc9_split_sends_are_registered_where_they_live(self):
+        by_mod = {s.module: s for s in ti.TRANSPORT_SITES}
+        for prefix, (facade, expected, routing) in self._ARC9_FAMILIES.items():
+            with self.subTest(family=prefix):
+                senders = self._senders(self._family_texts(prefix))
+                self.assertEqual(senders, expected)
+                for name in senders:
+                    self.assertIn(name, by_mod,
+                                  f"{name} sends to the target but is not in TRANSPORT_SITES")
+                    self.assertEqual(by_mod[name].routing, routing)
+                    self.assertEqual(by_mod[name].scope, by_mod[facade].scope)
+
+    def test_arc9_moved_sends_do_not_build_their_own_client(self):
+        by_mod = {s.module: s for s in ti.TRANSPORT_SITES}
+        for name in ("api_surface_probe.py", "browser_driver_router.py", "run_context_sessions.py"):
+            with self.subTest(module=name):
+                self.assertFalse(by_mod[name].constructs_client)
+
+    def test_control_a_send_moved_into_another_sibling_is_seen(self):
         """Negative control: the sender scan reports a sibling the registry does not name."""
         texts = {"api_surface_probe.py": "await self.run_context.executor().execute(req)",
                  "api_surface_walk.py": "tt, owned = transport_for(None, allowed_hosts=[])",
+                 "browser_driver_hops.py": "client = _rc._target_client(verify=ctx, timeout=5)",
                  "api_surface_discovery.py": "class SurfaceDiscovery: run_context = None"}
-        senders = self._api_surface_senders(texts)
-        self.assertEqual(senders, ["api_surface_probe.py", "api_surface_walk.py"])
+        senders = self._senders(texts)
+        self.assertEqual(senders, ["api_surface_probe.py", "api_surface_walk.py",
+                                   "browser_driver_hops.py"])
         registered = {s.module for s in ti.TRANSPORT_SITES}
-        self.assertEqual([n for n in senders if n not in registered], ["api_surface_walk.py"])
+        self.assertEqual([n for n in senders if n not in registered],
+                         ["api_surface_walk.py", "browser_driver_hops.py"])
 
     def test_summary_is_consistent(self):
         s = ti.summary()
