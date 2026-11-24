@@ -145,7 +145,14 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   owner="astra-identity (T03/T08)",
                   constructs_client=False,
                   note="production role discovery uses the run executor; legacy standalone "
-                       "callers retain a direct compatibility path."),
+                       "callers retain a direct compatibility path. ARC-9: the facade keeps "
+                       "SurfaceDiscovery and its run_context; the sends are in api_surface_probe.py."),
+    TransportSite("api_surface_probe.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="astra-identity (T03/T08)",
+                  constructs_client=False,
+                  note="ARC-9 sibling of api_surface_discovery.py (_ProbeMixin): every probe goes "
+                       "through run_context.executor().execute, or through transport_for for a "
+                       "standalone caller (scope, budget and the connect-time pin apply)."),
     TransportSite("crawler.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (T03/T08)",
                   constructs_client=False,
