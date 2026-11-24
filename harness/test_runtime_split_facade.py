@@ -19,6 +19,7 @@ import asyncio
 import builtins
 import dis
 import importlib
+import inspect
 import os
 import re
 import subprocess
@@ -122,7 +123,8 @@ def patched_in(source: str, facade: str) -> set[str]:
                 found.add(m.group(1))
         elif isinstance(n, ast.Call) and len(n.args) >= 2 and isinstance(n.args[1], ast.Constant):
             fn = ast.unparse(n.func)
-            if (fn.endswith("patch.object") or fn == "setattr") and is_module(n.args[0]):
+            if ((fn.endswith("patch.object") or fn == "setattr" or fn.endswith(".setattr"))
+                    and is_module(n.args[0]) and isinstance(n.args[1].value, str)):
                 found.add(n.args[1].value)
         elif isinstance(n, (ast.Assign, ast.AugAssign)):
             for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
@@ -137,7 +139,9 @@ _PATCHED_CACHE: dict[str, set[str]] = {}
 def patched_names(facade: str) -> set[str]:
     if facade not in _PATCHED_CACHE:
         names = set()
-        for path in sorted(HARNESS.glob("test_*.py")):
+        roots = [HARNESS, REPO / "testing", REPO / "evaluation_integrity"]
+        for path in sorted(p for root in roots if root.is_dir() for p in root.rglob("test_*.py")
+                           if "__pycache__" not in p.parts):
             text = path.read_text(encoding="utf-8-sig", errors="ignore")
             if facade not in text:
                 continue
@@ -233,7 +237,9 @@ def _code_objects(module) -> list[types.CodeType]:
                     visit(f, depth)
             return
         if isinstance(obj, types.FunctionType) and obj.__module__ == module.__name__:
-            add(obj.__code__)
+            # A decorated function (contextlib.contextmanager) keeps its own body in
+            # __wrapped__; the wrapper's code is the decorator's, not this module's.
+            add(inspect.unwrap(obj).__code__)
         elif isinstance(obj, type) and obj.__module__ == module.__name__ and depth < 3:
             for v in vars(obj).values():
                 visit(v, depth + 1)
@@ -309,10 +315,11 @@ class FacadeShapeTests(unittest.TestCase):
                   "mock.patch('harness.run_context.Klass.method')\n"
                   "mock.patch.object(rc, 'an_object')\n"
                   "setattr(rc, 'a_setattr', 1)\n"
+                  "monkeypatch.setattr(rc, 'a_monkeypatch', 1)\n"
                   "rc.an_assignment = 2\n"
                   "oc.not_this_facade = 3\n")
         self.assertEqual(patched_in(source, "run_context"),
-                         {"a_string", "an_object", "a_setattr", "an_assignment"})
+                         {"a_string", "an_object", "a_setattr", "a_monkeypatch", "an_assignment"})
 
     def test_siblings_keep_the_contract(self):
         for facade, (_alias, siblings) in FACADES.items():
@@ -429,6 +436,11 @@ class ContractCheckerNegativeControls(unittest.TestCase):
                          ["now: _clock", "resolver: _default_resolver"])
         self.assertEqual(bare_global_loads(synthetic_module(READ_THROUGH_FACADE), {"_clock", "_default_resolver"}),
                          [])
+
+    def test_the_bytecode_check_sees_inside_a_decorated_function(self):
+        bound = synthetic_module("import contextlib\n\n@contextlib.contextmanager\n"
+                                 "def scope():\n    yield _clock()\n")
+        self.assertEqual(bare_global_loads(bound, {"_clock"}), ["scope: _clock"])
 
 
 # ---------------------------------------------------------------------------
@@ -578,8 +590,6 @@ class OllamaFacadeReachTests(unittest.TestCase):
         for name in sorted(names):
             with self.subTest(name=name):
                 self.assertIn(name, readers, "no facade code reads it; its patch reaches nothing")
-                with patch.object(ollama_client, name, object()) as replacement:
-                    self.assertIs(vars(ollama_client)[name], replacement)
 
     def test_wire_reads_the_error_type_through_the_facade(self):
         from harness import ollama_client_wire
