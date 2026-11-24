@@ -29,7 +29,6 @@ MODULE_LINE_LIMIT = 1200
 OVERSIZED_CEILING = {
     "store.py": 4412,
     "server.py": 2824,
-    "coverage_model.py": 2174,
     "validators/write_integrity_validator.py": 2002,
     "api_surface_discovery.py": 1928,
     "validators/sqlmap.py": 1791,
