@@ -56,69 +56,33 @@ import json
 import logging
 import re
 import secrets
-from dataclasses import dataclass, field as dc_field
-from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
-from harness import naming
 from harness.models import Finding, HttpExchange
 from .base import ValidationResult, Validator
 from .cross_identity_validator import (
-    _PRIVILEGED_ROLE, _auth_signature, _distinct_other_principals, _masked_paths,
-    _object_lock, _principal_for, _source_identity, _stable, _unwrap_envelope)
-from .sequence_validator import _AUTHORITY_RE, _PRIV_FIELDS, _is_priv, _present_privileged
+    _PRIVILEGED_ROLE,
+    _auth_signature,
+    _distinct_other_principals,
+    _masked_paths,
+    _object_lock,
+    _principal_for,
+    _source_identity,
+    _stable,
+)
+# ARC-9: these helpers moved verbatim into sibling modules. The names below are what this
+# module's own code reads, or what callers import from it.
+from .write_integrity_support import (
+    _absent, BUSINESS_RULE_TAMPER, _Case, CREATE_VALIDATION, _created_id, CROSS_IDENTITY_WRITE,
+    _ends_with_id, _field_of, FINDING_CLASSES, _flat, FORGED_AUTHORSHIP, _item_url, _json_object,
+    _KIND_ALIASES, _login_refused, _LOGIN_SENDS, _login_session, _Made, MASS_ASSIGNMENT_CREATE,
+    _number, _object_of, _ok2xx, _PASSWORD_KEY, _pid, _Plan, _polluted, _RATING, _refused,
+    route_set, _run_identities, _same_value, _TAMPER_VALUE, UNAUTHORIZED_UPDATE, _unique_keys,
+)
+from .write_integrity_plans import _PlanningMixin
+from .write_integrity_judges import _JudgingMixin
 
 log = logging.getLogger(__name__)
-
-CROSS_IDENTITY_WRITE = "cross_identity_write"
-FORGED_AUTHORSHIP = "forged_authorship"
-BUSINESS_RULE_TAMPER = "business_rule_tamper"
-MASS_ASSIGNMENT_CREATE = "mass_assignment_create"
-CREATE_VALIDATION = "create_validation"
-# R11-5: an update of one object sent by a principal who should not be able to
-# make it (anonymous, or the capture's own non-owner session), read back as the
-# object's owner or an admin, and written back.
-UNAUTHORIZED_UPDATE = "unauthorized_update"
-KINDS = (CROSS_IDENTITY_WRITE, FORGED_AUTHORSHIP, BUSINESS_RULE_TAMPER,
-         MASS_ASSIGNMENT_CREATE, CREATE_VALIDATION, UNAUTHORIZED_UPDATE)
-
-_KIND_ALIASES = {
-    CROSS_IDENTITY_WRITE: {"cross_identity_write", "cross_identity_create", "cross_user_write",
-                           "bola_write", "idor_write", "foreign_reference_write"},
-    FORGED_AUTHORSHIP: {"forged_authorship", "authorship_forgery", "author_spoofing",
-                        "forged_owner", "owner_spoofing", "impersonated_write"},
-    BUSINESS_RULE_TAMPER: {"business_rule_tamper", "business_rule_bypass", "numeric_tamper",
-                           "negative_quantity", "quantity_tampering", "rating_tampering",
-                           "out_of_bounds_value", "negative_total"},
-    MASS_ASSIGNMENT_CREATE: {"mass_assignment_create", "mass_assignment_at_create",
-                             "registration_mass_assignment"},
-    CREATE_VALIDATION: {"create_validation", "weak_create_validation", "duplicate_registration",
-                        "empty_required_fields", "missing_required_field_validation"},
-    UNAUTHORIZED_UPDATE: {"unauthorized_update", "unauthorized_write", "unauthenticated_write",
-                          "missing_write_authorization", "write_authorization_bypass"},
-}
-FINDING_CLASSES = {a for aliases in _KIND_ALIASES.values() for a in aliases} | {
-    "write_integrity", "business_logic", "business logic", "mass_assignment", "mass assignment"}
-
-# An identifier segment in a path: a number, a long hex string or a uuid.
-_ID_SEGMENT = re.compile(r"^(\d+|[0-9a-fA-F]{8,}|[0-9a-fA-F]{8}-[0-9a-fA-F-]{4,})$")
-_ID_SUFFIX = re.compile(r"(?:_id|-id|Id|ID|id)$")
-_ID_KEYS = frozenset({"id", "_id", "uuid", "guid"})
-# A reference to a person (forged_authorship), never an owned-object reference.
-_PERSON_STEMS = frozenset({
-    "user", "owner", "author", "customer", "account", "member", "creator", "poster",
-    "sender", "reviewer", "createdby", "postedby", "submittedby", "writtenby", "authoredby"})
-_QUANTITY = re.compile(r"^(qty|quantity|quantities|count|units|pieces|itemcount|numitems)$")
-_RATING = re.compile(r"^(rating|ratings|stars?|score|grade)$")
-_MONEY = re.compile(r"^(price|unitprice|cost|total|subtotal|amount|ordertotal|grandtotal)$")
-_TEXT_KEY = re.compile(r"^(comment|message|description|title|text|body|content|note|notes|"
-                       r"subject|review|name)$")
-_UNIQUE_KEY = re.compile(r"^(e?mail|emailaddress|username|login|handle|nick|nickname)$")
-_EMAILISH = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_TAMPER_VALUE = -1   # out of bounds for any quantity, rating, price or total
-
-
-def _flat(key) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(key).lower())
 
 
 def _kind_of(finding: Finding, exchange: HttpExchange) -> str | None:
@@ -160,287 +124,11 @@ def chain_routes(vulnerability_class: str, exchange: HttpExchange) -> bool:
     return _value_field(body) is None and bool(WriteIntegrityValidator._tamper_field(body)[0])
 
 
-def _ends_with_id(url: str) -> bool:
-    segments = [s for s in urlsplit(url or "").path.split("/") if s]
-    return bool(segments) and bool(_ID_SEGMENT.match(segments[-1]))
-
-
 def _is_create(exchange: HttpExchange) -> bool:
     return (exchange.method or "").upper() == "POST" and not _ends_with_id(exchange.url)
 
 
-def _json_object(text):
-    try:
-        obj = json.loads(text) if isinstance(text, str) else None
-    except (TypeError, ValueError):
-        return None
-    return obj if isinstance(obj, dict) else None
-
-
-def _ref_stem(key) -> str:
-    """The object type a reference field names ("BasketId" -> "basket"), else ""."""
-    key = str(key)
-    if _flat(key) in _ID_KEYS or not _ID_SUFFIX.search(key):
-        return ""
-    base = _ID_SUFFIX.sub("", key).rstrip("_-")
-    return naming.object_key(base) if base else ""
-
-
-def _number(value):
-    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
-
-
-def _same_value(a, b) -> bool:
-    if _number(a) is not None and _number(b) is not None:
-        return float(a) == float(b)
-    return a is not None and b is not None and str(a) == str(b)
-
-
-def _field_of(obj, key):
-    """`obj[key]`, matched case- and separator-insensitively; (found, value)."""
-    if not isinstance(obj, dict):
-        return False, None
-    if key in obj:
-        return True, obj[key]
-    want = _flat(key)
-    for k, v in obj.items():
-        if _flat(k) == want:
-            return True, v
-    return False, None
-
-
-def _uniquify(body: dict, tag: str) -> tuple[dict, str]:
-    """A copy of a create body that cannot collide with an existing object (unique
-    email/username values get the tag) and carries the tag in a free-text field
-    so the created object can be found again. Returns (body, marker)."""
-    out, marker = dict(body), ""
-    for k, v in body.items():
-        if not isinstance(v, str) or not v:
-            continue
-        flat = _flat(k)
-        if _UNIQUE_KEY.match(flat):
-            if "@" in v:
-                local, domain = v.rsplit("@", 1)
-                out[k] = f"wi{tag}.{local[:24]}@{domain}"
-            else:
-                out[k] = f"{v[:24]}_wi{tag}"
-            marker = marker or out[k]
-        elif _TEXT_KEY.match(flat):
-            out[k] = f"{v[:80]} wi{tag}"
-            marker = marker or f"wi{tag}"
-    return out, marker
-
-
-def _unique_keys(body: dict) -> list[str]:
-    return [k for k, v in body.items() if isinstance(v, str) and v and _UNIQUE_KEY.match(_flat(k))]
-
-
-def _created_id(outcome) -> str:
-    """The id of the object a create answered with: from the (enveloped) JSON
-    body, else from the Location header. "" when neither names one."""
-    try:
-        doc = json.loads(outcome.body or "")
-    except (TypeError, ValueError):
-        doc = None
-    obj = _unwrap_envelope(doc) if isinstance(doc, dict) else None
-    if isinstance(doc, dict) and isinstance(doc.get("data"), dict):
-        obj = doc["data"]
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if _flat(k) in _ID_KEYS and isinstance(v, (int, str)) and not isinstance(v, bool) and str(v):
-                return str(v)
-    headers = {str(k).lower(): v for k, v in (getattr(outcome, "headers", None) or {}).items()}
-    location = headers.get("location") or ""
-    last = [s for s in urlsplit(location).path.split("/") if s]
-    return last[-1] if last and _ID_SEGMENT.match(last[-1]) else ""
-
-
-def route_set(routes) -> set[tuple[str, str]]:
-    """("METHOD", "/template") pairs from route strings such as
-    "DELETE /api/things/{id}" (the route inventory and restore_routes form)."""
-    known = set()
-    for route in routes or ():
-        parts = str(route).split(None, 1)
-        if len(parts) == 2:
-            known.add((parts[0].upper(), parts[1].strip().rstrip("/").lower()))
-    return known
-
-
-def _item_url(collection_url: str, oid: str) -> str:
-    parts = urlsplit(collection_url)
-    return urlunsplit((parts.scheme, parts.netloc,
-                       parts.path.rstrip("/") + "/" + quote(str(oid), safe=""), "", ""))
-
-
-def _object_of(outcome):
-    if outcome is None or not outcome.ok or not 200 <= (outcome.status or 0) < 300:
-        return None
-    try:
-        doc = json.loads(outcome.body or "")
-    except (TypeError, ValueError):
-        return None
-    if isinstance(doc, dict) and isinstance(doc.get("data"), dict):
-        doc = doc["data"]
-    obj = _unwrap_envelope(doc) if isinstance(doc, dict) else None
-    return obj if isinstance(obj, dict) and obj else None
-
-
-def _absent(outcome) -> bool:
-    """A verification read shows the object is gone."""
-    if outcome is None or not outcome.ok:
-        return False
-    if outcome.status in (404, 410):
-        return True
-    if 200 <= (outcome.status or 0) < 300:
-        text = (outcome.body or "").strip()
-        if text in ("", "null", "{}", "[]"):
-            return True
-        doc = _json_object(text)
-        return isinstance(doc, dict) and "data" in doc and doc["data"] in (None, {}, [])
-    return False
-
-
-def _ok2xx(outcome) -> bool:
-    return outcome is not None and outcome.ok and 200 <= (outcome.status or 0) < 300
-
-
-def _refused(outcome) -> bool:
-    return outcome is not None and outcome.ok and 400 <= (outcome.status or 0) < 500
-
-
-@dataclass
-class _Made:
-    """One create this case sent, and what became of it."""
-    label: str
-    url: str
-    body: dict
-    marker: str = ""
-    sent: object = None
-    item: str = ""
-    read: object = None
-    obj: dict | None = None
-    undo: object = None
-    check: object = None
-    restored: bool | None = None   # None: nothing was created, nothing to undo
-    done: bool = False
-    # The exact body text when it is not json.dumps(body): a duplicate-key body.
-    raw: str | None = None
-    left: bool = False             # created and deliberately left in place (opt-in)
-    # Login read-back of a self-service sign-up (opt-in path only): the login body
-    # with the credentials this create submits, the before/after/wrong-password
-    # login outcomes, and what they showed: "stored" (fails before, succeeds after,
-    # a wrong password fails), "existing" (already logs in before the create),
-    # "not_stored" (fails before and after), "unsure" (with `login_why`).
-    login: dict | None = None
-    logins: dict = dc_field(default_factory=dict)
-    login_result: str = ""
-    login_why: str = ""
-    account: str = ""              # how a stored account with no object URL is named
-
-    @property
-    def status(self):
-        return getattr(self.sent, "status", None)
-
-
-@dataclass
-class _Case:
-    finding: Finding
-    exchange: HttpExchange
-    kind: str
-    case_ref: str
-    actor: dict | None
-    idents: list
-    headers: dict
-    body: dict
-    others: list = dc_field(default_factory=list)
-    # A self-service create with no DELETE route, run only under the owner's opt-in
-    # (validators.write_integrity.allow_unrestorable_self_service_creates).
-    unrestorable: bool = False
-
-
-@dataclass
-class _Plan:
-    control: _Made
-    attacks: list
-    field: str = ""
-    detail: str = ""
-    forged: object = None
-    own: object = None
-    other: dict | None = None
-    # cross_identity_write: parameter-pollution forms of the attack, each sent only
-    # when no earlier attack landed and the case's mutating headroom still pays for
-    # it and the deletes it may need. `sent` lists those sent, `unsent` why not.
-    variants: list = dc_field(default_factory=list)
-    sent: list = dc_field(default_factory=list)
-    unsent: list = dc_field(default_factory=list)
-    # create_validation on the opt-in path: the observed login a refused or
-    # unreadable sign-up is read back through, or why none was used.
-    login_url: str = ""
-    login_source: str = ""
-    login_note: str = ""
-    login_keys: tuple = ()         # (identifier key, password key) of the login body
-
-
-# A login among the routes a run observed (the route inventory or a captured
-# exchange); a path is never guessed. Registration and logout paths are not logins.
-_LOGIN_PATH = re.compile(r"(?:^|/)(?:log[-_]?in|sign[-_]?in|log[-_]?on|authenticate|sessions?)(?:/|$|\.)",
-                         re.I)
-_NOT_LOGIN_PATH = re.compile(r"regist|sign[-_]?up|log[-_]?out|sign[-_]?out|reset|forgot|change", re.I)
-_LOGIN_SENDS = 3   # before the create, after it, and the wrong-password control
-
-
-def _login_session(outcome) -> str:
-    """What a 2xx login issued -- "a token in the JSON field 'token'", "a session
-    cookie (sid)" -- or "" when it issued neither. Never the value."""
-    if not _ok2xx(outcome):
-        return ""
-    from types import SimpleNamespace
-    from .auth_sequence_validator import _SESSION_COOKIE_RE, _login_token
-    headers = {str(k).lower(): v for k, v in (getattr(outcome, "headers", None) or {}).items()}
-    minted = _login_token(SimpleNamespace(text=outcome.body or "", headers=headers))
-    if minted is not None:
-        return "a token in " + minted[0].removeprefix("the ")
-    names = re.findall(r"(?:^|,\s*|\n)([^=;,\s]+)=", str(headers.get("set-cookie") or ""))
-    session = [n for n in names if _SESSION_COOKIE_RE.search(n)]
-    return f"a session cookie ({', '.join(session)})" if session else ""
-
-
-def _login_refused(outcome) -> bool:
-    """An answered login that issued no session or token (a 5xx or no answer is
-    not a refusal: it says nothing about the credentials)."""
-    return (outcome is not None and outcome.ok and outcome.status is not None
-            and outcome.status < 500 and not _login_session(outcome))
-
-
-_VARIANT_WORDS = {
-    "dup-own-first": "a duplicate key (the writer's value first, the foreign value last)",
-    "dup-foreign-first": "a duplicate key (the foreign value first, the writer's value last)",
-    "array": "an array holding both values",
-}
-_PASSWORD_KEY = re.compile(r"^(password|passwd|pwd|passphrase|pass|newpassword)$")
-
-
-def _polluted(body: dict, key: str, first, last) -> str:
-    """`body` as JSON text carrying `key` twice: `first` in the key's own place and
-    `last` appended as the final member. json.dumps cannot write a duplicate key,
-    so the second member is spliced in as text; the result is valid JSON whose
-    meaning depends on which duplicate the server's parser (and its checks) keep."""
-    head = json.dumps({**body, key: first})
-    tail = f"{json.dumps(key)}: {json.dumps(last)}"
-    return head[:-1] + (", " if len(head) > 2 else "") + tail + "}"
-
-
-def _run_identities(run) -> list[dict]:
-    return [{"name": s.name or s.principal_id, "role": s.role, "headers": dict(s.headers),
-             "session_ref": s.session_id, "principal_id": s.principal_id, "principal": s.principal}
-            for s in run.sessions.identities() if s.principal_id != "anonymous"]
-
-
-def _pid(ident: dict | None) -> str:
-    return _principal_for(ident).id if ident else "anonymous"
-
-
-class WriteIntegrityValidator(Validator):
+class WriteIntegrityValidator(_PlanningMixin, _JudgingMixin, Validator):
     name = "write_integrity"
     finding_classes = FINDING_CLASSES
     active = True
@@ -621,49 +309,6 @@ class WriteIntegrityValidator(Validator):
     # it back: it must fail before the create, succeed after it with a session or a
     # token, and a wrong password must still fail.
 
-    @staticmethod
-    def _login_keys(body: dict) -> tuple[str, str]:
-        """(identifier key, password key) of a login or sign-up body ("" when absent)."""
-        ident = next((k for k in body if _UNIQUE_KEY.match(_flat(k))), "")
-        password = next((k for k in body if _PASSWORD_KEY.match(_flat(k))), "")
-        return ident, password
-
-    def _login_target(self, case: _Case) -> tuple[str, dict | None, str]:
-        """(url, captured login body or None, where it was observed) of a login the
-        run observed on the sign-up's origin: a captured login exchange first, then a
-        POST route in the route inventory. ("", None, "") when it observed none."""
-        parts = urlsplit(case.exchange.url)
-        origin = f"{parts.scheme}://{parts.netloc}"
-
-        def is_login(path: str) -> bool:
-            return bool(_LOGIN_PATH.search(path)) and not _NOT_LOGIN_PATH.search(path)
-
-        context = getattr(self.run_context, "experiment_context", None)
-        captured = (context.get("captured") if isinstance(context, dict) else None) or ()
-        for item in list(captured)[:500]:
-            def get(key, _item=item):
-                return _item.get(key) if isinstance(_item, dict) else getattr(_item, key, None)
-            p = urlsplit(str(get("url") or ""))
-            if (str(get("method") or "").upper() != "POST" or f"{p.scheme}://{p.netloc}" != origin
-                    or not is_login(p.path)):
-                continue
-            body = _json_object(get("request_body"))
-            if body and all(self._login_keys(body)):
-                return (urlunsplit((p.scheme, p.netloc, p.path, p.query, "")), body,
-                        f"a captured login (POST {p.path})")
-        for route in self._route_entries():
-            bits = str(route).split(None, 1)
-            if len(bits) != 2 or bits[0].upper() != "POST":
-                continue
-            path = bits[1].strip()
-            if path.lower().startswith(("http://", "https://")):
-                p = urlsplit(path)
-                if f"{p.scheme}://{p.netloc}" != origin:
-                    continue
-                path = p.path
-            if path.startswith("/") and "{" not in path and is_login(path):
-                return origin + path, None, f"the route inventory (POST {path})"
-        return "", None, ""
 
     def _plan_logins(self, case: _Case, plan: _Plan) -> None:
         """Arm the login read-back for each attack whose credential pair no other create
@@ -764,186 +409,6 @@ class WriteIntegrityValidator(Validator):
 
     # -- per-class plans ---------------------------------------------------------
 
-    def _others_refs(self, principal_id: str) -> dict[str, list[str]]:
-        """{object type: [ids]} of the objects the run knows `principal_id` owns:
-        operator declarations first, then self-observed ownership."""
-        refs: dict[str, list[str]] = {}
-        ledger = self.ownership
-        if ledger is not None and hasattr(ledger, "owned_objects"):
-            for collection, oid in ledger.owned_objects(principal_id):
-                refs.setdefault(naming.object_key(collection), []).append(oid)
-        observed = getattr(self.run_context, "self_ownership", None)
-        if observed is not None and hasattr(observed, "owned_objects"):
-            for stem, oid in observed.owned_objects(principal_id):
-                if oid not in refs.setdefault(stem, []):
-                    refs[stem].append(oid)
-        return refs
-
-    def _account_ids(self, principal_id: str) -> list[str]:
-        ids = list(self._others_refs(principal_id).get("user", []))
-        observed = getattr(self.run_context, "self_ownership", None)
-        if observed is not None and hasattr(observed, "account_ids"):
-            ids += [i for i in observed.account_ids(principal_id) if i not in ids]
-        return ids
-
-    def _plan_cross_identity(self, case: _Case):
-        if case.actor is None:
-            return "needs the capture to be an authenticated, registered session"
-        if not case.others:
-            return "no distinct non-privileged principal is registered"
-        own = self._others_refs(_pid(case.actor))
-        url = case.exchange.url
-        for other in case.others:
-            theirs = self._others_refs(_pid(other))
-            for key, value in case.body.items():
-                stem = _ref_stem(key)
-                if not stem or stem in _PERSON_STEMS or not isinstance(value, (int, str)) or isinstance(value, bool):
-                    continue
-                candidates = [o for o in theirs.get(stem, ()) if str(o) != str(value)
-                              and str(o) not in own.get(stem, ())]
-                if not candidates:
-                    continue
-                forged = int(candidates[0]) if isinstance(value, int) and candidates[0].isdigit() else candidates[0]
-                ctl_body, ctl_marker = _uniquify(case.body, "c" + secrets.token_hex(4))
-                atk_body, atk_marker = _uniquify(case.body, "a" + secrets.token_hex(4))
-                atk_body[key] = forged
-                # Parameter pollution: an ownership check and the code that stores the
-                # reference may read different members of a duplicate key, or one
-                # element of an array, so the same foreign reference is also tried
-                # alongside the writer's own one, in both orders.
-                variants = []
-                for label, first, last in (("dup-own-first", value, forged),
-                                           ("dup-foreign-first", forged, value)):
-                    v_body, v_marker = _uniquify(case.body, "v" + secrets.token_hex(4))
-                    raw = _polluted(v_body, key, first, last)
-                    variants.append(_Made(label, url, json.loads(raw), v_marker, raw=raw))
-                v_body, v_marker = _uniquify(case.body, "v" + secrets.token_hex(4))
-                variants.append(_Made("array", url, {**v_body, key: [value, forged]}, v_marker))
-                return _Plan(_Made("control", url, ctl_body, ctl_marker),
-                             [_Made("attack", url, atk_body, atk_marker)], field=key,
-                             forged=forged, own=value, other=other, variants=variants,
-                             detail=f"{key}: {value!r} -> {_pid(other)}'s {stem} {forged!r}")
-            parts = urlsplit(url)
-            segments = parts.path.split("/")
-            for i in range(1, len(segments)):
-                if not _ID_SEGMENT.match(segments[i] or "") or not segments[i - 1]:
-                    continue
-                stem = naming.object_key(segments[i - 1])
-                candidates = [o for o in theirs.get(stem, ()) if str(o) != segments[i]
-                              and str(o) not in own.get(stem, ())]
-                if not candidates:
-                    continue
-                swapped = urlunsplit((parts.scheme, parts.netloc,
-                                      "/".join(segments[:i] + [candidates[0]] + segments[i + 1:]),
-                                      parts.query, ""))
-                ctl_body, ctl_marker = _uniquify(case.body, "c" + secrets.token_hex(4))
-                atk_body, atk_marker = _uniquify(case.body, "a" + secrets.token_hex(4))
-                return _Plan(_Made("control", url, ctl_body, ctl_marker),
-                             [_Made("attack", swapped, atk_body, atk_marker)],
-                             field=stem + "Id", forged=candidates[0], own=segments[i], other=other,
-                             detail=f"path {segments[i - 1]}/{segments[i]} -> "
-                                    f"{_pid(other)}'s {stem} {candidates[0]}")
-        return ("the create carries no reference to an object type another registered principal "
-                "is known to own (declare ownership, or enable authz.self_observed_ownership)")
-
-    def _plan_authorship(self, case: _Case):
-        if case.actor is None:
-            return "needs the capture to be an authenticated, registered session"
-        for key, value in case.body.items():
-            forged, whose = self._forge_author(case, key, value)
-            if forged is None:
-                continue
-            ctl_body, ctl_marker = _uniquify(case.body, "c" + secrets.token_hex(4))
-            atk_body, atk_marker = _uniquify(case.body, "a" + secrets.token_hex(4))
-            atk_body[key] = forged
-            return _Plan(_Made("control", case.exchange.url, ctl_body, ctl_marker),
-                         [_Made("attack", case.exchange.url, atk_body, atk_marker)], field=key,
-                         forged=forged, own=value,
-                         detail=f"{key}: {value!r} -> {forged!r} ({whose})")
-        return ("the create carries no author/owner/user field whose value can be replaced by "
-                "another principal's known identifier")
-
-    def _forge_author(self, case: _Case, key, value):
-        """(forged value, whose) for an author/owner/user field `key`, or (None, "")
-        when `key` is not one or no other identity's value is known."""
-        base = _flat(_ID_SUFFIX.sub("", str(key)) if _ref_stem(key) else key)
-        if base not in _PERSON_STEMS or value in (None, "") or isinstance(value, bool):
-            return None, ""
-        forged, whose = None, ""
-        if _number(value) is not None or (isinstance(value, str) and value.isdigit()):
-            for other in case.others:
-                ids = [i for i in self._account_ids(_pid(other)) if str(i) != str(value)]
-                if ids:
-                    forged = int(ids[0]) if isinstance(value, int) and ids[0].isdigit() else ids[0]
-                    whose = _pid(other)
-                    break
-        elif isinstance(value, str):
-            other = case.others[0] if case.others else None
-            name = (other or {}).get("name") or ""
-            if _EMAILISH.match(value):
-                forged = name if _EMAILISH.match(name) else f"wi-{secrets.token_hex(4)}@example.com"
-            else:
-                forged = name if name and name != value else f"wi-{secrets.token_hex(4)}"
-            whose = _pid(other) if forged == name else "a fabricated identity"
-        if forged is None or _same_value(forged, value):
-            return None, ""
-        return forged, whose
-
-    @staticmethod
-    def _tamper_field(obj: dict) -> tuple[str, str]:
-        """(field, kind) of the business number to tamper with, or ("", "")."""
-        for regex, label in ((_QUANTITY, "quantity"), (_RATING, "rating"), (_MONEY, "price/total")):
-            for key, value in obj.items():
-                if regex.match(_flat(key)) and (_number(value) or 0) > 0:
-                    return key, label
-        return "", ""
-
-    def _plan_tamper(self, case: _Case):
-        key, label = self._tamper_field(case.body)
-        if not key:
-            return ("no positive quantity, rating, price or total field in the create "
-                    "(discount-code reuse and expiry are not attempted: they need an "
-                    "operator-declared spent code)")
-        ctl_body, ctl_marker = _uniquify(case.body, "c" + secrets.token_hex(4))
-        atk_body, atk_marker = _uniquify(case.body, "a" + secrets.token_hex(4))
-        atk_body[key] = _TAMPER_VALUE
-        return _Plan(_Made("control", case.exchange.url, ctl_body, ctl_marker),
-                     [_Made("attack", case.exchange.url, atk_body, atk_marker)], field=key,
-                     forged=_TAMPER_VALUE, own=case.body[key],
-                     detail=f"{label} {key}: {case.body[key]!r} -> {_TAMPER_VALUE}")
-
-    def _plan_mass_assignment(self, case: _Case):
-        fields = {f: v for f, v in _PRIV_FIELDS.items()
-                  if _field_of(case.body, f)[0] is False}
-        if not fields:
-            return "the create already sets every privileged field this check would add"
-        ctl_body, ctl_marker = _uniquify(case.body, "c" + secrets.token_hex(4))
-        atk_body, atk_marker = _uniquify(case.body, "a" + secrets.token_hex(4))
-        atk_body.update(fields)
-        return _Plan(_Made("control", case.exchange.url, ctl_body, ctl_marker),
-                     [_Made("attack", case.exchange.url, atk_body, atk_marker)],
-                     field=",".join(sorted(fields)), forged=fields,
-                     detail="added " + ", ".join(sorted(fields)))
-
-    def _plan_validation(self, case: _Case):
-        url = case.exchange.url
-        unique = _unique_keys(case.body)
-        texts = [k for k, v in case.body.items() if isinstance(v, str) and v]
-        if not texts:
-            return "the create has no non-empty string field to empty and no unique field to duplicate"
-        ctl_body, ctl_marker = _uniquify(case.body, "c" + secrets.token_hex(4))
-        attacks = []
-        if unique:
-            tag = "d" + secrets.token_hex(4)
-            dup_body, dup_marker = _uniquify(case.body, tag)
-            attacks += [_Made("duplicate-first", url, dup_body, dup_marker),
-                        _Made("duplicate-second", url, dict(dup_body), dup_marker)]
-        empty = {k: ("" if isinstance(v, str) else v) for k, v in case.body.items()}
-        attacks.append(_Made("empty", url, empty, ""))
-        return _Plan(_Made("control", url, ctl_body, ctl_marker), attacks,
-                     field=",".join(texts),
-                     detail=(f"duplicate on {', '.join(unique)}; " if unique else "")
-                            + f"emptied {', '.join(texts)}")
 
     # -- the create engine ---------------------------------------------------------
 
@@ -957,35 +422,6 @@ class WriteIntegrityValidator(Validator):
             capability=self.name, session_ref=(who or {}).get("session_ref"),
             case_ref=case.case_ref, allow_cancelled_cleanup=cleanup)
 
-    def _readers(self, case: _Case) -> list:
-        """Who may read back or delete what this case created: the writer first,
-        then every other registered identity (a created account is often readable
-        and deletable only by an administrator)."""
-        out, seen = [case.actor], {(case.actor or {}).get("session_ref")}
-        for ident in case.idents:
-            if ident.get("session_ref") not in seen:
-                seen.add(ident.get("session_ref"))
-                out.append(ident)
-        return out
-
-    async def _find_by_marker(self, case: _Case, made: _Made, *, cleanup: bool) -> str:
-        if not made.marker:
-            return ""
-        listing = await self._send(case, "GET", made.url, cleanup=cleanup)
-        if not _ok2xx(listing):
-            return ""
-        try:
-            doc = json.loads(listing.body or "")
-        except (TypeError, ValueError):
-            return ""
-        items = doc if isinstance(doc, list) else next(
-            (v for v in (doc or {}).values() if isinstance(v, list)), []) if isinstance(doc, dict) else []
-        for item in items:
-            if isinstance(item, dict) and made.marker in json.dumps(item):
-                oid = next((str(v) for k, v in item.items() if _flat(k) in _ID_KEYS and str(v)), "")
-                if oid:
-                    return _item_url(made.url, oid)
-        return ""
 
     async def _create(self, case: _Case, made: _Made) -> None:
         made.sent = await self._send(case, "POST", made.url, made.body, raw=made.raw)
@@ -1046,19 +482,6 @@ class WriteIntegrityValidator(Validator):
             if _refused(made.undo):
                 denied.add(_pid(who))
 
-    def _record(self, case: _Case, made: _Made) -> None:
-        artifact = getattr(made.sent, "artifact_id", "") if made.sent is not None else ""
-        if not artifact or made.restored is None:
-            return
-        detail = (f"write_integrity {made.label} create deleted and verified gone ({made.item})"
-                  if made.restored else
-                  f"write_integrity {made.label} create NOT removed: {made.item or made.url} "
-                  f"(delete HTTP {getattr(made.undo, 'status', None)})")
-        try:
-            from harness import run_handoff
-            run_handoff.mark_restore(self.run_context, [artifact], ok=bool(made.restored), detail=detail)
-        except Exception:
-            log.debug("write_integrity: mark_restore failed", exc_info=True)
 
     async def _run_creates(self, case: _Case, plan: _Plan) -> ValidationResult:
         made: list[_Made] = []
@@ -1178,30 +601,6 @@ class WriteIntegrityValidator(Validator):
 
     # -- cross-identity parameter pollution ------------------------------------------
 
-    @staticmethod
-    def _stored_ref(plan: _Plan, obj: dict):
-        """(found, value) of the reference field `plan` forged, in a read-back."""
-        found, stored = _field_of(obj, plan.field)
-        if not found:
-            stem = naming.object_key(_ID_SUFFIX.sub("", plan.field) or plan.field)
-            found, stored = next(((True, v) for k, v in obj.items() if _ref_stem(k) == stem),
-                                 (False, None))
-        return found, stored
-
-    def _landed(self, plan: _Plan, made: _Made) -> bool:
-        """The read-back of `made` stores the foreign reference: the object landed on
-        the other principal's object (the only confirmation a variant gets)."""
-        if made.obj is None or plan.other is None:
-            return False
-        found, stored = self._stored_ref(plan, made.obj)
-        return bool(found) and _same_value(stored, plan.forged)
-
-    def _deleter(self, case: _Case, plan: _Plan, made: _Made):
-        """Whose sessions delete `made` first: the other principal when the object
-        landed on its object, the writer for a variant, else the default order."""
-        if case.kind == CROSS_IDENTITY_WRITE and self._landed(plan, made):
-            return plan.other
-        return case.actor if any(made is v for v in plan.sent) else None
 
     async def _send_variants(self, case: _Case, plan: _Plan, made: list) -> None:
         """Send the pollution variants one at a time, each only while the case's
@@ -1230,160 +629,9 @@ class WriteIntegrityValidator(Validator):
                                 for x in plan.variants[i + 1:]]
                 return
 
-    def _judge_cross_identity(self, case: _Case, plan: _Plan):
-        status, summary, outcome = self._judge_reference(case, plan)
-        if status == "confirmed" or not (plan.sent or plan.unsent):
-            return status, summary, outcome
-        plain = plan.attacks[0]
-        landed = next((v for v in plan.sent if self._landed(plan, v)), None)
-        if landed is not None:
-            _, stored = self._stored_ref(plan, landed.obj)
-            how = (f"refused (HTTP {plain.status})" if _refused(plain.sent) else
-                   "bound to the writer's own object" if _ok2xx(plain.sent) else
-                   f"answered HTTP {plain.status}")
-            return ("confirmed", f"Cross-identity write by parameter pollution: {_pid(case.actor)!r} "
-                                 f"created an object bound to {_pid(plan.other)!r}'s object by sending "
-                                 f"{_VARIANT_WORDS.get(landed.label, landed.label)} ({plan.detail}; "
-                                 f"HTTP {landed.status}); the read-back stores {plan.field}={stored!r}, "
-                                 f"while the plain foreign reference was {how}", "")
-        notes = []
-        if plan.sent:
-            notes.append("parameter-pollution variants did not land ("
-                         + ", ".join(f"{v.label}: HTTP {v.status}" for v in plan.sent) + ")")
-        if plan.unsent:
-            notes.append("not sent: " + "; ".join(plan.unsent))
-        lead = next((v for v in plan.sent if _ok2xx(v.sent) and v.obj is None), None)
-        if lead is not None:
-            return ("supported", f"LEAD: the server accepted {_VARIANT_WORDS.get(lead.label, lead.label)} "
-                                 f"carrying {_pid(plan.other)!r}'s reference ({plan.detail}) but the "
-                                 f"created object could not be read back; " + "; ".join(notes), "")
-        # The plain reference's verdict stands; the summary names what else was tried
-        # and what the headroom could not pay for.
-        return status, summary + "; " + "; ".join(notes), outcome
 
     # -- verdicts --------------------------------------------------------------------
 
-    def _judge_reference(self, case: _Case, plan: _Plan):
-        """cross_identity_write, forged_authorship, business_rule_tamper: the attack
-        sent one forged value; the verdict is what the server stored for it."""
-        attack = plan.attacks[0]
-        what = {CROSS_IDENTITY_WRITE: "a reference to another principal's object",
-                FORGED_AUTHORSHIP: "an author/owner value that is not the writer's",
-                BUSINESS_RULE_TAMPER: "an out-of-range value"}[case.kind]
-        if _refused(attack.sent):
-            return ("not_confirmed", f"The server refused a create carrying {what} "
-                                     f"(HTTP {attack.status}; {plan.detail}) while the legitimate "
-                                     f"create succeeded", "control_held")
-        if not _ok2xx(attack.sent):
-            return "inconclusive", f"The attack create returned HTTP {attack.status}", ""
-        if attack.obj is None:
-            return ("supported", f"LEAD: the server accepted a create carrying {what} "
-                                 f"({plan.detail}) but the created object could not be read back", "")
-        found, stored = _field_of(attack.obj, plan.field)
-        if not found and case.kind == CROSS_IDENTITY_WRITE:
-            stem = naming.object_key(_ID_SUFFIX.sub("", plan.field) or plan.field)
-            found, stored = next(((True, v) for k, v in attack.obj.items() if _ref_stem(k) == stem),
-                                 (False, None))
-        if not found:
-            return ("supported", f"LEAD: the server accepted a create carrying {what} "
-                                 f"({plan.detail}); the read-back does not show {plan.field!r}", "")
-        if _same_value(stored, plan.forged):
-            summary = {
-                CROSS_IDENTITY_WRITE: f"Cross-identity write: {_pid(case.actor)!r} created an object "
-                                      f"bound to {_pid(plan.other)!r}'s object ({plan.detail}); the "
-                                      f"read-back stores {plan.field}={stored!r}",
-                FORGED_AUTHORSHIP: f"Forged authorship: {_pid(case.actor)!r} created an object whose "
-                                   f"{plan.field} reads back as {stored!r}, not the writer "
-                                   f"({plan.detail})",
-                BUSINESS_RULE_TAMPER: f"Business-rule tampering: the server stored {plan.field}="
-                                      f"{stored!r} ({plan.detail}); the legitimate create stored "
-                                      f"{_field_of(plan.control.obj, plan.field)[1]!r}",
-            }[case.kind]
-            return "confirmed", summary, ""
-        held = {CROSS_IDENTITY_WRITE: "the server bound the reference to the writer's own object",
-                FORGED_AUTHORSHIP: "the server bound authorship to the session",
-                BUSINESS_RULE_TAMPER: "the server normalized the value"}[case.kind]
-        return ("not_confirmed", f"The server accepted the create but {held}: the read-back stores "
-                                 f"{plan.field}={stored!r}, not {plan.forged!r}", "control_held")
-
-    def _judge_mass_assignment(self, case: _Case, plan: _Plan):
-        attack = plan.attacks[0]
-        if _refused(attack.sent):
-            return ("not_confirmed", f"The server refused a create carrying privileged fields "
-                                     f"(HTTP {attack.status}) while the plain create succeeded",
-                    "control_held")
-        if not _ok2xx(attack.sent):
-            return "inconclusive", f"The attack create returned HTTP {attack.status}", ""
-        if attack.obj is None:
-            return ("supported", "LEAD: the server accepted a create carrying privileged fields but "
-                                 "the created object could not be read back", "")
-        stored = sorted(f for f, v in plan.forged.items()
-                        if _present_privileged(attack.obj, f, v)
-                        and not _present_privileged(plan.control.obj, f, v))
-        # A privileged value the server set on an authority-named field the plain
-        # create did not have also counts (e.g. role -> "admin" under another key).
-        if not stored:
-            for k, v in attack.obj.items():
-                if isinstance(k, str) and _AUTHORITY_RE.search(k) and not _same_value(
-                        v, _field_of(plan.control.obj, k)[1]) and (_is_priv(v, "admin") or v is True):
-                    stored.append(k)
-        if stored:
-            return ("confirmed", f"Mass assignment at create: the read-back of the created object "
-                                 f"carries {', '.join(stored)} with the privileged value sent, which "
-                                 f"the plain create did not get", "")
-        return ("not_confirmed", "The server accepted the create but ignored the privileged fields: the "
-                                 "read-back carries none of them", "control_held")
-
-    def _judge_validation(self, case: _Case, plan: _Plan):
-        notes, accepted, lead = [], [], []
-        dups = [m for m in plan.attacks if m.label.startswith("duplicate")]
-        if dups:
-            first, second = dups
-            if _ok2xx(first.sent) and _ok2xx(second.sent) and first.item and second.item \
-                    and first.item != second.item:
-                (accepted if first.obj is not None and second.obj is not None else lead).append(
-                    f"a duplicate of a unique create was stored as a second object ({second.item})")
-            elif _ok2xx(first.sent):
-                notes.append(f"the duplicate was refused (HTTP {second.status})"
-                             + (f" (not read back by logging in: {second.login_why})"
-                                if plan.login_url and second.login_why else ""))
-        empty = next(m for m in plan.attacks if m.label == "empty")
-        unsettled = []
-        if _ok2xx(empty.sent):
-            if empty.obj is not None:
-                # Only a field the read-back returns as "" counts: a field it never
-                # returns (a password) says nothing about what was stored.
-                blanks = [k for k in plan.field.split(",") if _field_of(empty.obj, k) == (True, "")]
-                (accepted if blanks else lead).append(
-                    f"a create with every string field empty was stored"
-                    + (f" (read-back: {', '.join(blanks)} empty)" if blanks else ""))
-            elif empty.login_result == "stored":
-                accepted.append(f"a create with every string field empty was stored although its "
-                                f"HTTP {empty.status} answer named no readable object: {empty.login_why}")
-            else:
-                lead.append("a create with every string field empty was accepted (HTTP "
-                            f"{empty.status}) but could not be read back"
-                            + (f" ({empty.login_why})" if empty.login_why else ""))
-        elif empty.sent is not None:
-            if empty.login_result == "stored":
-                accepted.append(f"a create with every string field empty was stored despite HTTP "
-                                f"{empty.status}: {empty.login_why}")
-            elif empty.login_result in ("existing", "unsure"):
-                unsettled.append(f"the empty create's HTTP {empty.status} cannot be counted as a refusal: "
-                                 f"{empty.login_why}")
-            else:
-                notes.append(f"the empty create was refused (HTTP {empty.status})"
-                             + (f" and {empty.login_why}" if empty.login_result == "not_stored" else
-                                f" (not read back by logging in: {empty.login_why})" if empty.login_why
-                                else ""))
-        if accepted:
-            return "confirmed", "Weak create validation: " + "; ".join(accepted + lead), ""
-        if lead:
-            return "supported", "LEAD: " + "; ".join(lead), ""
-        if unsettled:
-            return "inconclusive", "Create validation not settled: " + "; ".join(unsettled + notes), ""
-        return ("not_confirmed", "The server enforces create validation: " + "; ".join(notes)
-                + (f"; {plan.login_note}" if plan.login_note else ""), "control_held")
 
     # -- update tamper (business_rule_tamper on PUT/PATCH) --------------------------------
 
@@ -1515,28 +763,6 @@ class WriteIntegrityValidator(Validator):
 
     # -- forged authorship on an update (PUT/PATCH of one object) --------------------
 
-    def _no_update_object(self, case: _Case) -> str:
-        """Why an author-carrying PUT/PATCH with no object id in its path cannot run."""
-        ex = case.exchange
-        method = (ex.method or "").upper()
-        path = urlsplit(ex.url).path or "/"
-        status = ex.response_status
-        from types import SimpleNamespace
-        oid = _created_id(SimpleNamespace(body=ex.response_body or "", headers=ex.response_headers or {}))
-        if oid:
-            answer = (f" (its answer names object {oid}, but a {method} to the collection adds an "
-                      f"object rather than updating one)")
-        else:
-            answer = f" and its answer (HTTP {status}) names none" if status is not None else " and names none"
-        adds = ""
-        if status == 201 or oid:
-            if not self._restore_route(ex.url):
-                from harness.engagement import normalize_path
-                adds = (f", and no DELETE route is known for what it adds (DELETE "
-                        f"{normalize_path(_item_url(ex.url, '1'))})")
-        return (f"write_integrity forged_authorship: the {method} to {path} does not end in an "
-                f"object id{answer}, so there is no object to snapshot, read back or write back"
-                f"{adds}; nothing was written")
 
     async def _update_authorship(self, case: _Case) -> ValidationResult:
         """Snapshot one object, re-write its author/owner field with the writer's own
@@ -1699,71 +925,6 @@ class WriteIntegrityValidator(Validator):
 
     # -- unauthorized update: write as someone else, read back as owner/admin (R11-5) --
 
-    def _object_ref(self, url: str) -> str:
-        from harness import principals
-        return principals.object_reference(url, run_id=getattr(self.run_context, "run_id", "") or "")
-
-    def _owner_fact(self, url: str, method: str):
-        """The ownership fact for the object at `url` (the write's verb first, then
-        GET), and whether it is an operator declaration; (None, False) when none."""
-        if self.ownership is None:
-            return None, False
-        ref = self._object_ref(url)
-        for verb in dict.fromkeys((method, "GET")):
-            fact = self.ownership.lookup(ref, verb)
-            if fact is not None:
-                return fact, bool(self.ownership.has_declaration(ref, verb))
-        return None, False
-
-    def _update_reader(self, url: str, method: str, idents: list) -> tuple[dict | None, str]:
-        """Who reads the object back and writes it back: its owner (an ownership
-        fact naming a registered identity), else a registered admin.
-        (identity, "owner"|"admin"), or (None, why there is none)."""
-        fact, _ = self._owner_fact(url, method)
-        owner_id = getattr(fact, "owner_principal_id", "") or ""
-        if owner_id:
-            owner = next((i for i in idents if _pid(i) == owner_id and i.get("session_ref")), None)
-            if owner is not None:
-                return owner, "owner"
-        admin = next((i for i in idents if _PRIVILEGED_ROLE.search(i.get("role") or "")
-                      and i.get("session_ref")), None)
-        if admin is not None:
-            return admin, "admin"
-        return None, (f"its owner {owner_id!r} has no registered session and no admin session is "
-                      f"registered" if owner_id else
-                      "no owner is known for it and no admin session is registered")
-
-    def _declared_boundary(self, writer, url: str, method: str) -> str:
-        """Why a change `writer` (None: anonymous) made to the object at `url`
-        crosses a boundary the operator declared, or "": an anonymous write to a
-        route on authz.protected_paths or the engagement's protected_paths, or an authz.owners declaration that does not
-        entitle the writer. Self-observed ownership is not a declaration."""
-        if writer is None:
-            try:
-                from harness import protected_routes
-                hit = protected_routes.ProtectedRoutes.for_target(
-                    getattr(self.run_context, "config", None) or {}, url,
-                    engagement_paths=getattr(self.run_context, "protected_paths", None) or None,
-                ).match(method, url)
-            except Exception:
-                log.debug("write_integrity: protected routes failed", exc_info=True)
-                hit = None
-            if hit is not None:
-                return f"an anonymous {method} to a route declared protected ({hit.describe()})"
-        fact, declared = self._owner_fact(url, method)
-        if fact is None or not declared:
-            return ""
-        from harness import principals
-        principal = principals.Principal.anonymous() if writer is None else _principal_for(writer)
-        ref = self._object_ref(url)
-        decision = next((self.ownership.authorization(principal, ref, verb)
-                         for verb in dict.fromkeys((method, "GET"))
-                         if self.ownership.has_declaration(ref, verb)), None)
-        if decision != principals.AuthzDecision.UNAUTHORIZED:
-            return ""
-        owner = getattr(fact, "owner_principal_id", "") or "another principal"
-        return (f"authz.owners declares the object to {owner!r}, which does not entitle "
-                f"{principal.id!r} ({fact.provenance})")
 
     async def unauthorized_update(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         """R11-5. Snapshot one object as its owner (or an admin), change one
