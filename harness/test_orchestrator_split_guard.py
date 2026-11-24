@@ -21,13 +21,11 @@ REPO = HARNESS.parent
 MODULE_LINE_LIMIT = 1200
 
 # Modules over the limit, at their size when ARC-9's orchestrator part landed (b7492ca8 plus the
-# orchestrator split; store.py and server.py at the wave-5 merge, with ARC-13 (its ledger_chain
-# side table) and OPS-5).
+# orchestrator split, with ARC-13 and OPS-5 at the wave-5 merge). server.py and store.py left the
+# table when ARC-9 split them (server_routes_*.py routers; store_* repositories).
 # A module may shrink and then drops out of the table; it may not grow.
-# Raise a ceiling only with the owner's say-so. The table names the next ARC-9 splits:
-# store.py (repositories), server.py (APIRouters), then the rest.
+# Raise a ceiling only with the owner's say-so. The table lists the remaining ARC-9 splits.
 OVERSIZED_CEILING = {
-    "store.py": 4412,
     "coverage_model.py": 2174,
     "validators/write_integrity_validator.py": 2002,
     "api_surface_discovery.py": 1928,
