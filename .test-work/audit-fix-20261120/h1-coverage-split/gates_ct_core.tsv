@@ -1,0 +1,18 @@
+module	runner	rc	tests	seconds
+harness.test_coverage_tracker	unittest	0	42	1
+harness.test_coverage_drive_throughput	unittest	0	8	9
+harness.test_coverage_blocked_leg_rvf	unittest	0	10	31
+harness.test_coverage_r7_drive	unittest	0	5	1
+harness.test_coverage_replay_dedupe	unittest	0	25	24
+harness.test_result_payload_size	unittest	0	15	5
+harness.test_stage_reservations	unittest	0	25	9
+harness.test_param_dispatch_caller	unittest	0	29	36
+harness.test_dom_xss_query_source	unittest	0	18	180
+harness.test_execution_registry	unittest	0	62	140
+harness.test_final_pass_callers	unittest	0	6	46
+harness.test_job_status_passive	unittest	0	25	21
+harness.test_smoke_investigate	unittest	0	14	9
+harness.test_attempt_facts	unittest	0	14	33
+harness.test_run_journal	unittest	0	44	34
+harness.test_coverage_capabilities	unittest	0	28	112
+# done: 16 modules, 0 failed

@@ -25,15 +25,14 @@ MODULE_LINE_LIMIT = 1200
 # table when ARC-9 split them (server_routes_*.py routers; store_* repositories).
 # A module may shrink and then drops out of the table; it may not grow.
 # Raise a ceiling only with the owner's say-so. The table lists the remaining ARC-9 splits.
+# coverage_model.py, coverage_tracker.py and api_surface_discovery.py are facades over sibling
+# modules now (harness.test_coverage_split guards that patches reach the moved code); they left the table.
 OVERSIZED_CEILING = {
-    "coverage_model.py": 2174,
     "validators/write_integrity_validator.py": 2002,
-    "api_surface_discovery.py": 1928,
     "validators/sqlmap.py": 1791,
     "browser_driver.py": 1754,
     "ollama_client.py": 1734,
     "experiment.py": 1721,
-    "coverage_tracker.py": 1707,
     "run_context.py": 1706,
     "validators/business_flow_validator.py": 1514,
     "validators/auth_sequence_validator.py": 1514,

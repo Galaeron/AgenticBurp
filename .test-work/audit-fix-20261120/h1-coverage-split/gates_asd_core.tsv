@@ -1,0 +1,16 @@
+module	runner	rc	tests	seconds
+harness.test_api_surface_discovery	unittest	0	51	6
+harness.test_discovery_recursion_caller	unittest	0	9	35
+harness.test_empty_scope_fail_closed	unittest	0	13	10
+harness.test_engagement_builder	unittest	0	4	1
+harness.test_role_crawl	unittest	0	42	5
+harness.test_sensitive_file_confirmation	unittest	0	11	71
+harness.test_cross_request_decisions_rvt	unittest	0	48	142
+harness.test_spec_behind_ui	unittest	0	11	1
+harness.test_discovery_ffuf_in_run	unittest	0	20	30
+harness.test_discovery_spa_wildcards	unittest	0	12	37
+harness.test_ffuf_runner	unittest	0	39	0
+harness.test_surface_allow_header_rvi	unittest	0	4	2
+harness.test_principal_matrix_readers	unittest	0	16	2
+harness.test_active_assessment_repair	unittest	0	12	10
+# done: 14 modules, 0 failed
