@@ -1,0 +1,12 @@
+CAUGHT  tracker drive: time (7 read(s))  static=True reach=True  failing: 2
+CAUGHT  tracker drive: _LEG_STATUS (1 read(s))  static=True reach=True  failing: 2
+CAUGHT  tracker drive: _LEG_STATUS_UNKNOWN (1 read(s))  static=True reach=True  failing: 2
+CAUGHT  tracker drive: _fair_cells (2 read(s))  static=True reach=True  failing: 3
+CAUGHT  tracker drive: _time_fair_cells (1 read(s))  static=True reach=True  failing: 3
+CAUGHT  tracker drive: REQUEST_LEVEL_INPUTS (2 read(s))  static=True reach=True  failing: 2
+CAUGHT  tracker drive: log (3 read(s))  static=True reach=True  failing: 3
+CAUGHT  tracker report: _listed_in_compact_ledger (1 read(s))  static=True reach=True  failing: 2
+CAUGHT  tracker report: log (1 read(s))  static=True reach=True  failing: 3
+CAUGHT  surface probe: _host_in_scope (1 read(s))  static=True reach=True  failing: 2
+CAUGHT  surface mining: _host_in_scope (1 read(s))  static=True reach=True  failing: 2
+CAUGHT  surface mining: sensitive_file_verdict (1 read(s))  static=True reach=True  failing: 2
