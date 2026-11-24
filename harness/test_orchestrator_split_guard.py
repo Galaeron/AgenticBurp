@@ -35,7 +35,6 @@ OVERSIZED_CEILING = {
     "browser_driver.py": 1754,
     "ollama_client.py": 1734,
     "experiment.py": 1721,
-    "coverage_tracker.py": 1707,
     "run_context.py": 1706,
     "validators/business_flow_validator.py": 1514,
     "validators/auth_sequence_validator.py": 1514,
