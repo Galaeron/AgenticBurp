@@ -28,14 +28,10 @@ MODULE_LINE_LIMIT = 1200
 # coverage_model.py, coverage_tracker.py and api_surface_discovery.py are facades over sibling
 # modules now (harness.test_coverage_split guards that patches reach the moved code); they left the table.
 OVERSIZED_CEILING = {
-    "validators/write_integrity_validator.py": 2002,
-    "validators/sqlmap.py": 1791,
     "browser_driver.py": 1754,
     "ollama_client.py": 1734,
     "experiment.py": 1721,
     "run_context.py": 1706,
-    "validators/business_flow_validator.py": 1514,
-    "validators/auth_sequence_validator.py": 1514,
     "engagement.py": 1446,
     "validators/cross_identity_validator.py": 1381,
     "issues.py": 1226,
