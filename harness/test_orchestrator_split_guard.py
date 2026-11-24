@@ -21,17 +21,16 @@ REPO = HARNESS.parent
 MODULE_LINE_LIMIT = 1200
 
 # Modules over the limit, at their size when ARC-9's orchestrator part landed (b7492ca8 plus the
-# orchestrator split, with ARC-13 and OPS-5 at the wave-5 merge). server.py and store.py left the
-# table when ARC-9 split them (server_routes_*.py routers; store_* repositories).
+# orchestrator split, with ARC-13 and OPS-5 at the wave-5 merge).
 # A module may shrink and then drops out of the table; it may not grow.
 # Raise a ceiling only with the owner's say-so. The table lists the remaining ARC-9 splits.
-# coverage_model.py, coverage_tracker.py and api_surface_discovery.py are facades over sibling
-# modules now (harness.test_coverage_split guards that patches reach the moved code); they left the table.
+# ARC-9 wave 6 split twelve modules into facades over sibling modules; they left the table.
+# The tests that prove patches still reach the moved code: server.py (test_server_router_split),
+# store.py (test_store_facade), coverage_model.py, coverage_tracker.py, api_surface_discovery.py
+# (test_coverage_split), the four validators (test_validator_split), run_context.py,
+# ollama_client.py, browser_driver.py (test_runtime_split_facade).
 OVERSIZED_CEILING = {
-    "browser_driver.py": 1754,
-    "ollama_client.py": 1734,
     "experiment.py": 1721,
-    "run_context.py": 1706,
     "engagement.py": 1446,
     "validators/cross_identity_validator.py": 1381,
     "issues.py": 1226,
