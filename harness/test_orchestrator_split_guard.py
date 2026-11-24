@@ -31,7 +31,6 @@ OVERSIZED_CEILING = {
     "server.py": 2824,
     "coverage_model.py": 2174,
     "api_surface_discovery.py": 1928,
-    "validators/sqlmap.py": 1791,
     "browser_driver.py": 1754,
     "ollama_client.py": 1734,
     "experiment.py": 1721,

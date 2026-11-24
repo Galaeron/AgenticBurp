@@ -486,6 +486,11 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
             # mutating-method sqlmap.py:114-115 case is covered by
             # gate_routed_exceptions above, not this one.
             "sqlmap.py",
+            # sqlmap_policy.py (ARC-9: moved verbatim out of sqlmap.py). create_endpoint_reason
+            # reads the captured method only to name a request ceiling and a reason string. The
+            # module holds no gate call, client or sqlmap launch (harness/test_validator_split.py
+            # pins that for every sibling), so the method is never sent from there.
+            "sqlmap_policy.py",
             # The only exchange.method reference is a DEFENSIVE GUARD:
             #   if (exchange.method or "GET").upper() != "GET": return skipped
             # i.e. it refuses to proceed for anything but GET. The validator's
