@@ -67,8 +67,10 @@ class SecurityPolicyTests(unittest.TestCase):
                      "testing/test-target", "testing/blind-target-2", "testing/blind-test-kit",
                      "harness/requirements.lock"):
             self.assertTrue((ROOT / path).exists(), path)
+        server = "".join(p.read_text(encoding="utf-8") for p in
+                         [ROOT / "harness/server.py", *(ROOT / "harness").glob("server_routes_*.py")])
         for route in ("/pairing/check", "/run-provenance"):
-            self.assertIn(f'"{route}"', (ROOT / "harness/server.py").read_text(encoding="utf-8"))
+            self.assertIn(f'"{route}"', server)
 
 
 class ChangelogTests(unittest.TestCase):

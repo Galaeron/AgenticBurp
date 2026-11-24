@@ -44,16 +44,22 @@ def fenced_blocks(text: str, language: str) -> list[str]:
     return re.findall(rf"```{language}\n(.*?)```", text, flags=re.S)
 
 
+SERVER_SOURCES = [ROOT / "harness/server.py", *sorted((ROOT / "harness").glob("server_routes_*.py"))]
+
+
 def server_routes() -> set[tuple[str, str]]:
-    """(METHOD, path) for every @app.<method>("...") decorator in harness/server.py."""
+    """(METHOD, path) for every @app.<method>("...") or @router.<method>("...")
+    decorator in harness/server.py and its router modules (ARC-9)."""
     found = set()
-    for node in ast.walk(ast.parse((ROOT / "harness/server.py").read_text(encoding="utf-8"))):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for dec in node.decorator_list:
-                if (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
-                        and isinstance(dec.func.value, ast.Name) and dec.func.value.id == "app"
-                        and dec.args and isinstance(dec.args[0], ast.Constant)):
-                    found.add((dec.func.attr.upper(), dec.args[0].value))
+    for source in SERVER_SOURCES:
+        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for dec in node.decorator_list:
+                    if (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
+                            and isinstance(dec.func.value, ast.Name)
+                            and dec.func.value.id in ("app", "router")
+                            and dec.args and isinstance(dec.args[0], ast.Constant)):
+                        found.add((dec.func.attr.upper(), dec.args[0].value))
     return found
 
 
