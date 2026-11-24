@@ -33,7 +33,6 @@ OVERSIZED_CEILING = {
     "validators/write_integrity_validator.py": 2002,
     "api_surface_discovery.py": 1928,
     "validators/sqlmap.py": 1791,
-    "browser_driver.py": 1754,
     "experiment.py": 1721,
     "coverage_tracker.py": 1707,
     "validators/business_flow_validator.py": 1514,
