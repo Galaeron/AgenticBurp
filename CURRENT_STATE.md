@@ -1,16 +1,15 @@
-# Current state — 2026-11-23 (earlier states: git history of this file)
+# Current state — 2026-11-26 (earlier states: git history of this file)
 
 ## Branch and base
-- Work lives on the local integration branch `integrate/audit-fixes-20261120` (NOT pushed):
-  PR #32's tip `d893ed0f` (CI green, not merged; merging needs the owner's OK) plus the 12
-  principal-audit code batches (a1 to d3), the model-call pacer config (O11) and four test fixes,
-  tip `6fe5538c`. The e1 docs/state commits (DOC-1, DOC-3, DOC-4, DOC-5, OPS-4, STATE-2, STATE-4
-  and their follow-ups) sit on top of it.
+- `main` holds, merged in this order on 2026-11-26 (owner's OK): #31 (r11 post-mortem docs), #32 (r11
+  fixes R11-1 to R11-10), #33 (audit batches a1 to d3, O11, e1 docs/state), #34 (wave 5: ARC-13 ledger
+  chain, OPS-5 engagement stores, ARC-9 orchestrator split), #35 (wave 6: ARC-9 module splits) and
+  #36 (OPS-1 follow-up: the lock clears pip-audit; four tornado ids allowlisted to 2027-01-31).
+  Base before them: `0fb8cd5a` (PR #30, 2026-11-17). Owner decisions each PR lists stay open.
 - Audit and program: `reviews/2026-11-19-principal-audit/REMEDIATION_BACKLOG.md`;
   `.test-work/audit-fix-20261120/PROGRAM.md` and one `<batch>/HANDOFF.md` per batch (main checkout,
   untracked). What changed, by ID: [CHANGELOG.md](CHANGELOG.md) (Unreleased).
-- #32 already holds the r11 fixes (R11-1 to R11-10) on top of `main` = `0fb8cd5a` (PR #30,
-  2026-11-17). In neither: `feat/scoreboard-scorer-20261116`, `fcb96d62` (rejected), `WorkingSunday`,
+- Not on main: `feat/scoreboard-scorer-20261116`, `fcb96d62` (rejected), `WorkingSunday`,
   `main-checkout-snapshot-20261101` (about 70 files nowhere else; split it per
   docs/I01_CANDIDATE_MANIFEST_2026-10-17.md) and the `origin/vibe/*` branches.
 - The main checkout (`reconciliation-backlog`) has many uncommitted files, including its own
@@ -42,8 +41,9 @@
   was in progress when this was written; its result is not recorded here. Per-batch gates are in the
   HANDOFFs and are reported, not re-run: smoke 182 to 241, precondition 74; Java 417 tests, 0 failures
   (c3, JDK 17, Gradle 8.7 offline). Historical: PR #30 full suite green on 3.14 (CI).
-- Not verified: the clean-machine first-run walk-through (DOC-3), the CI `dependency-audit-blocking`
-  job, `.[dev]` in a clean venv, loading the jar in Burp, TOK-3's live yield over five repeats.
+- #36, 2026-11-26, Python 3.14.6 with its lock: `pip check` OK; the blocking audit step as ci.yml runs
+  it exits 0 (4 ignored); smoke and precondition (74) exit 0; 12 modules on the bumped packages OK.
+- Not verified: the clean-machine first-run walk-through (DOC-3), `.[dev]` in a clean venv, loading the jar in Burp, TOK-3's live yield over five repeats.
 - Verify in an in-repo worktree, `PYTHONPATH=<worktree>`, system Python (not `.venv-rationalisation`);
   Defender deletes `file_upload_agent.py` under %TEMP%. Java: in `burp-extension/`, `gradle
   --gradle-user-home <main>/.audit-external/gradle-cache --offline --no-daemon clean test shadowJar`,
@@ -57,9 +57,9 @@
 - 2026-11-14 oracle run (each leg aimed at its endpoint by hand): 22 of 60 confirmed, 20 of 98 solved.
 
 ## Open work (priority order)
-0. Owner: push `integrate/audit-fixes-20261120` and open one PR (CI runs the full suite); merge
-   #32; STATE-1 (decide the ~40 local-only files, move the root to `main`). Unscheduled in PROGRAM.md:
-   STATE-3, GAP-1, GAP-3, TOK-1, OPS-5, ARC-9, ARC-13, STRAT-1 to STRAT-5.
+0. Owner: STATE-1 (decide the ~40 local-only files, move the root to `main`); the decisions #33-#35 list;
+   drop the tornado allowlist entries once mitmproxy allows tornado>=6.6.1 (expiry 2027-01-31 fails main's
+   audit); six modules still over ARC-9's limit (#35). Unscheduled: STATE-3, GAP-1, GAP-3, TOK-1, STRAT-1-5.
 1. Decisions the audit batches left (each HANDOFF has its own): validators' no-run fallbacks and the no-run
    `GatedAsyncClient` (d2); the library-only modules of ARC-10 (wire in, move or delete); `fail_open_mode:
    curated` needs a GAP-1 recall comparison (b2); pacer defaults (O11); the Burp plane's request budget
