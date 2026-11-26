@@ -84,6 +84,10 @@ batches. The IDs are the audit's; each line names the behaviour that changed.
 ### Build, supply chain and tests
 
 - OPS-1: a blocking `pip-audit` job runs on pushes to `main` and `v*` tags, with a reviewed allowlist.
+- OPS-1 follow-up: `harness/requirements.lock` moves past the known vulnerabilities in cryptography
+  (50.0.2, with pyOpenSSL 26.4.0), h2, msgpack, pyasn1, tornado (6.5.10), urllib3, urwid (4.0.13) and
+  Werkzeug. Four tornado advisories fixed only in 6.6+ are allowlisted until 2027-01-31: mitmproxy
+  12.3.1 caps tornado at 6.5.10, and the harness runs no tornado server.
 - OPS-2: Gradle 8.7 wrapper with a pinned checksum and a Java 17 toolchain; CI builds with it.
 - OPS-3: `python -m harness.lock_preflight` and a startup warning when installed packages differ
   from `harness/requirements.lock`.
