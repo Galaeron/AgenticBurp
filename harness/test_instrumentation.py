@@ -506,7 +506,8 @@ class PhaseRecorderTests(unittest.TestCase):
         used[0], calls[0] = 9, 5
         timings = recorder.timings()
         self.assertEqual([t["phase"] for t in timings], ["discovery", "worklist"])
-        self.assertEqual(timings[0], {"phase": "discovery", "started_s": 0.0, "elapsed_s": 1.5,
+        self.assertEqual(timings[0], {"phase": "discovery", "started_s": 0.0, "ended_s": 1.5,
+                                      "elapsed_s": 1.5, "budget_s": None, "unused_s": None,
                                       "requests_used_delta": 7, "model_calls_delta": 2})
         self.assertEqual((timings[1]["requests_used_delta"], timings[1]["model_calls_delta"]), (2, 3))
 
@@ -602,7 +603,9 @@ class _NoInstrumentation:
     """RunInstrumentation patched out: records nothing, reports nothing."""
 
     def __init__(self, *args, **kwargs):
-        self.phases = SimpleNamespace(begin=lambda name: None, finish=lambda: None)
+        self.phases = SimpleNamespace(begin=lambda name, budget_s=None: None,
+                                      set_budget=lambda name, budget_s: None,
+                                      finish=lambda: None)
 
     def snapshot(self):
         return {}

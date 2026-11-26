@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
@@ -362,8 +363,12 @@ def derive_input_cases_from_template(template: dict | None,
     """Convenience over `derive_input_cases` for an endpoint `template` dict
     (engagement.template_from_exchange: method/query/body/content_type/object_id)."""
     template = template or {}
+    from harness.models import body_is_placeholder
+    body = template.get("body", "") or ""
+    if body_is_placeholder(body):
+        body = ""   # R11-9: the crawler's guess names no input of the endpoint
     cases = derive_input_cases(
-        query=template.get("query", "") or "", body=template.get("body", "") or "",
+        query=template.get("query", "") or "", body=body,
         content_type=template.get("content_type", "") or "",
         object_id=template.get("object_id"), workflow_state_id=workflow_state_id)
     # A client-side route (client_routes.py) adds the inputs page script reads: a
@@ -473,6 +478,23 @@ def _has_auth_endpoint(endpoint: dict) -> tuple[bool, str]:
         return True, "authentication-related endpoint"
     return False, "not an authentication endpoint"
 
+_LOOKUP_IDENTIFIERS = ("username", "user", "email", "login", "userid", "user_name")
+
+
+def _has_auth_endpoint_or_lookup(endpoint: dict) -> tuple[bool, str]:
+    """An auth endpoint, or a GET whose capture names an account in its query (a
+    recovery lookup such as ?email=). R11-8 (c): r11 never opened the enumeration
+    cell on a lookup whose path names no auth word."""
+    hit, reason = _has_auth_endpoint(endpoint)
+    if hit:
+        return hit, reason
+    if "GET" in (endpoint.get("methods") or ("GET",)) and any(
+            name.lower() in {f"query:{k}" for k in _LOOKUP_IDENTIFIERS}
+            for name in captured_parameter_names(endpoint)):
+        return True, "a captured GET names an account identifier in its query"
+    return False, reason
+
+
 def _has_file_path_segment(endpoint: dict) -> tuple[bool, str]:
     path = endpoint.get("path", "")
     if re.search(r"/(upload|file|download|media|attachment|avatar|image|doc|asset)s?(/|$)", path, re.I):
@@ -566,6 +588,18 @@ def _has_denied_role(endpoint: dict) -> tuple[bool, str]:
 _CLIENT_VALUE_FIELD = re.compile(
     r"price|amount|total|cost|discount|quantity|qty|subtotal|fee|balance")
 _CLIENT_VALUE_PATH = ("cart", "checkout", "basket", "order", "payment", "purchase")
+
+def _flow_shape(kind: str):
+    """A predicate: the endpoint's captured write has the business-flow shape `kind`."""
+    def predicate(endpoint: dict) -> tuple[bool, str]:
+        from harness.validators.business_flow_validator import endpoint_flow_kind
+        got = endpoint_flow_kind(endpoint)
+        if got == kind:
+            return True, f"captured write has the {kind} flow shape"
+        return False, f"no captured write with the {kind} flow shape"
+    predicate.__name__ = f"_flow_shape_{kind}"
+    return predicate
+
 
 def _has_client_value_field(endpoint: dict) -> tuple[bool, str]:
     if not _accepts_body(endpoint)[0]:
@@ -665,6 +699,15 @@ class Check:
     # WG-2 (3): the class the coverage driver hands the leg. Empty = vulnerability_class.
     # Lets a shared-class row route to its own sub-check (e.g. auth_sequence's enum leg).
     leg_class: str = ""
+    # R11-10: True when the check's verdict on an endpoint does not depend on who
+    # sends the request (injection, error handling, client policy headers ...). Then
+    # one identity's run of the check on an endpoint stands for every identity's
+    # cell there, and an identity with no capture of that endpoint is not a gap
+    # (CoverageTracker.credit_caller_independent). False (the default) keeps the cell
+    # identity-bound: access control, sessions, authentication, exposure, and any
+    # row where the caller's account or privilege can change the verdict. Set in
+    # one place, `_CALLER_INDEPENDENT_CHECKS` below the catalog.
+    caller_independent: bool = False
 
     def applies(self, endpoint: dict) -> tuple[bool, str]:
         """Deterministic applicability + the rationale for WHY it applies or doesn't.
@@ -871,7 +914,7 @@ CHECK_CATALOG: tuple[Check, ...] = (
     # class to the leg, which routes bare "auth" to no check; a narrower synonym in
     # categories.py is the follow-up that lets the driver fire these legs.
     Check("WSTG-IDNT-04", "Account enumeration", Phase.ENDPOINT,
-          "auth", _has_auth_endpoint, "auth_sequence",
+          "auth", _has_auth_endpoint_or_lookup, "auth_sequence",
           "Test whether login/registration/reset responses distinguish existing from "
           "unknown usernames",
           "Authentication vulnerabilities",
@@ -939,11 +982,36 @@ CHECK_CATALOG: tuple[Check, ...] = (
           "Test if session tokens are regenerated after login"),
     # WG-3: auth_sequence's logout leg (session_timeout class) mints a fresh throwaway
     # login from a captured login and never logs the operator out, so the row is
-    # scoped to auth endpoints like SESS-03. Idle/absolute timeout (SESS-07) has no leg.
+    # scoped to auth endpoints like SESS-03. Idle/absolute timeout waits have no leg; SESS-07
+    # below checks only that the session token expires at all.
     Check("WSTG-SESS-06", "Logout functionality", Phase.ENDPOINT,
           "session_timeout", _has_auth_endpoint, "auth_sequence",
           "Test whether logout invalidates the session server-side (the pre-logout "
           "cookie must stop reaching authenticated pages)"),
+    # R11-8 (b): a session JWT with no exp claim never expires. auth_sequence's expiry
+    # check decodes the tokens the run holds (the login's token, the identities'
+    # credentials) and sends nothing. Its own class, so the logout row is not proved by it.
+    Check("WSTG-SESS-07", "Session timeout (token expiry)", Phase.ENDPOINT,
+          "session_expiry", _has_auth_endpoint, "auth_sequence",
+          "Decode the session bearer JWT (the login's token, the run identities' "
+          "credentials) and check that it carries an exp claim; nothing is sent"),
+    # R11-8 (b): a run-owned identity's token kept across its own password change
+    # (and restored). A write: needs the mutating ceiling for this check >= 2.
+    Check("AV-PWCHANGE-01", "Session token survives a password change", Phase.ENDPOINT,
+          "session_after_password_change", _has_auth_endpoint, "password_change_session",
+          "For a run-owned identity: log in (token T1), change its password through the "
+          "captured change-password flow, read its account with T1, then change the "
+          "password back and verify the original logs in. T1 still accepted confirms",
+          external_refs=(
+              ExternalRef("WSTG", "WSTG-ATHN-09",
+                          "https://owasp.org/www-project-web-security-testing-guide/v42/"
+                          "4-Web_Application_Security_Testing/04-Authentication_Testing/"
+                          "09-Testing_for_Weak_Password_Change_or_Reset_Functionalities",
+                          "Testing for Weak Password Change or Reset Functionalities",
+                          version="4.2"),
+              ExternalRef("CWE", "CWE-613", "https://cwe.mitre.org/data/definitions/613.html",
+                          "Insufficient Session Expiration"),
+          )),
     # The file_upload leg uploads only a BENIGN disallowed-extension (.html) file and
     # checks it is stored and served back: BUSL-08 (unexpected file types). In
     # scheme-1 data (pre-WG-1, unmarked) "WSTG-BUSL-08" meant the TOCTOU row and still
@@ -1345,7 +1413,76 @@ CHECK_CATALOG: tuple[Check, ...] = (
               "create_validation", "weak_create_validation", "duplicate_registration",
               "empty_required_fields", "missing_required_field_validation",
           )),
+    # R11-7 business flows (business_flow_validator): replay the run's own captured
+    # flow on a run-owned identity, read the resulting state back, restore what can be.
+    Check("WSTG-BUSL-10", "Payment functionality (settlement tamper, payment skip)",
+          Phase.ENDPOINT, "payment_tamper", _flow_shape("payment_tamper"), "business_flow",
+          "Replay the captured cart steps and settlement untampered, then with a client-chosen "
+          "amount, quantity or delivery value (or the payment dropped); confirm only when the "
+          "read-back order total or balance shows less was charged than the control.",
+          "Business logic vulnerabilities",
+          specific_classes=(
+              "payment_tamper", "payment tamper", "payment_tampering", "payment tampering",
+              "checkout_tamper", "checkout tampering", "settlement_tamper", "payment_bypass",
+              "payment bypass", "payment_skip", "order_total_tamper", "wallet_payment_skip",
+          )),
+    Check("AV-BUSL-COUPON-01", "Coupon or voucher misuse (forged, expired, another user's code)",
+          Phase.ENDPOINT, "coupon_misuse", _flow_shape("coupon_misuse"), "business_flow",
+          "Apply a forged code, an expired code and another run identity's code to the captured "
+          "coupon write; confirm when the basket or order read-back shows the discount, then "
+          "clear the code again.",
+          "Business logic vulnerabilities",
+          external_refs=(
+              ExternalRef("WSTG", "WSTG-BUSL-10",
+                          "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/10-Business_Logic_Testing/10-Test-Payment-Functionality",
+                          "Test Payment Functionality"),
+          ),
+          specific_classes=(
+              "coupon_misuse", "coupon misuse", "coupon_forgery", "coupon forgery",
+              "coupon_reuse", "expired_coupon", "voucher_misuse", "promo_code_abuse",
+              "discount_code_abuse", "cross_user_coupon",
+          )),
+    Check("WSTG-BUSL-06", "Circumvention of work flows (2FA disable without step-up)",
+          Phase.ENDPOINT, "mfa_disable_stepup", _flow_shape("mfa_disable_stepup"), "business_flow",
+          "Replay the captured 2FA-disable request with its password or TOTP field dropped or "
+          "wrong; confirm when the status read-back shows 2FA off, then re-enable it from the "
+          "run's captured enable request or name it as left disabled.",
+          "Authentication vulnerabilities",
+          specific_classes=(
+              "mfa_disable_stepup", "mfa disable stepup", "2fa_disable", "2fa disable",
+              "mfa_disable", "two_factor_disable", "mfa_step_up_bypass",
+              "2fa_disable_without_password",
+          )),
 )
+
+# R11-10: rows whose verdict does not depend on the caller (Check.caller_independent).
+# Every row NOT named here is identity-bound. Kept out on purpose, though the
+# leg may look caller-blind:
+# - every WSTG-ATHZ / ATHN / SESS row, AV-EXPOSURE-* and AV-WRITE-XID / AUTHOR
+#   (owner's list: the verdict is about who may do it);
+# - WSTG-INJT-20 and AV-MASSASSIGN-02: whether a privileged field may be set
+#   depends on the caller's privilege (an admin may set it);
+# - WSTG-INJT-03 (verb tampering): tests an access-control bypass;
+# - WSTG-CLNT-10 (WebSockets): cross-site hijacking rides the caller's session;
+# - WSTG-BUSL-05, BUSL-06, BUSL-10, AV-BUSL-COUPON-01: limits, step-up and
+#   payment rules are often per account;
+# - manual rows (WSTG-CONF-09, WSTG-BUSL-09): no leg runs them.
+_CALLER_INDEPENDENT_CHECKS = frozenset({
+    # Transport, policy headers and server configuration.
+    "WSTG-CRYP-01", "WSTG-CONF-07", "WSTG-CONF-12", "WSTG-CLNT-07", "WSTG-INFO-02",
+    "WSTG-INFO-05", "WSTG-CONF-06", "WSTG-CONF-14", "WSTG-CLNT-09", "WSTG-CONF-10",
+    "AV-WELLKNOWN-01", "WSTG-ERRH-01", "AV-FILTER-01",
+    # Injection and request handling.
+    "WSTG-INJT-16", "WSTG-INJT-15", "WSTG-INJT-17", "WSTG-CONF-13", "WSTG-INJT-05",
+    "WSTG-INJT-01", "WSTG-INJT-02", "WSTG-CLNT-01", "WSTG-INJT-12", "WSTG-INJT-18",
+    "WSTG-INJT-07", "WSTG-INJT-19", "WSTG-CLNT-04", "WSTG-INJT-05.6", "WSTG-INJT-23",
+    # Input handling that is the same for any caller.
+    "WSTG-IDNT-04", "WSTG-BUSL-08", "WSTG-BUSL-02", "AV-WRITE-BIZ-01",
+    "AV-WRITE-VALID-01",
+})
+CHECK_CATALOG = tuple(
+    dataclasses.replace(c, caller_independent=True) if c.id in _CALLER_INDEPENDENT_CHECKS else c
+    for c in CHECK_CATALOG)
 
 CHECKS_BY_ID: dict[str, Check] = {c.id: c for c in CHECK_CATALOG}
 
@@ -1531,6 +1668,9 @@ VALIDATOR_ROW_EXCLUSIONS: dict[str, str] = {
                  "cross_identity (switching or adding a kind is an owner decision)",
     "verbose_error": "passive stack-trace scan; WSTG-ERRH-01 is judged by the passive "
                      "error_handling adapter instead",
+    "challenge_echo": "R11-8 (c): routed by capture shape on the analyze path; it records "
+                      "leads until the owner signs off, so a WSTG-BUSL-07 row (and its "
+                      "drive) is an owner decision",
 }
 
 # Current WSTG tests deliberately left without a row, each with the reason.

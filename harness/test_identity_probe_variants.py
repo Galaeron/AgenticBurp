@@ -283,7 +283,9 @@ class DriveCallerTests(_EngagementCallerBase, unittest.TestCase):
     """investigate_engagement with the real builder and crawl against the fixture,
     the coverage drive on, and the cross-identity leg recorded."""
 
-    def _investigate(self, roles, *, crawled=None, extra=()):
+    def _investigate(self, roles, *, crawled=None, extra=(), substitution=None, validate=None):
+        """`substitution` sets engagement.coverage_identity_substitution (R11-10);
+        None keeps the shipped default. `validate` replaces the recorder."""
         api = _Api()
         self.addCleanup(api.close)
         calls = []
@@ -296,10 +298,12 @@ class DriveCallerTests(_EngagementCallerBase, unittest.TestCase):
         def drive_config(*, mutating):
             cfg = _config(mutating=mutating)
             cfg["engagement"]["coverage_drive_legs"] = True
+            if substitution is not None:
+                cfg["engagement"]["coverage_identity_substitution"] = substitution
             return cfg
         patches = [patch("harness.engagement_builder.build_engagement", side_effect=build),
                    patch("harness.validators.cross_identity_validator.CrossIdentityValidator.validate",
-                         new=_record_cross_identity(calls)), *extra]
+                         new=(validate or _record_cross_identity)(calls)), *extra]
         with patch("harness.test_engagement_transport_callers._config", drive_config):
             result, rc, model = self._run(api, max_requests=500, roles=list(roles),
                                           extra_patches=patches)
@@ -330,7 +334,8 @@ class DriveCallerTests(_EngagementCallerBase, unittest.TestCase):
         result, calls = self._investigate(
             [ANON, USER1],
             extra=[patch.object(engagement.EngagementState, "record_identity_probe",
-                                lambda self, url, method, probe: None)])
+                                lambda self, url, method, probe: None)],
+            substitution=False)   # R11-10: no substituted replay of anonymous's capture
         self.assertFalse([c for c in calls if c[1] == "Bearer user1-token"
                           and c[0] == "/api/Products/1"], calls)
         blocks = {(b["endpoint"], b["identity"]): b for b in result["prerequisite_blocks"]}
@@ -344,8 +349,11 @@ class DriveCallerTests(_EngagementCallerBase, unittest.TestCase):
         def counting(ep, key):
             lookups.append((ep.key, key))
             return real(ep, key)
+        # R11-10 substitution off: the switch-off behaviour this test pins down
+        # (harness.test_r11_10_identity_credit covers it on).
         result, calls = self._investigate([ANON, USER1, GHOST], crawled=[ANON, USER1],
-                                          extra=[patch("harness.engagement.replayable_variants", counting)])
+                                          extra=[patch("harness.engagement.replayable_variants", counting)],
+                                          substitution=False)
         blocks = result["prerequisite_blocks"]
         ghost = [b for b in blocks if b["identity"] == "ghost"]
         self.assertEqual(sorted(b["endpoint"] for b in ghost),

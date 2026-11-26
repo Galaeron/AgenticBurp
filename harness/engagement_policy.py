@@ -98,6 +98,10 @@ class EngagementPolicy:
     # (all identities together; access-control checks per identity). Applies only
     # while the drive is time-bound; 0 = no per-endpoint bound.
     coverage_endpoint_check_share: float = 0.05
+    # R11-10 (owner decision 2026-11-19): an identity-bound coverage cell whose
+    # identity holds no capture of the endpoint replays another identity's capture
+    # with this identity's credentials only. Inside the coverage drive (off by default).
+    coverage_identity_substitution: bool = True
 
     @classmethod
     def from_config(cls, config: dict) -> "EngagementPolicy":
@@ -133,6 +137,7 @@ class EngagementPolicy:
             investigation_seconds=float(eng_cfg.get("investigation_seconds", 0)),
             coverage_drive_seconds=float(eng_cfg.get("coverage_drive_seconds", 0)),
             coverage_endpoint_check_share=_share(eng_cfg.get("coverage_endpoint_check_share", 0.05)),
+            coverage_identity_substitution=bool(eng_cfg.get("coverage_identity_substitution", True)),
         )
 
     def as_dict(self) -> dict:

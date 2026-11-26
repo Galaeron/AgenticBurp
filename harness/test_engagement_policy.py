@@ -29,6 +29,12 @@ def _load_committed_config() -> dict:
         return yaml.safe_load(f) or {}
 
 
+
+# Owner-approved default-on switches -> the off-by-default drive each refines.
+# R11-10 (owner decision 2026-11-19): credential substitution for identity-bound
+# coverage cells; it acts only inside the coverage drive (coverage_drive_legs).
+_OWNER_DEFAULT_ON = {"coverage_identity_substitution": "engagement_coverage_drive"}
+
 class EnumerationSafeDefaultsTests(unittest.TestCase):
     """Every active/engagement flag the policy tracks must enumerate to
     False on the clean, committed config.yaml -- explicit, one flag at a
@@ -64,11 +70,20 @@ class EnumerationSafeDefaultsTests(unittest.TestCase):
         explicit test still gets caught here."""
         flags = self.policy.active_flags()
         self.assertTrue(flags, "active_flags() returned nothing to check")
-        non_default = {name: value for name, value in flags.items() if value is not False}
+        non_default = {name: value for name, value in flags.items()
+                       if value is not False and name not in _OWNER_DEFAULT_ON}
         self.assertEqual(
             non_default, {},
             f"committed config.yaml has non-safe-default active/engagement flag(s): {non_default}",
         )
+
+    def test_owner_default_on_switches_are_on(self):
+        """The named exceptions above are on in the committed config, and each
+        refines a drive that is itself off by default."""
+        for name, drive in _OWNER_DEFAULT_ON.items():
+            with self.subTest(name=name):
+                self.assertIs(getattr(self.policy, name), True)
+                self.assertIs(getattr(self.policy, drive), False)
 
     def test_as_dict_enumerates_every_field(self):
         """as_dict() must expose every declared field (numeric companions
@@ -85,6 +100,7 @@ class EnumerationSafeDefaultsTests(unittest.TestCase):
             "coverage_case_budget", "coverage_parameter_field_cap", "capture_review_limit",
             "capture_review_seconds", "coverage_request_reserve",
             "investigation_seconds", "coverage_drive_seconds", "coverage_endpoint_check_share",
+            "coverage_identity_substitution",
         }
         self.assertEqual(set(d.keys()), expected_fields)
 
@@ -131,6 +147,8 @@ class ParityTests(unittest.TestCase):
             # Added after the refactor: the per-(endpoint, check) share of a
             # time-bound coverage drive.
             coverage_endpoint_check_share=float(eng_cfg.get("coverage_endpoint_check_share", 0.05)),
+            # R11-10 (owner decision 2026-11-19): default on.
+            coverage_identity_substitution=bool(eng_cfg.get("coverage_identity_substitution", True)),
         )
 
     def test_parity_on_committed_config(self):

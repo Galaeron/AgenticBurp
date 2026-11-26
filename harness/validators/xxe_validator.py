@@ -171,6 +171,11 @@ class XxeValidator(Validator):
         return (super().applies(finding, exchange) or _looks_xml(exchange)
                 or multipart_xml_part(exchange) is not None)
 
+    def claims_class(self, finding: Finding, exchange: HttpExchange | None = None) -> bool:
+        """R11-1: applies() also routes by an XML body or XML multipart part; a confirmation proves
+        this validator's class only for a finding of that class."""
+        return Validator.applies(self, finding, exchange)
+
     def _skip(self, why: str) -> ValidationResult:
         return ValidationResult(self.name, "skipped", "xxe", summary=why)
 

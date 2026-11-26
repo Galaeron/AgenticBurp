@@ -255,6 +255,10 @@ class ManagedSession:
     # the credentials -- a token, decoded claims, a cache key -- must key it on
     # (session_id, generation) so a refreshed session never serves stale state.
     generation: int = 0
+    # R11-6: digests (never values) of the credentials this session held before a
+    # replace_headers. A capture made with an earlier token is still this
+    # identity's request (run_tokens.issued_identity).
+    retired_credentials: set = field(default_factory=set, repr=False)
     # E5a health: "unverified" until a send is accepted, then "healthy"; "suspect"
     # after a 401 the run could not explain; "expired" once the health probe rejected
     # the credentials and no refresh restored them (sends are then refused unsent).
@@ -263,6 +267,11 @@ class ManagedSession:
     auth_failures: int = 0           # 401s seen on sends that carried this session's credentials
     _probe: "HealthProbe | None" = field(default=None, repr=False)
     _refresh_fn: object = field(default=None, repr=False)
+    # R11-8 (b): the operator-declared login of this identity (its credentials,
+    # kept in memory only and never logged) and the base URL it resolves against.
+    # Only an identity the run owns has one; legs that log in act only on it.
+    login: dict | None = field(default=None, repr=False)
+    login_base: str = field(default="", repr=False)
     _refreshes: int = field(default=0, repr=False)
     _checked_at: "float | None" = field(default=None, repr=False)   # _clock() of the last probe
     _expiry_reported: bool = field(default=False, repr=False)
@@ -368,12 +377,23 @@ class SessionManager:
             raise ValueError(f"unknown session reference: {session_id}")
         session._refresh_fn = fn
 
+    def set_login(self, session_id: str, login: dict, base_url: str) -> None:
+        """Keep this identity's declared login (role.login) for legs that must log
+        in as a run-owned identity (R11-8 b). In memory only; never logged."""
+        session = self._by_id.get(session_id)
+        if session is None:
+            raise ValueError(f"unknown session reference: {session_id}")
+        session.login, session.login_base = dict(login or {}), str(base_url or "")
+
     def replace_headers(self, session_id: str, headers: dict) -> ManagedSession:
         """Install new credentials for a session: bumps `generation`, marks it
         healthy, and drops the cookie jar (its cookies belonged to the old login)."""
         session = self._by_id.get(session_id)
         if session is None:
             raise ValueError(f"unknown session reference: {session_id}")
+        from harness import run_tokens
+        old, _ = run_tokens.issued_digests(session.headers)
+        session.retired_credentials |= old
         session.headers = dict(headers or {})
         session.generation += 1
         session.health = "healthy"
@@ -1389,6 +1409,10 @@ class RunContext:
     # E7: the run's durable journal of finished units (run_journal.RunJournal), set by the
     # server when runs.journal is on; None means the run is not journaled or resumed.
     run_journal: object = field(default=None, repr=False, compare=False)
+    # R11-4b: the instrumentation.RunInstrumentation of the engagement that owns this
+    # run, set by investigate_engagement, so a job cancelled before the engagement
+    # returned still reports its phase_timings. None: no engagement started.
+    instrumentation: object = field(default=None, repr=False, compare=False)
     # LB-6: the run's caller-declared objective (objective_profiles.ObjectiveTask),
     # or None, which means objective completion is never attempted. Set only by
     # the code that creates the run (a benchmark runner, a test), never by a model
@@ -1403,6 +1427,10 @@ class RunContext:
     # once discovery is built or restored. The XSS legs read it to load the page
     # route that issued an API call (routes_for_api). None: no route is known.
     client_routes: object = field(default=None, repr=False, compare=False)
+    # R11-5: the engagement's declared protected_paths (EngagementState.protected_paths,
+    # docs/PROTECTED_ROUTES.md patterns), set with the run's ownership. The write
+    # checks match them alongside config authz.protected_paths. Empty: none declared.
+    protected_paths: list = field(default_factory=list, repr=False, compare=False)
     # HU-5: the run's target change log (run_handoff.ChangeLog; every non-read send
     # that ended 2xx, in memory) and its handoff (run_handoff.RunHandoff, attached
     # by the server per job; None: no handoff is kept). Bookkeeping only.

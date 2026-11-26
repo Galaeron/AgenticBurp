@@ -27,6 +27,8 @@ from .path_traversal_validator import PathTraversalValidator
 from .open_redirect_validator import OpenRedirectValidator
 from .sequence_validator import SequenceValidator
 from .auth_sequence_validator import AuthSequenceValidator
+from .challenge_echo_validator import ChallengeEchoValidator
+from .password_change_validator import PasswordChangeSessionValidator
 from .stored_xss_validator import StoredXssValidator
 from .verb_tamper_validator import VerbTamperValidator
 from .csrf_validator import CsrfValidator
@@ -264,7 +266,23 @@ class ValidatorRegistry:
         auth_cfg = cfg.get("auth_sequence", {})
         if auth_cfg.get("enabled", True):
             self.validators["auth_sequence"] = AuthSequenceValidator(
-                allowed_hosts=_allowed, timeout=float(auth_cfg.get("timeout", 10.0)))
+                allowed_hosts=_allowed, timeout=float(auth_cfg.get("timeout", 10.0)),
+                confirm_lookup=bool(auth_cfg.get("confirm_lookup", True)))
+        # R11-8 (c): a challenge response that carries its own answer. Passive over
+        # captured pairs; the active submit and confirmation are both opt-in.
+        ce_cfg = cfg.get("challenge_echo", {})
+        if ce_cfg.get("enabled", True):
+            self.validators["challenge_echo"] = ChallengeEchoValidator(
+                allowed_hosts=_allowed, timeout=float(ce_cfg.get("timeout", 10.0)),
+                confirm=bool(ce_cfg.get("confirm", True)),
+                active_submit=bool(ce_cfg.get("active_submit", False)),
+                max_submissions=int(ce_cfg.get("max_submissions", 4)))
+        # R11-8 (b): a run-owned identity's token across its own password change.
+        # A write: allow_mutating_replay and mutating_ceiling_by_check >= 2.
+        pc_cfg = cfg.get("password_change_session", {})
+        if pc_cfg.get("enabled", True):
+            self.validators["password_change_session"] = PasswordChangeSessionValidator(
+                allowed_hosts=_allowed, timeout=float(pc_cfg.get("timeout", 10.0)))
         # Stored/second-order XSS leg -- plant via a write, confirm on an
         # independent HTML render. Active; mutating plant needs allow_mutating_replay.
         sxss_cfg = cfg.get("stored_xss", {})
@@ -315,7 +333,8 @@ class ValidatorRegistry:
         if rl_cfg.get("enabled", True):
             self.validators["rate_limit"] = RateLimitValidator(
                 allowed_hosts=_allowed, timeout=float(rl_cfg.get("timeout", 10.0)),
-                min_attempts=int(rl_cfg.get("min_attempts", 12)))
+                min_attempts=int(rl_cfg.get("min_attempts", 12)),
+                confirm_reset_answer=bool(rl_cfg.get("confirm_reset_answer", True)))
         # Predictable reset-token -- samples reset tokens and confirms only the
         # unambiguous predictability cases (sequential/timestamp/below-floor/
         # derived). Active; the reset trigger is a mutating POST (allow_mutating_replay).
@@ -341,6 +360,22 @@ class ValidatorRegistry:
             from harness.config_schema import parse_validators_flags
             self.validators["write_integrity"] = WriteIntegrityValidator(
                 allowed_hosts=_allowed, restore_routes=wi_cfg.get("restore_routes") or (),
+                allow_writes=parse_validators_flags(cfg)["allow_mutating_replay"])
+        # R11-7 business flows -- checkout tamper, coupon misuse, 2FA disable without
+        # step-up, replayed from the run's own captured flow on run-owned identities.
+        # Sends nothing unless allow_mutating_replay, active_enabled and an explicit
+        # mutating_ceiling_by_check.business_flow entry are all set.
+        bf_cfg = cfg.get("business_flow", {}) or {}
+        if bf_cfg.get("enabled", True):
+            from harness.config_schema import parse_validators_flags
+            from .business_flow_validator import BusinessFlowValidator
+            self.validators["business_flow"] = BusinessFlowValidator(
+                allowed_hosts=_allowed, read_backs=bf_cfg.get("read_backs") or (),
+                coupons=bf_cfg.get("coupons") or {},
+                mfa_status_reads=bf_cfg.get("mfa_status_reads") or (),
+                settlement_race=bf_cfg.get("settlement_race") is True,
+                race_copies=int(bf_cfg.get("race_copies", 2) or 2),
+                max_variants=int(bf_cfg.get("max_variants", 2) or 2),
                 allow_writes=parse_validators_flags(cfg)["allow_mutating_replay"])
 
         # DOM-based XSS leg -- drives a real browser with the payload in the URL
@@ -569,12 +604,42 @@ class ValidatorRegistry:
                 and {family, getattr(validator, "name", "")} & POLLING_EXCLUDED_VALIDATORS):
             return decision("unsupported", "protocol_inapplicable",
                             "a long-polling transport request carries framing, not application input")
+        if check.id == "WSTG-SESS-07":
+            # R11-8 (b): decodes the session JWTs the run already holds; sends nothing,
+            # so it needs no mutating-replay permission, and no JWT means no case.
+            from .auth_sequence_validator import _session_jwts
+            if not _session_jwts(exchange, run_context):
+                return decision("needs_prerequisite", "missing_credentials",
+                                "no session JWT in the capture or the run's identities")
+            return decision("ready", "ready", "decode-only token expiry check") | {
+                "mechanism_id": "auth.token_expiry"}
+        if check.id == "AV-PWCHANGE-01":
+            from .password_change_validator import change_shape
+            if change_shape(exchange) is None:
+                return decision("unsupported", "unsupported_boundary",
+                                "needs a captured change-password request")
+            gate = getattr(run_context, "gate", None)
+            if gate is None or not gate.config.allow_mutating_replay or \
+                    gate.mutating_headroom(None, "password_change_session")[2] < 2:
+                return decision("policy_denied", "mutating_policy_denied",
+                                "the change and its restore need allow_mutating_replay and "
+                                "mutating_ceiling_by_check.password_change_session >= 2")
+            return decision("ready", "ready", "password change with restore") | {
+                "mechanism_id": "auth.password_change_session"}
         method = (exchange.method or "GET").upper()
         path = urlsplit(exchange.url).path.lower()
         if check.id in {"WSTG-ATHN-07", "WSTG-SESS-03", "WSTG-IDNT-04", "WSTG-ATHN-11", "WSTG-SESS-06"}:
             from .auth_sequence_validator import _parse_body, _find_key, _PASS_KEYS, _USER_KEYS
+            from .auth_sequence_validator import _query_identifier
             fields, _kind = _parse_body(exchange)
             password, user = _find_key(fields, _PASS_KEYS), _find_key(fields, _USER_KEYS)
+            if (check.id == "WSTG-IDNT-04" and method == "GET"
+                    and _query_identifier(exchange) is not None):
+                # R11-8 (c): a GET lookup that takes the account identifier in its
+                # query (a recovery lookup). r11 never dispatched one: only a
+                # captured credential write passed this gate.
+                return decision("ready", "ready", "identifier lookup") | {
+                    "mechanism_id": "auth.account_lookup"}
             if method not in {"POST", "PUT"}:
                 return decision("unsupported", "unsupported_method", "auth procedure needs a captured credential write")
             if check.id == "WSTG-ATHN-07":
@@ -667,14 +732,16 @@ class ValidatorRegistry:
             if method == "DELETE" and str(self._xid_cfg.get("delete_restore_method", "")).upper() != "PUT":
                 return decision("needs_prerequisite", "missing_restore_contract", "DELETE requires an explicit PUT recreation contract")
         if family == "write_integrity":
-            from .write_integrity_validator import (BUSINESS_RULE_TAMPER, FORGED_AUTHORSHIP, kind_for,
+            from .write_integrity_validator import (BUSINESS_RULE_TAMPER, FORGED_AUTHORSHIP,
+                                                    UNAUTHORIZED_UPDATE, kind_for,
                                                     _is_create, _json_object)
             kind = kind_for(finding_class, exchange)
             if method not in {"POST", "PUT", "PATCH"} or kind is None:
                 return decision("unsupported", "unsupported_method", "write checks need a captured JSON create or update")
             if _json_object(exchange.request_body) is None:
                 return decision("needs_prerequisite", "missing_json_body", "a captured JSON object body is required")
-            if not _is_create(exchange) and kind not in (BUSINESS_RULE_TAMPER, FORGED_AUTHORSHIP):
+            if not _is_create(exchange) and kind not in (BUSINESS_RULE_TAMPER, FORGED_AUTHORSHIP,
+                                                         UNAUTHORIZED_UPDATE):
                 return decision("unsupported", "unsupported_method", "this write check needs a POST create to a collection")
             if run_context is None or not run_context.gate.config.allow_mutating_replay:
                 return decision("policy_denied", "mutating_policy_denied", "write checks require explicit mutating replay permission")
@@ -693,6 +760,22 @@ class ValidatorRegistry:
                 return decision("policy_denied", "mutating_policy_denied",
                                 "client-trust tampers require explicit mutating replay permission")
             mechanism = "client_trust.tamper"
+        if family == "business_flow":
+            from .business_flow_validator import kind_for
+            if method not in {"POST", "PUT", "PATCH"}:
+                return decision("unsupported", "unsupported_method",
+                                "a business flow replays a captured POST/PUT/PATCH write")
+            if kind_for(finding_class, exchange) is None:
+                return decision("unsupported", "no_flow_shape",
+                                "the capture has no checkout, coupon or 2FA-disable shape for this check")
+            gate = run_context.gate.config if run_context is not None else None
+            if gate is None or not gate.allow_mutating_replay:
+                return decision("policy_denied", "mutating_policy_denied",
+                                "business flows require explicit mutating replay permission")
+            if "business_flow" not in (gate.mutating_ceiling_by_check or {}):
+                return decision("policy_denied", "mutating_ceiling_missing",
+                                "business flows need an explicit mutating_ceiling_by_check.business_flow")
+            mechanism = "business_flow." + kind_for(finding_class, exchange)
         if family == "websocket":
             # Cross-site hijacking rides the cookie a browser attaches on its own;
             # a long-poll capture is not a WebSocket handshake.

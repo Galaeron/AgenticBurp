@@ -5175,7 +5175,50 @@ Non-negotiables apply:
 - `full` must be green before close.
 - Nothing may be specific to Juice Shop.
 
-### [ ] R11-1 — A confirmation counts only for the class whose mechanism it proves  ★
+### [x] R11-1 — A confirmation counts only for the class whose mechanism it proves  ★
+- **Done (2026-11-18, branch `fix/r11-1-confirm-class`):**
+  - `Validator.claims_class` checks the class only. By default it is `applies`. It is
+    overridden where `applies` also routes by shape: well_known (path), api_security
+    (response evidence), open_redirect (redirect params), xxe (XML body), path_traversal
+    (file-shaped exchange) and jwt_forge (JWT present; a bare "token" label counts only
+    when it names no other canonical class).
+  - `ValidationResult.mechanism_classes` lists the classes a result proves.
+    `ValidationResult.observation` marks a result as an observation.
+  - The exposure oracle proves data exposure, and also `idor` when the secret belongs to
+    another account (so the r7 BOLA path still confirms). The .well-known probe returns
+    a `security_txt` or `csaf` observation.
+  - In `_validate_findings`, `proves_finding_class` gates every confirmed result.
+    - On a mismatch, the routed finding is recorded as `skipped` and its own verdict is
+      left open.
+    - The proof is filed once per (validator, class, proof) per run, as a confirmed
+      finding of the proved class, in a report appended to `reports`.
+      `plan_dispatch` keeps that report with the caller's.
+    - An observation never confirms a canonical vulnerability class; `recon` is the
+      one exception.
+  - Tests: `harness/test_r11_confirm_class.py` runs the real dispatch and the plan path
+    against owned loopback services. It covers both acceptance cases, both controls,
+    another account's secret still proving a BOLA, and defect injection with the gate
+    off.
+- **Audit (c), left as is:**
+  - The graph loop `_confirm` (`orchestrator_chain.py`) routes by class substring by
+    construction.
+  - The coverage drive (`_bind_stored`) is already pre-filtered by
+    `bind_confirmation_proof`, which matches on the proof's class.
+  - The class-extension legs keep `applies` as their claim: idor_read and cross_identity
+    (access-control markers), the listing/filter/metrics/sensitive-file matchers, and
+    write_integrity `_kind_of`. They route by class already.
+  - Duck-typed validators without `claims_class` also keep `applies` as their claim.
+  - The agent-fallback route is still bound by `_fallback_result_binds`, the existing
+    guard, and is unchanged.
+- **Follow-ups, fixed in the second commit:**
+  - The iterative review path (`_review_iterative_findings`) now adds the finding filed
+    apart to the held list that `pivot_memory.integrate` persists. The finding is stored
+    with its proof.
+  - jwt_forge `claims_class` declines any canonical class other than jwt and auth, so
+    reset-token findings are no longer claimed. `applies` is unchanged, so the leg still
+    runs. A forgery filed apart is named `jwt` (`Validator.mechanism_class`).
+- **Left for R11-2:** free-text labels that resolve to no canonical class (for example
+  "password reset token") are still claimed through the "token" substring.
 - **Domain:** Confirmation correctness · **Effort:** M · **Mode:** LOOP (offline).
 - **Evidence (VERIFIED):**
   - `WellKnownValidator.applies` (`harness/validators/exposure_leads.py:1117-1122`) accepts any
@@ -5213,7 +5256,7 @@ Non-negotiables apply:
   - Negative controls: a genuine data-exposure finding on that route still confirms; a
     well_known finding still gets its observation.
 
-### [ ] R11-2 — Normalise class names before grouping issues
+### [x] R11-2 — Normalise class names before grouping issues
 - **Domain:** Issue accounting · **Effort:** S · **Mode:** LOOP (offline).
 - **Evidence (VERIFIED):** `issue_class` (`harness/issues.py:584-590`) falls back to the raw
   lowercased label. `exposed_metrics_endpoint`, `exposed metrics endpoint` and
@@ -5232,7 +5275,7 @@ Non-negotiables apply:
   - Negative control: two different unknown classes on one route stay two issues.
   - `test_issue_*`/report tests are unchanged.
 
-### [ ] R11-3 — Keep sqlmap off transport endpoints and cap its time per endpoint
+### [x] R11-3 — Keep sqlmap off transport endpoints and cap its time per endpoint
 - **Domain:** Scheduling / cost · **Effort:** M · **Mode:** LOOP (offline); efficacy OWNER/LIVE.
 - **Evidence (SUPPORTED, r11):**
   - sqlmap sent 52% of target requests (115,137 gate authorisations; r10 51%).
@@ -5254,7 +5297,7 @@ Non-negotiables apply:
   - Past its share, sqlmap's next target is reported as held, not silently dropped.
   - Negative control: a parameter named `t` on a non-transport route still gets sqlmap.
 
-### [ ] R11-4 — Hand unused phase time to skipped work before the job ends
+### [x] R11-4 — Hand unused phase time to skipped work before the job ends
 - **Domain:** Scheduling · **Effort:** M · **Mode:** LOOP (offline).
 - **Evidence (SUPPORTED, r11):**
   - The job ended 51 min before its soft-cancel deadline.
@@ -5274,7 +5317,62 @@ Non-negotiables apply:
   - `phase_timings` is filled.
   - Negative control: no extra pass starts after the soft-cancel deadline.
 
-### [ ] R11-5 — Find why thousands of successful writes produced no write verdict
+### [x] R11-4b — Close the three follow-ups from the R11-4 review
+- **Domain:** Scheduling / instrumentation · **Effort:** S · **Mode:** LOOP (offline).
+- **Evidence (VERIFIED, code read 2026-11-19):**
+  - The final pass's `drive_legs` and `held_replays` steps were tested only on the coverage
+    tracker. The caller tests stubbed the coverage drive, so neither step ran through
+    `investigate_engagement`.
+  - `server.py`'s cancelled-job result had no instrumentation block. A cancelled job reported
+    no `phase_timings` or `sqlmap_targeting`, and its manifest's `phase_timings` was empty.
+    This may be why the r11 post-mortem read `phase_timings` as empty.
+  - `experiments_final` got only the coverage deadline:
+    - With no `coverage_drive_seconds`, it ran with no time bound at all.
+    - The coverage deadline is not clamped to the investigation deadline unless rollover is
+      on, so the pass could run into finalise's reserve or past the run's deadline.
+    - Once the deadline had passed (the retry rounds and the final pass run past it), the
+      pass sent nothing. It only re-evaluated and marked READY tasks deferred ("stage
+      deadline reached"), but the phase record showed it as begun with no budget.
+- **DONE (2026-11-19, branch `claude/r11-4b-final-pass-fa21d0`):**
+  1. `harness/test_final_pass_callers.py` runs the real coverage drive through
+     `investigate_engagement` on one fake clock:
+     - A leg the drive queued and never attempted is sent by the final pass, and nothing the
+       drive sent is sent again.
+     - A replay the per-endpoint share held is sent once, and the cell's held list empties.
+     - Controls: the pass off; no time left; only the finalise reserve left.
+     - No bug found. Unplugging either step fails the positive tests.
+  2. A cancelled job now reports phase timings:
+     - `investigate_engagement` leaves its `RunInstrumentation` on the run
+       (`RunContext.instrumentation`).
+     - The server's cancelled-job result adds the same `{instrumentation, costs}` a finished
+       job reports. The phase the cancel cut is closed with `interrupted: true`
+       (`PhaseRecorder.abort`).
+     - Test: `harness/test_cancelled_instrumentation.py`. Its controls: a finished job is
+       unchanged; a job cancelled before any engagement started reports no block.
+     - This covers the `CancelledError` path that a cancel (or a soft-cancel deadline sent
+       through `/cancel`) takes. A job cancelled before its coroutine's first step
+       (`_ensure_cancelled`) still has no block, since no engagement started.
+  3. `experiments_final` is bounded by the coverage deadline and by the investigation
+     deadline less the finalise reserve (`engagement.final_pass.reserve_seconds`, which
+     applies whether the final pass is on or off):
+     - Once that bound has passed, the phase is recorded as skipped, with why:
+       - `PhaseRecorder.skip` writes a `skipped: <reason>` record;
+       - the handoff lists it under `phases.skipped`;
+       - `experiment_final_pass.skipped` carries the same reason.
+     - The pass then only marks READY tasks deferred and sends nothing.
+     - `experiments_final` is now in `CONDITIONAL_PHASES`.
+     - Fake-clock caller tests are in `test_final_pass.FinalPassCallerTests`:
+       - no drive deadline: the pass is bounded at deadline less reserve;
+       - a drive deadline past the run's deadline: bounded by the run's deadline;
+       - skipped with only the reserve left;
+       - skipped once the final pass ran past the drive deadline.
+       - Control: it still runs, within the drive deadline, when time remains.
+- **Tests that fail before the change:** the item 2 server test and the
+  run-registration test; the item 3 tests. The item 3 control's deadline check passed
+  before; it fails before only on the new `budget_s`. The item 1 tests pass on the old code,
+  since they only add coverage.
+
+### [x] R11-5 — Find why thousands of successful writes produced no write verdict
 - **Domain:** Authorization / write checks · **Effort:** M · **Depends on:** HU-1 for intent
   on non-owned objects · **Mode:** LOOP (offline investigation from the r11 store, then a fix).
 - **Evidence (SUPPORTED, r11, `strix_compare.py`):**
@@ -5298,7 +5396,7 @@ Non-negotiables apply:
   - the restore is verified.
   - Negative control: a 200 that changes nothing gives `not_confirmed`.
 
-### [ ] R11-6 — Map captured principals to identities and build mass-assignment bodies
+### [x] R11-6 — Map captured principals to identities and build mass-assignment bodies
 - **Domain:** Identity / coverage · **Effort:** M · **Mode:** LOOP (offline).
 - **Evidence (SUPPORTED, r11 terminal reasons):**
   - 560 cells ended `missing_principal` and 453 `unreachable_identity`.
@@ -5315,7 +5413,9 @@ Non-negotiables apply:
   - A write endpoint seen only through its GET gets a mass-assignment leg.
   - Negative controls: a foreign token stays unregistered; a read-only field is never sent.
 
-### [ ] R11-7 — Multi-step business flows (checkout, coupons, wallet, 2FA)  [NEEDS OWNER DECISION — write scope]
+### [x] R11-7 — Multi-step business flows (checkout, coupons, wallet, 2FA)  [OWNER APPROVED 2026-11-19]
+- **Owner decision (2026-11-19):** checks may drive multi-step writes on run-owned accounts,
+  restoring where possible and naming what is left; behind the existing write gates.
 - **Domain:** Workflow misuse · **Mode:** design LOOP after the owner decides; live OWNER/LIVE.
 - **Evidence (SUPPORTED):** r11 never sent checkout, coupon, 2FA-disable or deluxe-membership
   flows to completion, while Strix confirmed 8 findings there:
@@ -5326,12 +5426,81 @@ Non-negotiables apply:
 - **Note:** this is HU-4's scope with live evidence. The flows create orders and move wallet
   balance, so the owner must first decide which state-creating steps a run may take and how
   it restores them. Track it under HU-4; this entry holds the evidence.
+- **DONE offline (2026-11-19):** `harness/validators/business_flow_validator.py`, one leg
+  (`business_flow`) with three kinds. Each starts from the run's own captured flow and is
+  judged only on a read-back. See `docs/WRITE_CHECKS.md`.
+  - `d8a168c7` checkout/payment tamper, `WSTG-BUSL-10`:
+    - It replays the cart steps and the settlement as an untampered control, then with a
+      client-chosen amount, a negative quantity or a fake delivery id. It confirms when
+      the order total or balance read-back shows less was charged.
+    - Payment skip (covers wallet and deluxe membership): it drops or forges the payment
+      field. It confirms when a standing is granted with no debit; a new order alone is a
+      lead.
+  - `56daf874` coupon misuse, `AV-BUSL-COUPON-01`: forged, expired and another identity's
+    code. It confirms on the read-back discount and clears a body code again.
+  - `bbd62f63` 2FA disable without step-up, `WSTG-BUSL-06`: the step-up field is dropped,
+    then wrong, and the status read-back decides. It re-enables 2FA from the identity's
+    captured enable request, otherwise the finding names "2FA LEFT DISABLED".
+  - Gates: `active_enabled`, `allow_mutating_replay` and an explicit
+    `mutating_ceiling_by_check.business_flow`. The defaults send nothing. It sends only
+    through `RunContext.executor()` as a registered identity and never sends DELETE.
+    Placed orders are named LEFT IN PLACE.
+  - Tests: `harness/test_business_flows.py` (16): a positive and a negative per flow
+    through the real dispatch, the defaults, a missing ceiling, foreign credentials, the
+    unrestorable 2FA residue, and no DELETE.
+  - Left over: R11-7b (live trial) and R11-7c (gaps).
+
+### [ ] R11-7b — Live trial of the business_flow leg  [OWNER/LIVE]
+- **Mode:** LIVE on a fresh container. Use `config.local.yaml` with `active_enabled`,
+  `allow_mutating_replay` and `mutating_ceiling_by_check.business_flow: 8`.
+- **Aim:** confirm on a live target that the leg reaches the r11/Strix shapes:
+  checkout (#21), wallet and deluxe (#22, #26), coupons (#23, #24, #30) and 2FA disable (#29).
+- **Check the captured flow:** does it hold the read-backs the leg needs (an order
+  history, a basket, a 2FA status GET)? If not, declare them in
+  `validators.business_flow.read_backs` / `mfa_status_reads`.
+- **Expect residue:** orders stay; a coupon carried in the path stays applied; 2FA
+  usually stays disabled, because re-enabling needs a fresh TOTP. All of it is named
+  in the change log.
+
+### [x] R11-7c — business_flow gaps not covered by R11-7
+- **Mode:** LOOP (offline). **DONE offline (2026-11-19)**, branch
+  `claude/r11-7c-business-flow-gaps-bb7387`. Detail in `docs/WRITE_CHECKS.md`.
+- **Done:**
+  - **Coupon at the settlement step:** loopback test with a positive (forged code
+    settles for less than the code-emptied control) and a negative (checked codes).
+    It exposed two faults, both fixed. A refused tampered settlement left its cart
+    items in the basket, and they were not named. And every later variant was
+    dropped. Now the next settlement-step variant settles the basket the refused
+    flow left (no refill), and the leftover items are named `LEFT IN PLACE`.
+  - **Race at settlement (#25):** `validators.business_flow.settlement_race`, off by
+    default. After an unconfirmed payment_tamper check, it fills the basket once and
+    settles twice in sequence (the control), then refills and sends N concurrent
+    settlements. N comes from `authorize_burst`, so `max_burst_size` caps it. It
+    confirms only when the read-back shows more entries, or more balance spent, than
+    the control allowed. Placed orders are named `LEFT IN PLACE`.
+  - **2FA restore:** an identity's `role.login.totp_secret` lets the re-enable put a
+    freshly computed RFC 6238 code in the captured enable request's code field.
+    Without a secret, or with a wrong one, it is named `2FA LEFT DISABLED` as before.
+    The secret and the codes are never logged or reported.
+  - **Variants and flow discovery:** variants are spread over the value families,
+    `max_variants` (default 2, hard cap 4). A cart step is a cart-shaped write, or a
+    write the captured read-backs show adding an entry that carries its values. An
+    unrelated write is not replayed.
+  - Tests: `harness/test_business_flows.py`, 16 to 30.
+- **Left open:**
+  - a race on one balance or a one-time grant with no cart step (the sequential
+    control would consume it);
+  - the race has no catalog row of its own (it reports under WSTG-BUSL-10);
+  - a 2FA setup that needs a fresh server-issued value, not only a code;
+  - a basket filled by a multipart write, or one with no captured read-back after it;
+  - still at most three cart steps;
+  - live trial of all of the above (R11-7b).
 
 ### [ ] R11-8 — Detection gaps behind Strix findings r11 sent requests for but never reported
 - **Domain:** Detection · **Effort:** M per sub-item · **Mode:** LOOP (offline); (b) and (c)
   change confirmation policy, so they need OWNER sign-off.
 - **(a) The leg mutated the wrong inputs (Strix #3, NoSQL operator injection on a review
-  PATCH).**
+  PATCH).** (DONE 884e32ca)
   - Evidence (SUPPORTED, r11 proofs): the nosql leg ran on `PATCH /rest/products/reviews`
     and the review POST/PUT 9 times. Every time it put operators in inputs named `name` and
     `value`, which "behaved like plain strings". It never mutated the request's own `id`
@@ -5343,15 +5512,33 @@ Non-negotiables apply:
     (`orchestrator_helpers.py:569-570`, VERIFIED). JSON write bodies get one only when an
     agent labels them.
 - **(b) The leg saw the evidence but by design only records an observation (Strix #17, #16).**
+  (DONE 865a1f2b + 2029f7ef expiry, ddd8aade failed-login burst, 2599eeb9 password change.)
+  - Token expiry: a session JWT with no `exp` (captured login, request or run identity)
+    confirms as `session_expiry` on WSTG-SESS-07, decode only; no JWT, no case.
+  - Failed-login burst: for a run identity with a declared login (`role.login`, now kept by
+    `SessionManager.set_login`), rate_limit sends `min_attempts` wrong passwords under
+    `max_burst_size`, then the real login. Still accepted, no throttle: confirms. Refused:
+    not vulnerable, and the identity is named as left locked. Needs max_burst_size >=
+    min_attempts (12) to confirm; fewer is a lead.
+  - Password change: new leg `password_change_session` (AV-PWCHANGE-01,
+    `session_after_password_change`) changes and restores a run identity's password through
+    the captured change flow. Needs `allow_mutating_replay` and
+    `mutating_ceiling_by_check.password_change_session >= 2`; off by default. A failed
+    restore is named in the verdict.
   - rate_limit sent rapid POSTs to `/rest/user/login`, saw no throttle, and recorded
     "OBSERVATION (not confirmed)". A valid-login burst cannot prove there is no lockout on
     failed logins (`rate_limit_validator.py:16-18`, `:167`, VERIFIED).
   - auth_sequence (SESS-06) recorded "Logout invalidation lead": the bearer JWT has no `exp`
     claim.
   - Owner question: may a missing `exp` on a session JWT confirm as a finding of its own?
+    **Owner decision (2026-11-19): yes** to all three: a missing `exp` confirms, a
+    failed-login burst on a run-owned account may confirm "no lockout", and a password
+    change plus restore may test whether the old token survives.
   - A token that survives a password change has no leg. It would need a password change and
     a restore, so it is a write.
-- **(c) No leg exists (Strix #27, #15).**
+- **(c) No leg exists (Strix #27, #15).** (DONE 8723e21b. Owner decision 2026-11-19:
+  confirm by default, flipped in 62099c10 (config, registry fallbacks, constructors);
+  challenge_echo `active_submit` stays off.)
   - A challenge endpoint that returns its own answer: 4,581 captcha requests in r11, never
     flagged. Generic oracle: a value from one response that a later request must echo to
     pass the challenge.
@@ -5373,3 +5560,202 @@ Non-negotiables apply:
 - DELETE legs (Strix #8, #9) are held by owner policy.
 - `/support/logs` (Strix #20) is linked nowhere (crawl check). It is a wordlist question,
   not a missing leg.
+
+### [x] R11-9 — Stop the crawler's guessed body from serving as the endpoint template
+- **Domain:** Coverage / precision · **Effort:** M · **Mode:** LOOP (offline). Filed by R11-6 (c).
+- **Evidence (VERIFIED, code):**
+  - When the role crawler has no schema or form for a write, it sends
+    `role_crawl._GENERIC_JSON_BODY` (`{"name": "probe", "value": "probe"}`). The engagement
+    then records that exchange as the endpoint template, and every injection leg
+    (sqli, ssti, command injection, xss, nosql) mutates the guessed keys as if they were
+    real parameters.
+  - `models.body_is_placeholder` and `request_body_is_placeholder` already mark the guess,
+    but only prompts and, since R11-6, the mass-assignment legs consult them.
+  - R11-6 builds an update's body from the object's own GET
+    (`validators/read_body.body_from_read`), but only inside the sequence leg. The template
+    other legs receive is unchanged.
+- **Recommendation:**
+  - When an item's GET has been observed and the write's only body is the guess, record a
+    read-built body as the template (settable fields only, `read_body.settable_fields`),
+    marked as read-built, not captured.
+  - Have each injection leg skip, or deprioritise, a template whose body is still a
+    placeholder, instead of injecting into `name` and `value`.
+  - This changes the template every leg consumes, so it is larger than R11-6's
+    mass-assignment-only change.
+- **Acceptance criteria:**
+  - An update seen through its GET and a guessed write gets a read-built template, and its
+    injection legs mutate the read's settable fields.
+  - Negative control: a real captured body is never replaced.
+  - Negative control: a guessed body is never offered to an injection leg as known
+    parameters.
+- **Result (VERIFIED offline, DONE 84e696f1):**
+  - `EngagementState.record_template` gives a PUT/PATCH of one object that was sent only
+    with the guess a template built from the object's observed 2xx GET
+    (`body_from_read`, settable fields only), marked `body_source="read"` and
+    `read_from="GET <path>"`. A captured body is never replaced, and one captured later
+    takes over (template richness now ranks captured > read-built > guess).
+    `captured_nodes` replays a guessed variant of the same object with the read-built body.
+  - `injection_targets.guessed_body` (moved from nosql) gates every leg: `param_targets`
+    drops a guess's keys (command injection, ssti, nosql, path traversal, ssrf, open
+    redirect, and the `_has_injectable_param` shape routing). sqlmap tests only the query,
+    or is not launched ("not a negative result"). stored_xss does not apply. Coverage
+    derives no body cases from a guess.
+  - Tests: `harness/test_r11_9_read_built_template.py` (10).
+  - Injection legs on a read-built write body are still mutating replays: the safety
+    gate's write settings (off by default) decide whether they send.
+- **Open points found by R11-6 (not in its scope):**
+  - **Owner decision:** whether an anonymous read may count as an exposure caller. Most of
+    r11's 31 "not a registered session" skips were captures with no credentials at all
+    (`/api/Challenges`, `/rest/memories`, `/api/Feedbacks`). R11-6 now skips these with
+    their own reason ("carries no credentials"). Counting them would change confirmation
+    policy. **Owner decision (2026-11-19): yes**, an anonymous read counts as an exposure
+    caller. **DONE e978b876:** a credential-less GET is replayed twice as the anonymous
+    caller; an unmasked credential secret on an account object confirms excessive data
+    exposure only (no idor/BOLA class, no missing-auth claim). Tests:
+    `harness/test_r11_9_anonymous_exposure.py` (4).
+  - **The 560 `missing_principal` cells** look like coverage gaps, not identity mapping.
+    In r11, captures already matched the role headers exactly (for example eval-user-1 and
+    eval-user-2), so no token mapping was needed for them. The cells come from the coverage
+    drive's `replayable_variants` and `identity_variants` (`orchestrator_chain.py`), so look
+    there. **Investigated: not a small fix, filed as R11-10.**
+  - The read-built mass-assignment leg needs `validators.mutating_ceiling_by_check.sequence
+    >= 2` (the write plus its restore) and `allow_mutating_replay`. Both stay off by default,
+    so r12 sends nothing new until the owner sets them.
+
+### [x] R11-10 — Stop counting an identity's missing capture as a coverage gap for identity-independent checks
+- **Domain:** Coverage accounting · **Effort:** M · **Mode:** LOOP (offline), with an owner
+  decision on the identity-bound half. Filed by R11-9.
+- **Evidence (VERIFIED, r11 `result.json` coverage checkpoint, read-only):**
+  - 543 checkpoint cells (560 in the post-mortem's count) end `missing_principal`, on 15
+    endpoints. 233 are eval-user-2's, 177 anonymous's and 133 eval-user-1's.
+  - On every one of those endpoints, one or two of the three identities hold a capture and
+    the others hold none. Examples: `POST /rest/user/login` and
+    `PUT /rest/order-history/-1/delivery-status` were captured only as anonymous, and
+    `POST /profile`, `POST /dataerasure` and `GET /api/Addresss/null` only as one or both
+    users.
+  - **346 of the 543** are identity-independent checks (injection, error handling, client
+    checks, CONF) that another identity already ran on the same endpoint. They count the
+    same work again as a gap.
+  - **197** are identity-bound checks (WSTG-ATHZ/SESS/ATHN, AV-WRITE-AUTHOR/XID,
+    AV-EXPOSURE). There, the identity never sent the request. This is a real gap.
+  - Several of the 15 endpoints are crawler-filled paths (`/api/Addresss/null`,
+    `/rest/products/file/reviews`, `/rest/track-order/file`, `/socket.io/socket.io`).
+- **Cause (VERIFIED, code):**
+  - The coverage matrix makes one cell per (identity, endpoint, check). For an endpoint
+    with any capture, `_captured_readiness` (`orchestrator_chain.py:2932`, the return at
+    `:2953`) and `_run_leg_core` (`:2976`, the result at `:3001`) look up only
+    `replayable_variants(ep, capture_identity_key(<this identity>))` (`engagement.py:263`
+    via `identity_variants`, `:249`). An identity with no capture of its own is
+    `missing_principal`, whatever the check. `worklist_investigator.captured_nodes:56`
+    yields the same marker when a variant's identity key matches no role.
+  - `coverage_tracker.py:1274-1282` then counts these cells as prerequisite blocks.
+- **Recommendation:**
+  - For a check whose verdict does not depend on the caller, record the cell of an
+    identity with no capture as covered by the identity that ran it, not as
+    `missing_principal`. One option is a terminal `covered_by_identity:<id>` reason.
+    The list of identity-independent checks should come from the check catalog, not from
+    the cell.
+  - For identity-bound checks, keep `missing_principal`. Whether the drive may replay
+    another identity's capture with this identity's credentials changes E5b's "only
+    observed requests" rule. That needs an **owner decision**.
+  - Optional: drop crawler-filled paths (a `null`, `file` or `-1` segment that no capture
+    took from a response) from the matrix.
+- **Acceptance criteria:**
+  - On an endpoint captured only as A, an injection check verdict for A covers B's cell,
+    and B's cell is no longer `missing_principal`.
+  - Negative control: an access-control check for B stays `missing_principal`, unless the
+    owner approves replaying with substituted credentials.
+  - The r11 checkpoint replayed through the new accounting leaves at most the 197
+    identity-bound cells.
+- **Offline half (VERIFIED offline, 2026-11-19, branch `claude/r11-10-coverage-credit-611952`):**
+  - The split is in the catalog: `Check.caller_independent` (default False), set on the
+    rows named in `coverage_model._CALLER_INDEPENDENT_CHECKS`.
+  - `CoverageTracker.credit_caller_independent` runs in every `report()`. A cell of an
+    identity with no capture, on a caller-independent check, is credited to the identity
+    that holds the capture, with terminal reason `covered_by_identity` (that cell is
+    conclusive), `open_on_identity` (no verdict yet: the gap is counted once, on that
+    cell) or `not_applicable_on_identity` (that capture was judged protocol-inapplicable).
+    The row carries `covered_by`, and the detail is `<reason>:<id>: ...`. The cell stays
+    INCONCLUSIVE and is never executed. It is left out of `not_tested` and
+    `cases_not_tested` and counted under `credited_by_identity`.
+  - `orchestrator_chain` (`_captured_readiness`, `_run_leg_core`): such a cell returns
+    reason code `covered_by_identity` and no longer adds to `prerequisite_blocks`.
+    No request is sent and no credentials are substituted.
+  - Tests: `harness/test_r11_10_identity_credit.py` (12, one at caller level).
+  - Replay of the r11 checkpoint (read-only, `.test-work/r11-10/replay_r11_checkpoint.py`
+    in the worktree): 543 -> **232** `missing_principal`. 311 cells are credited
+    (103 covered, 193 open on the other identity, 15 not applicable there). None of them
+    is executed or listed in `not_tested`.
+  - **Gap against the "at most 197" criterion:** 232 = the 197 owner-listed cells + 35
+    cells on five rows kept identity-bound under "when unsure, identity-bound":
+    `WSTG-INJT-20` (11) and `AV-MASSASSIGN-02` (9) (an admin may set a privileged
+    field; the write leg needs a non-privileged principal), `WSTG-BUSL-05` (10) (race
+    limits are often per account), `WSTG-CLNT-10` (3) (WebSocket hijacking rides the
+    session) and `WSTG-INJT-03` (2) (verb tampering is an access-control bypass).
+    **Owner:** confirm or move any of these into `_CALLER_INDEPENDENT_CHECKS`
+    (one id each).
+- **Owner decision (2026-11-19):** credential substitution is allowed for the
+  identity-bound cells. It is default on behind one switch, like the R11-8(c) confirm
+  defaults.
+- **Identity-bound half (VERIFIED offline, 2026-11-19, same branch):**
+  - Switch `engagement.coverage_identity_substitution` (default `true`). It is read by
+    `EngagementPolicy` and is in `config_schema._PASSIVE_FORCE_OFF_KNOBS`. It takes
+    effect only inside `coverage_drive_legs`, which is off by default and is forced off
+    in passive mode too.
+  - `engagement.substituted_variant`: another identity's capture, re-keyed to the target
+    identity.
+    - It keeps `substituted_from` and `substituted_capture_id`.
+    - It drops the source's response (status, headers, body), so no verdict reads the
+      source identity's response as the target's.
+    - It returns None when the URL, query or body carries a credential: a field named like
+      one (csrf, xsrf, token, session, sid, jwt, password, secret, api key, auth...), or
+      one of the source identity's own header or cookie values.
+    - Captures hold no request headers. `_seed_exchange` attaches only the replaying
+      identity's own credentials (none for anonymous), so the source's credentials are
+      never mixed in.
+  - `orchestrator_chain` (`_substituted_variants`, used by `_captured_readiness` and
+    `_run_leg_core`): an identity-bound, non-passive check with no own capture uses the
+    first other identity (sorted) whose replayable captures substitute.
+    - The send then takes the same `_run_captured_leg` path, safety gate, mutating rules,
+      per-check ceilings and write-restore rules as an own-capture replay.
+    - Passive legs (`content_exposure`, `security_headers`, `error_handling`) judge the
+      captured response, so they are never substituted. Those cells stay
+      `missing_principal`.
+    - A cell with no substitutable capture also stays `missing_principal`.
+  - Provenance:
+    - The result summary and the proof limitation (and so the cell detail and the proof's
+      `observed_result`) start with `substituted_from:<source>: replayed from <source>'s
+      capture with <identity>'s credentials substituted`.
+    - The finding carries `replayed_from_identity` and `credential_substitution: true`
+      (kept by `EndpointNode.add_finding`).
+  - E5b comments updated in `engagement.py`, `engagement_builder.py`,
+    `orchestrator_chain.py` and `worklist_investigator.py`.
+  - Tests: `harness/test_r11_10_identity_credit.py`, 21 in total. The 9 new ones cover:
+    - a substituted read sends only the target's credential and no source response;
+    - an anonymous target sends no credentials;
+    - a substituted write is refused by the gate without `allow_mutating_replay`;
+    - with the switch off the cell stays `missing_principal`;
+    - provenance on the cell and the finding;
+    - credential-bearing captures are refused;
+    - the passive force-off.
+  - `test_identity_probe_variants`: its two "stays missing_principal" tests now pass
+    `substitution=False`, because they pin down the switch-off behaviour.
+  - r11 checkpoint recount (read-only, `.test-work/r11-10/substitution_count.py`, counts
+    only): of the 232 cells still `missing_principal` after the credit, **207** have
+    another identity's capture of the endpoint and become drivable: 172 of the 197
+    owner-listed and all 35 on the five conservative rows. **25** stay
+    `missing_principal`. They are all `AV-EXPOSURE-01` (`content_exposure`, a passive
+    leg). No cell lacks another identity's capture. The checkpoint holds no capture
+    bodies, so 207 is an upper bound: the credential-in-body filter may refuse some.
+  - **Not verified live.** The drive's sends under substitution have only run against
+    loopback fixtures.
+- Result: the offline credit and credential substitution are both implemented and verified
+  offline. In the r11 replay, 543 cells end `missing_principal` today. After the credit,
+  232 still do, and with substitution at most 25 (passive exposure) stay.
+- **Not done (note):** `worklist_investigator.captured_nodes` still marks a variant whose
+  identity key matches no role as `missing_principal`. That is a different case (the
+  capture exists but has no role) and is left as it is.
+- **Optional item, not done (note):** drop crawler-filled paths. In r11, 4 of the 15
+  endpoints were such paths. Worth doing as its own item, because it changes the matrix
+  denominator, not just the accounting. Only drop a `null`, `file` or `-1` segment that
+  no capture took from a response, and test it against the R11-9 template fixture.

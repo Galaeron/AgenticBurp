@@ -398,6 +398,11 @@ _GATE_ROUTED_EXCEPTIONS = {
     # every send; it preflights each write with gate.authorize and is self-gated
     # on allow_mutating_replay.
     "write_integrity_validator.py",
+    # business_flow (R11-7) replays the run's captured cart/settlement/coupon/2FA
+    # writes only through the run executor (the SafetyGate authorizes every send),
+    # needs allow_mutating_replay plus an explicit per-check ceiling, and its one
+    # send helper refuses DELETE.
+    "business_flow_validator.py",
 }
 
 
@@ -511,6 +516,16 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
             # The module holds no client and sends nothing; its candidates are page
             # URLs the browser loads by GET navigation.
             "route_candidates.py",
+            # challenge_echo (R11-8 c): exchange.method appears only in a GET-only
+            # shape guard and as the route key that pairs captures. Its opt-in live
+            # sends (challenge GETs hardcoded; the captured submission's own method)
+            # go through the gate-routed RunContext executor, never a raw client.
+            "challenge_echo_validator.py",
+            # password_change_session (R11-8 b): the captured change-password
+            # flow is resent with its own method (and restored) through the run's
+            # gate-routed transport (send_creds), charged to the check's mutating
+            # ceiling; it holds no raw client.
+            "password_change_validator.py",
         }
 
         violations = []
@@ -620,6 +635,14 @@ class TestNoValidatorBypassesTheGate(unittest.TestCase):
         self.assertIn("gate.authorize(", write)
         self.assertIn("allow_mutating_replay", write)
         self.assertNotIn("httpx", write, "write_integrity_validator.py must not hold a raw client")
+
+        flows = (here / "validators" / "business_flow_validator.py").read_text()
+        self.assertIn("executor().execute(", flows,
+                      "business_flow_validator.py writes but not through the run executor")
+        self.assertIn("allow_mutating_replay", flows)
+        self.assertIn("mutating_ceiling_by_check", flows)
+        self.assertIn('if method == "DELETE":', flows, "business_flow must refuse DELETE")
+        self.assertNotIn("httpx", flows, "business_flow_validator.py must not hold a raw client")
 
         for name in ("ssrf_validator.py", "xxe_validator.py",
                      "command_injection_validator.py", "ssti_validator.py",

@@ -49,9 +49,12 @@ SCHEMA_VERSION = 1
 # order (test_run_handoff checks this list against orchestrator_chain's source).
 RUN_PHASES = ("discovery", "header_audit", "business_context", "experiments", "worklist",
               "recrawl", "capture_review", "chain_rounds", "second_order", "coverage_drive",
-              "retry_rounds", "experiments_final", "finalise")
-# Opened only when their feature is on (engagement.recrawl / engagement.retry_rounds).
-CONDITIONAL_PHASES = frozenset({"recrawl", "retry_rounds"})
+              "retry_rounds", "final_pass", "experiments_final", "finalise")
+# Opened only when their feature is on (engagement.recrawl / engagement.retry_rounds /
+# engagement.final_pass), or, for experiments_final, only while its deadline (the
+# coverage deadline, and the investigation deadline less the finalise reserve) has
+# not passed; otherwise it is recorded as skipped, with why (R11-4b).
+CONDITIONAL_PHASES = frozenset({"recrawl", "retry_rounds", "final_pass", "experiments_final"})
 TERMINAL_PHASE = "finalise"
 # Sends after this phase begins count as testing a worklist node.
 _TESTING_FROM = "worklist"
@@ -267,6 +270,7 @@ class RunHandoff:
         self._phases_begun: list[str] = []
         self._phases_ended: set[str] = set()
         self._phases_aborted: set[str] = set()
+        self._phases_skipped: dict[str, str] = {}   # phase -> why it was passed over
         self._captures: dict[str, dict] = {}     # observation key -> pending capture
         self._captures_enumerated = False
         self._state = None
@@ -282,9 +286,11 @@ class RunHandoff:
 
     # -- events -------------------------------------------------------------
 
-    def phase_event(self, event: str, name: str) -> None:
+    def phase_event(self, event: str, name: str, reason: str | None = None) -> None:
         with self._lock:
-            if event == "begin":
+            if event == "skip":
+                self._phases_skipped[name] = reason or ""
+            elif event == "begin":
                 if name not in self._phases_begun:
                     self._phases_begun.append(name)
             elif event == "end":
@@ -376,17 +382,23 @@ class RunHandoff:
         ended = set(self._phases_ended)
         known = [p for p in begun if p in RUN_PHASES]
         interrupted = [p for p in begun if p not in ended or p in self._phases_aborted]
+        skipped = {p: why for p, why in self._phases_skipped.items() if p not in begun}
+        passed = set(begun) | set(skipped)
         if self.completed:
             not_run: list[dict] = []
-            not_applicable = [p for p in RUN_PHASES if p not in begun]
+            not_applicable = [p for p in RUN_PHASES if p not in passed]
         else:
-            last = max((RUN_PHASES.index(p) for p in known), default=-1)
+            last = max((RUN_PHASES.index(p) for p in [*known, *skipped] if p in RUN_PHASES),
+                       default=-1)
             not_run = [{"phase": p, "conditional": p in CONDITIONAL_PHASES}
                        for p in RUN_PHASES[last + 1:]]
-            not_applicable = [p for p in RUN_PHASES[:last + 1] if p not in begun]
+            not_applicable = [p for p in RUN_PHASES[:last + 1] if p not in passed]
         return {"begun": begun, "completed": sorted(ended & set(begun), key=begun.index),
                 "interrupted": interrupted, "not_run": not_run,
-                "not_applicable": not_applicable, "run_completed": self.completed}
+                "not_applicable": not_applicable,
+                # Passed over, with why (R11-4b: experiments_final past its deadline).
+                "skipped": [{"phase": p, "reason": why} for p, why in skipped.items()],
+                "run_completed": self.completed}
 
     def _untouched_nodes(self) -> list[dict]:
         state = self._state

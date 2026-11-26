@@ -327,6 +327,8 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     "engagement.driver_execute",
     "engagement.feature_crawl",
     "engagement.coverage_drive_legs",
+    # R11-10: identity-substituted replays of another identity's capture.
+    "engagement.coverage_identity_substitution",
     # ffuf inside runs sends its own wordlist traffic to the target.
     "engagement.discovery_ffuf",
     # Recursive discovery sends wordlist traffic below the first level (False
@@ -354,6 +356,8 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     "engagement.crawl_per_principal",
     # Retry rounds sweep the worklist again until the deadline -- active traffic.
     "engagement.retry_rounds.enabled",
+    # R11-4: the final pass sends the legs earlier budgets set aside -- active traffic.
+    "engagement.final_pass.enabled",
     # The server-error follow-up hands database-error leads to sqlmap / the nosql
     # leg -- active traffic. Forced to False (= 0 leads); the passive ledger stays.
     "engagement.server_errors.max_lead_confirmations",

@@ -265,9 +265,11 @@ class LogoutInvalidationIsDualPlaneTests(unittest.TestCase):
         planes = [("dual" if c.python_present and c.java_present
                    else "java" if c.java_present else "python")
                   for c in CAPABILITY_MATRIX.values()]
-        # 23 Python-only: the branch's 14 plus main's nine passive/GET-only legs
-        # (security headers, error handling, exposure, filter, well-known).
-        self.assertEqual((27, 2, 23), (planes.count("dual"), planes.count("java"),
+        # 26 Python-only: the branch's 14, main's nine passive/GET-only legs
+        # (security headers, error handling, exposure, filter, well-known),
+        # R11-8(c)'s challenge_echo, R11-7's business_flow and R11-8(b)'s
+        # password_change_session.
+        self.assertEqual((27, 2, 26), (planes.count("dual"), planes.count("java"),
                                        planes.count("python")))
         java_only = {k for k, c in CAPABILITY_MATRIX.items() if not c.python_present}
         self.assertEqual({"xss_reflected_context", "workflow_replay_boundary"}, java_only)

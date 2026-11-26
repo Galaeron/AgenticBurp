@@ -241,7 +241,7 @@ class CoverageSharedAuthLegEngagementTests(unittest.TestCase):
         reached: list[str] = []
 
         def sub_check(name, fc):
-            async def _stub(self_, exchange):
+            async def _stub(self_, exchange, **_kw):
                 reached.append(name)
                 return ValidationResult("auth_sequence", "not_confirmed", fc, confidence=0.0,
                                         confirmed=False, summary=f"stub {name} check ran")

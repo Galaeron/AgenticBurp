@@ -313,6 +313,19 @@ _PYTHON_ONLY: tuple[CapabilityOwnership, ...] = (
     _python_only("well_known", "well_known",
                  note="AV-WELLKNOWN-01 leg: security.txt and CSAF provider metadata once per "
                       "origin, reported as observations. GET-only; no Java case."),
+    _python_only("challenge_echo", "challenge_echo",
+                 note="WSTG-BUSL-07 leg: a challenge response that carries its own answer, "
+                      "read from captured issue/submit pairs; the active submit is off by "
+                      "default (challenge_echo_validator.py). No Java case."),
+    _python_only("business_flow", "business_flow",
+                 note="R11-7 multi-step flow legs (checkout/payment tamper at settlement, "
+                      "coupon misuse, 2FA disable without step-up) on run-owned identities; "
+                      "needs mutating replay and an explicit per-check ceiling "
+                      "(business_flow_validator.py). No Java case."),
+    _python_only("password_change_session", "password_change_session",
+                 note="R11-8(b) AV-PWCHANGE-01: a token that survives its own password change, "
+                      "with the password restored; needs mutating replay and a ceiling >= 2 "
+                      "(password_change_validator.py). No Java case."),
 )
 
 CAPABILITY_MATRIX: dict[str, CapabilityOwnership] = {

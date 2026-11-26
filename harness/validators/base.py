@@ -73,6 +73,16 @@ class ValidationResult:
     # expired mid-scan, the route was paused after 5xx answers). The execution
     # registry keeps a retry for it however many requests the attempt was answered.
     transient_stop: bool = False
+    # R11-1: the classes THIS result proves, for a leg routed by exchange shape or
+    # evidence rather than by the finding's class (the exposure oracle, the
+    # .well-known probe). The dispatcher binds a confirmation to the finding only
+    # when the validator claims the finding's class (Validator.claims_class) or the
+    # finding's issue class is one of these; otherwise the proof is filed as a
+    # finding of the first class named here. Empty: the validator's own classes.
+    mechanism_classes: tuple[str, ...] = ()
+    # R11-1 (b): an observation ("not a vulnerability", severity info) never
+    # confirms a vulnerability-class finding, whatever routed it.
+    observation: bool = False
 
     def with_artifacts(self, *, baseline=None, attack=None, controls=()) -> "ValidationResult":
         """Name the sends behind this verdict; each is an ExecutionOutcome, a
@@ -246,6 +256,72 @@ class Validator(ABC):
                 return True
         return False
 
+    def claims_class(self, finding: Finding, exchange: HttpExchange | None = None) -> bool:
+        """R11-1: whether a confirmation from this validator can be the finding's
+        own class's proof -- decided by the finding's class only, never by the
+        exchange's shape or evidence. Defaults to applies(): a validator that
+        routes by class alone claims exactly what it routes. A validator whose
+        applies() also routes by path, parameters or response evidence overrides
+        this with its class test; its proof for another class is filed as its own
+        finding (see proves_finding_class)."""
+        return self.applies(finding, exchange)
+
     @abstractmethod
     async def validate(self, finding: Finding, exchange: HttpExchange) -> ValidationResult:
         raise NotImplementedError
+
+
+# R11-1 (b): classes an observation may stand for -- reconnaissance, not a flaw.
+_OBSERVATION_CLASSES = frozenset({"recon"})
+
+
+def is_observation(result) -> bool:
+    """An informational result that says it is not a vulnerability."""
+    if getattr(result, "observation", False):
+        return True
+    return ((getattr(result, "severity", "") or "").lower() == "info"
+            and "not a vulnerability" in (getattr(result, "summary", "") or "").lower())
+
+
+def _validator_classes(validator) -> list[str]:
+    fcs = sorted(getattr(validator, "finding_classes", ()) or ())
+    canon = [c for c in (canonicalize(fc) for fc in fcs) if c]
+    return canon or fcs
+
+
+def mechanism_class_of(validator, result) -> str:
+    """The class a result proves when it does not prove the routed finding's:
+    the result's own mechanism, else the validator's declared primary class
+    (`mechanism_class`), else its first canonical class."""
+    named = [c for c in (getattr(result, "mechanism_classes", ()) or ()) if c]
+    if named:
+        return named[0]
+    primary = getattr(validator, "mechanism_class", "")
+    if isinstance(primary, str) and primary:
+        return primary
+    own = _validator_classes(validator)
+    return own[0] if own else (getattr(validator, "name", "") or getattr(result, "validator", ""))
+
+
+def proves_finding_class(validator, result, finding, exchange=None) -> bool:
+    """R11-1: a confirmed result is the finding's proof only when the validator's
+    mechanism is the finding's class -- the validator claims that class
+    (claims_class), or the result names it among the classes it proves. An
+    observation never stands for a vulnerability class (b). A validator without
+    claims_class (a duck-typed stub) keeps the applies() routing as its claim."""
+    from harness.issues import issue_class
+    label = finding.vulnerability_class or ""
+    cls = issue_class(label)
+    claims = getattr(validator, "claims_class", None)
+    if claims is not None:
+        bound = bool(claims(finding, exchange))
+    else:
+        applies = getattr(validator, "applies", None)
+        bound = applies is None or bool(applies(finding, exchange))
+    if not bound:
+        bound = cls in {issue_class(m) for m in (getattr(result, "mechanism_classes", ()) or ()) if m}
+    if bound and is_observation(result):
+        from harness.categories import CANONICAL_CATEGORIES
+        if cls in CANONICAL_CATEGORIES and cls not in _OBSERVATION_CLASSES:
+            return False
+    return bound

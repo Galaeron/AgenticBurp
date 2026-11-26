@@ -200,10 +200,13 @@ async def dispatch_plans(orch, exchange: HttpExchange, plans: list[TestPlan],
             out["deferred"].append(plan.id)
             continue
         dispatched += 1
+        batch = [AgentReport(agent=agent or plan.category or "", model="plan_dispatch",
+                             findings=findings)]
         new_reports, proofs = await orch._validate_findings(
-            exchange, [AgentReport(agent=agent or plan.category or "", model="plan_dispatch",
-                                   findings=findings)],
-            run_context=run_context, only_validators=frozenset(names))
+            exchange, batch, run_context=run_context, only_validators=frozenset(names))
+        # R11-1: a proof of another class than the plan's is filed as its own
+        # finding in a report appended to the batch; keep it with the caller's.
+        reports.extend(batch[1:])
         validation_reports.extend(new_reports)
         for proof in proofs:
             if proof.get("finding_ref") and proof.get("case_id"):
