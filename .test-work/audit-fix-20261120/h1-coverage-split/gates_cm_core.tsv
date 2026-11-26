@@ -1,0 +1,10 @@
+module	runner	rc	tests	seconds
+harness.test_coverage_model	unittest	0	50	1
+harness.test_wstg_catalog_ids	unittest	0	21	1
+harness.test_coverage_manifest	unittest	0	38	3
+harness.test_coverage_cases	unittest	0	40	1
+harness.test_coverage_summary	unittest	0	9	0
+harness.test_catalog_validator_rows	unittest	0	15	1
+harness.test_file_upload_busl08	unittest	0	22	4
+harness.test_coverage_shared_class_attribution	unittest	0	16	1
+# done: 8 modules, 0 failed

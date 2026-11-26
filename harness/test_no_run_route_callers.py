@@ -31,7 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import global_throttle, safety_gate, store
+from harness import global_throttle, safety_gate, server_admission, store
 
 _IN_SCOPE = "127.0.0.1"
 _OUTSIDE = "127.0.0.2"
@@ -329,8 +329,9 @@ class AdvanceActiveModeTests(_RouteFixture):
     def test_fault_injection_removing_the_gate_sends(self):
         site = self._site()
         self.arm(False)
-        # ARC-1: the master switch the shared route dependency applies.
-        with patch.object(self.server, "_admit_active_traffic", lambda: None):
+        # ARC-1: the master switch the shared route dependency applies (single-
+        # sourced in harness.server_admission since ARC-9).
+        with patch.object(server_admission, "_admit_active_traffic", lambda orchestrator: None):
             resp = self._advance(site)
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertTrue(site.requests)

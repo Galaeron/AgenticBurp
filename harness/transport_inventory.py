@@ -96,6 +96,12 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   owner="astra-identity (T03)",
                   note="RunContext.Executor + ManagedSession -- the run-scoped, "
                        "scope/cookie/credential-aware transport target sends migrate onto."),
+    TransportSite("run_context_sessions.py", CHANNEL_HTTP, SCOPE_INFRA, ROUTING_ADAPTER,
+                  owner="astra-identity (T03)",
+                  constructs_client=False,
+                  note="ARC-9 sibling of run_context.py: ManagedSession's per-identity client "
+                       "pool; every client comes from run_context._target_client (TLS policy, "
+                       "connect-time pins, isolated cookie jar)."),
     TransportSite("safety_gate.py", CHANNEL_HTTP, SCOPE_INFRA, ROUTING_ADAPTER,
                   owner="astra-identity (T03)",
                   note="SafetyGate + GatedAsyncClient -- the mutation/scope gate the "
@@ -117,6 +123,12 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   owner="tools",
                   note="Playwright/Chromium adapter for browser_xss/dom_xss/stored_xss. "
                        "Executor browser adapter is T08 follow-on."),
+    TransportSite("browser_driver_router.py", CHANNEL_BROWSER, SCOPE_INFRA, ROUTING_ADAPTER,
+                  owner="tools",
+                  constructs_client=False,
+                  note="ARC-9 sibling of browser_driver.py: the I05-D identity router routes "
+                       "every browser request, aborts held writes, and sends the rest through "
+                       "run_context._target_client under browser_driver's scope/egress policy."),
 
     # ---- egress: public intelligence APIs, NOT the target ----
     TransportSite("github_advisories.py", CHANNEL_HTTP, SCOPE_EGRESS, ROUTING_DIRECT,
@@ -145,7 +157,14 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                   owner="astra-identity (T03/T08)",
                   constructs_client=False,
                   note="production role discovery uses the run executor; legacy standalone "
-                       "callers retain a direct compatibility path."),
+                       "callers retain a direct compatibility path. ARC-9: the facade keeps "
+                       "SurfaceDiscovery and its run_context; the sends are in api_surface_probe.py."),
+    TransportSite("api_surface_probe.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="astra-identity (T03/T08)",
+                  constructs_client=False,
+                  note="ARC-9 sibling of api_surface_discovery.py (_ProbeMixin): every probe goes "
+                       "through run_context.executor().execute, or through transport_for for a "
+                       "standalone caller (scope, budget and the connect-time pin apply)."),
     TransportSite("crawler.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (T03/T08)",
                   constructs_client=False,

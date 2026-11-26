@@ -1,0 +1,8 @@
+module	runner	rc	tests	seconds
+harness.test_orchestrator_precondition	unittest	0	74	2
+harness.test_orchestrator_split_guard	unittest	0	16	7
+harness.test_transport_inventory	unittest	0	22	26
+harness.test_coverage_split	unittest	0	44	8
+harness.test_coverage_manifest	unittest	0	38	2
+harness.test_wstg_catalog_ids	unittest	0	21	1
+# done: 6 modules, 0 failed

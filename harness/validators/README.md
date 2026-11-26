@@ -31,6 +31,15 @@ All are `active` (send live requests, gated by `validators.active_enabled`) exce
 whole registry via `ValidatorRegistry.for_finding`; the engagement graph loop's
 `_confirm` dispatcher uses the six legs only.
 
+## Large validators (ARC-9)
+
+No module is over 1,200 lines (`test_orchestrator_split_guard.py`). A validator that outgrew that
+keeps its module, class, name and registration, and its pure helpers sit in `<validator>_<area>.py`
+siblings (`write_integrity_support/plans/judges`, `sqlmap_policy/params/signals/report`,
+`business_flow_support`, `auth_sequence_support`). The gate calls, scope checks, run-executor sends
+and the sqlmap launch stay in the validator module; `test_validator_split.py` pins that, the names
+callers import from the original, and that a patch on the original module still reaches its readers.
+
 ## Parameter binding
 
 Agents return `parameter_location` (query/body/path/header/cookie) and

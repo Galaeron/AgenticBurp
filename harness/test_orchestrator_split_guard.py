@@ -21,25 +21,16 @@ REPO = HARNESS.parent
 MODULE_LINE_LIMIT = 1200
 
 # Modules over the limit, at their size when ARC-9's orchestrator part landed (b7492ca8 plus the
-# orchestrator split; store.py and server.py at the wave-5 merge, with ARC-13 (its ledger_chain
-# side table) and OPS-5).
+# orchestrator split, with ARC-13 and OPS-5 at the wave-5 merge).
 # A module may shrink and then drops out of the table; it may not grow.
-# Raise a ceiling only with the owner's say-so. The table names the next ARC-9 splits:
-# store.py (repositories), server.py (APIRouters), then the rest.
+# Raise a ceiling only with the owner's say-so. The table lists the remaining ARC-9 splits.
+# ARC-9 wave 6 split twelve modules into facades over sibling modules; they left the table.
+# The tests that prove patches still reach the moved code: server.py (test_server_router_split),
+# store.py (test_store_facade), coverage_model.py, coverage_tracker.py, api_surface_discovery.py
+# (test_coverage_split), the four validators (test_validator_split), run_context.py,
+# ollama_client.py, browser_driver.py (test_runtime_split_facade).
 OVERSIZED_CEILING = {
-    "store.py": 4412,
-    "server.py": 2824,
-    "coverage_model.py": 2174,
-    "validators/write_integrity_validator.py": 2002,
-    "api_surface_discovery.py": 1928,
-    "validators/sqlmap.py": 1791,
-    "browser_driver.py": 1754,
-    "ollama_client.py": 1734,
     "experiment.py": 1721,
-    "coverage_tracker.py": 1707,
-    "run_context.py": 1706,
-    "validators/business_flow_validator.py": 1514,
-    "validators/auth_sequence_validator.py": 1514,
     "engagement.py": 1446,
     "validators/cross_identity_validator.py": 1381,
     "issues.py": 1226,

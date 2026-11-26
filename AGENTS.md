@@ -9,7 +9,8 @@ as general onboarding.
 Burp Suite copilot: captured HTTP analysis plus a bounded engagement graph, with
 Ollama-backed reasoning and deterministic validators. Safe defaults are passive.
 
-- API/config: `harness/server.py`; packaged imports use `harness.*`.
+- API/config: `harness/server.py` (app, auth, job state); routes in `server_routes_*.py`,
+  active-traffic admission in `server_admission.py`; packaged imports use `harness.*`.
 - Orchestrator assembly: `orchestrator.py`; analysis: `orchestrator_detect.py`;
   confirmation: `orchestrator_confirm.py`; engagement: `orchestrator_chain.py` (driver) and its stages `orchestrator_chain_*.py`.
 - Discovery/worklist: `engagement_builder.py`, `api_surface_discovery.py`,

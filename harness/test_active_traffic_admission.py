@@ -9,6 +9,13 @@ each answers 403 while an owned loopback target counts zero requests.
 Negative control: strip the dependency from one route; the structural check
 reports it, the behavioural check fails, and that route then sends.
 
+ARC-9. The routes live in router modules (harness/server_routes_*.py) whose
+handlers are closures over the server module, so the scan resolves closure
+variables too, and every router module's routes are in app.routes. Admission is
+single-sourced in harness.server_admission. Negative controls: a router route that
+reaches a send path without the dependency fails the scan; a scan without closure
+resolution misses the router routes; an included (lazy) router hides its routes.
+
 ARC-2. With iterative_agent.enabled and server.allowed_hosts=[], POST /active-probe
 answers 403 and the target receives nothing. Each layer refuses on its own: the
 route's active scope admission, run_active_probe's standalone admission, and the
@@ -33,9 +40,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi import APIRouter, FastAPI
 from fastapi.routing import APIRoute
 
-from harness import global_throttle, iterative_agent, run_context, safety_gate, store
+from harness import (global_throttle, iterative_agent, run_context, safety_gate,
+                     server_admission, store)
 from harness.test_no_run_route_callers import _IN_SCOPE, _Target, _page
 
 _MISSING = object()
@@ -86,18 +95,32 @@ def _local_imports(tree) -> dict:
     return names
 
 
+def _closure_vars(fn) -> dict:
+    """A closure's free variables and their values; an empty cell is skipped."""
+    names = {}
+    for name, cell in zip(fn.__code__.co_freevars, fn.__closure__ or ()):
+        try:
+            names[name] = cell.cell_contents
+        except ValueError:
+            pass
+    return names
+
+
 class TrafficScan:
     """Which route handlers can reach a run-owning send path?
 
     Each function's own source is parsed and every loaded name or attribute is
-    resolved against that function's namespace: module globals, its local harness
-    imports, and `self` (the live owner: the server's orchestrator for its routes,
-    so instance-attribute dispatch such as `self.agent_manager.x` is followed too).
+    resolved against that function's namespace: module globals, its closure
+    variables (a router handler reads the server module as `srv`), its local
+    harness imports, and `self` (the live owner: the server's orchestrator for its
+    routes, so instance-attribute dispatch such as `self.agent_manager.x` is
+    followed too).
     Product functions and methods are followed, including ones passed as callbacks;
     anything outside `harness` (or in a test module) is not. Resolution is static
     (`inspect.getattr_static`), so no property or handler code runs."""
 
-    def __init__(self):
+    def __init__(self, *, closures: bool = True):
+        self.closures = closures
         self.sinks = {
             id(run_context.RunContext.__dict__["create"].__func__): "RunContext.create",
             id(run_context.standalone_context): "standalone_context",
@@ -115,6 +138,8 @@ class TrafficScan:
         except (OSError, TypeError, SyntaxError):
             return edges
         scope = dict(fn.__globals__)
+        if self.closures:
+            scope.update(_closure_vars(fn))
         scope.update(_local_imports(tree))
 
         def resolve(node):
@@ -173,6 +198,26 @@ class TrafficScan:
                 for method in route.methods:
                     found[(method, route.path)] = path
         return found
+
+
+def _unregistered(server, scanned) -> set:
+    """Scanned traffic routes the admission registry does not list."""
+    registered = (set(server.ACTIVE_TRAFFIC_ROUTES) | set(server.ACTIVE_TRAFFIC_WHEN)
+                  | set(server.PASSIVE_RUN_ROUTES))
+    return set(scanned) - registered
+
+
+def _synthetic_router(srv, *, gated: bool) -> APIRouter:
+    """A router module's shape: one handler, a closure over the server module,
+    that reaches standalone_context through srv.orchestrator.run_active_probe."""
+    router = APIRouter()
+
+    @router.post("/synthetic-traffic",
+                 dependencies=list(server_admission._ACTIVE_TRAFFIC) if gated else [])
+    async def synthetic_traffic():
+        return await srv.orchestrator.run_active_probe(None, "", "")
+
+    return router
 
 
 def _ungated(server, routes) -> list:
@@ -299,6 +344,7 @@ class TrafficRouteRegistryTests(unittest.TestCase):
         registered = (set(self.server.ACTIVE_TRAFFIC_ROUTES) | set(self.server.ACTIVE_TRAFFIC_WHEN)
                       | set(self.server.PASSIVE_RUN_ROUTES))
         self.assertEqual(set(scanned), registered, scanned)
+        self.assertEqual(_unregistered(self.server, scanned), set())
         # The audit's six routes are gated unconditionally.
         self.assertLessEqual({
             ("POST", "/crawl"), ("POST", "/crawl-roles"), ("POST", "/engagement/{host}/advance"),
@@ -322,6 +368,83 @@ class TrafficRouteRegistryTests(unittest.TestCase):
     def test_negative_control_stripped_route_is_reported(self):
         stripped = _without_admission(self.server, "/probe-missing-auth")
         self.assertEqual(_ungated(self.server, stripped), [("POST", "/probe-missing-auth")])
+
+    def test_the_scan_covers_every_router_module(self):
+        """ARC-9: every harness/server_routes_*.py is registered on the app, each
+        router contributes routes, and the scanned traffic routes come from them."""
+        files = {f"harness.{path.stem}" for path in Path(__file__).parent.glob("server_routes_*.py")}
+        self.assertEqual({module.__name__ for module in self.server.ROUTER_MODULES}, files)
+        endpoint_modules = {route.endpoint.__module__ for route in self.server.app.routes
+                            if isinstance(route, APIRoute)}
+        self.assertEqual(endpoint_modules, files)
+        scanned = TrafficScan().traffic_routes(self.server.app, self.server.orchestrator)
+        by_route = {(method, route.path): route.endpoint.__module__
+                    for route in self.server.app.routes if isinstance(route, APIRoute)
+                    for method in route.methods}
+        self.assertLessEqual({by_route[key] for key in scanned}, files)
+
+    def test_app_routes_are_flat(self):
+        """The scan reads app.routes. An included router is one lazy entry there
+        (FastAPI 0.141), so its routes would escape the scan. Control: the same
+        traffic route is found when registered and missed when included."""
+        lazy = [route for route in self.server.app.routes
+                if not isinstance(route, APIRoute) and type(route).__name__ != "Route"]
+        self.assertEqual(lazy, [])
+        scan = TrafficScan()
+        registered, included = FastAPI(), FastAPI()
+        registered.router.routes.extend(_synthetic_router(self.server, gated=False).routes)
+        included.include_router(_synthetic_router(self.server, gated=False))
+        self.assertIn(("POST", "/synthetic-traffic"),
+                      scan.traffic_routes(registered, self.server.orchestrator))
+        self.assertEqual(scan.traffic_routes(included, self.server.orchestrator), {})
+
+    def test_admission_is_single_sourced(self):
+        """ARC-9: the dependency, the master switch and the registry are defined
+        once, in harness.server_admission; server re-exports, routers import."""
+        for name in ("require_active_traffic", "_ACTIVE_TRAFFIC", "ACTIVE_TRAFFIC_ROUTES",
+                     "ACTIVE_TRAFFIC_WHEN", "PASSIVE_RUN_ROUTES"):
+            self.assertIs(getattr(self.server, name), getattr(server_admission, name), name)
+        self.assertFalse(hasattr(self.server, "_admit_active_traffic"))
+        for module in self.server.ROUTER_MODULES:
+            for name in ("require_active_traffic", "_admit_active_traffic", "_ACTIVE_TRAFFIC"):
+                if hasattr(module, name):
+                    self.assertIs(getattr(module, name), getattr(server_admission, name),
+                                  f"{module.__name__}.{name}")
+        definition = ("def require_active_traffic", "def _admit_active_traffic",
+                      "_ACTIVE_TRAFFIC =", "ACTIVE_TRAFFIC_ROUTES =")
+        for path in Path(__file__).parent.glob("*.py"):
+            if path.name == "server_admission.py" or path.name.startswith("test_"):
+                continue
+            text = path.read_text(encoding="utf-8")
+            for needle in definition:
+                self.assertNotIn(needle, text, f"{path.name} defines {needle!r}")
+
+    def test_the_scan_resolves_router_closures(self):
+        """Scanner control: a router handler reaches the orchestrator only through
+        its closure variable `srv`. Without closure resolution the scan misses it."""
+        endpoint = next(route.endpoint for route in self.server.app.routes
+                        if isinstance(route, APIRoute) and route.path == "/active-probe")
+        self.assertIn("srv", endpoint.__code__.co_freevars)
+        self.assertIsNotNone(TrafficScan().path_to_sink(endpoint, self.server.orchestrator))
+        self.assertIsNone(TrafficScan(closures=False).path_to_sink(endpoint, self.server.orchestrator))
+
+    def test_negative_control_router_route_without_the_dependency(self):
+        """Fault injection: a router route that reaches standalone_context without
+        require_active_traffic. The registry check reports it; listed in the
+        registry but still ungated, the dependency check reports it; its gated twin
+        passes both."""
+        app_routes = list(self.server.app.routes)
+        ungated = _synthetic_router(self.server, gated=False).routes
+        scanned = TrafficScan().traffic_routes(types.SimpleNamespace(routes=app_routes + ungated),
+                                               self.server.orchestrator)
+        self.assertIn("ConfirmMixin.run_active_probe", scanned[("POST", "/synthetic-traffic")])
+        self.assertEqual(_unregistered(self.server, scanned), {("POST", "/synthetic-traffic")})
+        listed = self.server.ACTIVE_TRAFFIC_ROUTES | {("POST", "/synthetic-traffic")}
+        with patch.object(self.server, "ACTIVE_TRAFFIC_ROUTES", listed):
+            self.assertEqual(_ungated(self.server, app_routes + ungated),
+                             [("POST", "/synthetic-traffic")])
+            gated = _synthetic_router(self.server, gated=True).routes
+            self.assertEqual(_ungated(self.server, app_routes + gated), [])
 
 
 class TrafficRouteAdmissionTests(_AdmissionFixture):
