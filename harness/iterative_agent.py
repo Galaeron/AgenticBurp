@@ -42,6 +42,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx  # noqa: F401 -- HTTP transport site; sends now go via run_context.TargetTransport
 
 from harness import circuit_breaker, global_throttle
+from harness import policy_refusal
 from harness.models import Finding, HttpExchange, request_body_is_placeholder, sanitize_agent_finding
 from harness.ollama_client import OllamaInvalidJSONError, OllamaTransientError
 from harness.safety_gate import get_default_gate
@@ -276,8 +277,12 @@ class AttemptRecord:
     location: str      # mutated location: query|body|path|header
     name: str          # param / path segment / header name
     value: str         # payload value excerpt, <= 60 chars
-    outcome: str       # "HTTP <status>, <n> bytes" or the block reason
+    outcome: str       # "HTTP <status>, <n> bytes" or the block reason (raw)
     key: str = ""
+    # policy_refusal category when the harness refused the send ("" when the
+    # target answered or the send failed in transit); only the prompt line
+    # frames it, `outcome` stays the raw reason.
+    policy: str = ""
 
     @property
     def attempt_id(self) -> str:
@@ -287,7 +292,13 @@ class AttemptRecord:
         return (f"- step {self.step}: {self.kind} {self.location}:{_excerpt(self.name)}"
                 f"={json.dumps(self.value)} | {self.method} "
                 f"{_excerpt(self.target, _TARGET_RENDER_CHARS)}"
-                f" | {_excerpt(self.outcome, _OUTCOME_RENDER_CHARS)}")
+                f" | {self._outcome_view()}")
+
+    def _outcome_view(self) -> str:
+        if not self.policy:
+            return _excerpt(self.outcome, _OUTCOME_RENDER_CHARS)
+        # The marker is not part of the outcome's character budget.
+        return policy_refusal.short(self.policy, _excerpt(self.outcome, _OUTCOME_RENDER_CHARS))
 
 
 def _prior_attempts_block(attempts: list[AttemptRecord], duplicates: int) -> str:
@@ -447,11 +458,13 @@ class IterativeResult:
     # empty object is a parse error and a failed send is a blocked attempt.
     # model_error_retries counts in-step retries of a transient model failure;
     # breaker_waits counts steps spent waiting out an open Ollama breaker.
+    # policy_refusal_repeats counts harness refusals (scope, gate, budget,
+    # duplicate, rejected proposal, ...) of a category this probe already hit.
     diagnostics: dict = field(default_factory=lambda: {
         "parse_errors": 0, "refusals": 0, "rejected_proposals": 0,
         "unavailable_selections": 0, "duplicate_proposals": 0, "blocked_attempts": 0,
         "useful_unique_actions": 0, "model_error_retries": 0, "breaker_waits": 0,
-        "evidence_attempt_ids": []})
+        "policy_refusal_repeats": 0, "evidence_attempt_ids": []})
 
     def to_dict(self) -> dict:
         return {
@@ -502,6 +515,10 @@ Rules:
 - Confirm before claiming: a finding needs response evidence the injection/bypass actually landed,
   not just that a payload was accepted. If the evidence is weak, keep probing or stop "not_found".
 - Stop as soon as you have confirmed the issue, or when you've genuinely run out of ideas.
+- A line marked "HARNESS POLICY REFUSAL" comes from this testing harness, not from the target:
+  nothing was sent, so it says nothing about the target's defences. Never try to get around it with
+  an encoded or varied form of the same request; change approach or stop. A response the target
+  sent (any HTTP status, a 403, a 429, a WAF page) is shown as "HTTP <status>" and is evidence.
 - Output ONLY the JSON object, no prose around it."""
 
 
@@ -542,6 +559,9 @@ class IterativeAgent:
         # session", never leaking across sessions or agents.
         self._sent_signatures: set[str] = set()
         self._last_response_headers: dict = {}   # of the latest send, for _response_view
+        # policy_refusal category of the latest _execute call when the harness
+        # refused it unsent (None: the target answered, or the send failed in transit).
+        self._last_refusal: str | None = None
 
     @property
     def gate(self):
@@ -633,11 +653,13 @@ class IterativeAgent:
         A genuinely different request (any of those four differs) is never
         skipped. Ticket D: `run` now rejects duplicates BEFORE calling this; the
         check here stays as the backstop for any other caller."""
+        self._last_refusal = None
         sig = _request_signature(method, url, headers, body)
         if sig in self._sent_signatures:
             log.info(
                 "iterative_agent: skipping duplicate request already sent this "
                 "active-probe session: %s %s", method, url)
+            self._last_refusal = policy_refusal.DUPLICATE
             return None, _DUP_BLOCK
         self._sent_signatures.add(sig)
 
@@ -651,6 +673,10 @@ class IterativeAgent:
             await global_throttle.acquire()
             out = await _tt.send_creds(method, url, capability="iterative_agent",
                                        headers=headers, body=body, max_redirects=0)
+            # The returned reasons are the raw ones (transcript, logs, distress
+            # accounting); _last_refusal says which of them the harness made.
+            if not out.ok:
+                self._last_refusal = policy_refusal.category_for_outcome(out.outcome)
             if out.outcome == "out_of_scope":
                 return None, f"blocked: {urlsplit(url).hostname} out of scope"
             if out.outcome == "blocked":
@@ -800,6 +826,14 @@ class IterativeAgent:
         attempts: list[AttemptRecord] = []
         attempt_by_key: dict[str, AttemptRecord] = {}
         dup_streak = _DuplicateStreak()
+        # Optional telemetry: harness refusals of a category this run already
+        # refused once (the model came back to a forbidden kind of action).
+        refused_categories: set[str] = set()
+
+        def note_refusal(category: str) -> None:
+            if category in refused_categories:
+                diag["policy_refusal_repeats"] += 1
+            refused_categories.add(category)
 
         def emit(step_obj: IterativeStep) -> None:
             result.transcript.append(step_obj)
@@ -909,7 +943,17 @@ class IterativeAgent:
                 else:
                     diag["unavailable_selections"] += 1
                 ids = outcome.get('fresh_attempt_ids') or outcome.get('referenced_attempt_ids') or []
-                history.append(f"[step {step}] mechanism result: {json.dumps(outcome)}")
+                # The owning controller's own refusals (rejected, reused, missing
+                # prerequisite) ran nothing against the target: framed as policy.
+                refusal = {'rejected': policy_refusal.MECHANISM,
+                           'needs_prerequisite': policy_refusal.MECHANISM,
+                           'reused': policy_refusal.DUPLICATE}.get(status)
+                if refusal:
+                    note_refusal(refusal)
+                    history.append(f"[step {step}] mechanism result: "
+                                   f"{policy_refusal.frame(refusal, json.dumps(outcome))}")
+                else:
+                    history.append(f"[step {step}] mechanism result: {json.dumps(outcome)}")
                 emit(IterativeStep(step, {"action":"experiment", "kind":outcome.get('kind','<rejected>'),
                      "hypothesis":outcome.get('hypothesis','<rejected>')}, "(controller selection)", None,
                      json.dumps(outcome), attempt_id=ids[0] if ids else ""))
@@ -937,7 +981,9 @@ class IterativeAgent:
                     err = "reset: the request is already the captured request"
                     diag["rejected_proposals"] += 1
                     consecutive_no_progress += 1
-                    history.append(f"[step {step}] action rejected: {err}")
+                    note_refusal(policy_refusal.REJECTED_PROPOSAL)
+                    history.append(f"[step {step}] action rejected: "
+                                   f"{policy_refusal.frame(policy_refusal.REJECTED_PROPOSAL, err)}")
                     emit(IterativeStep(step, action, "(rejected)", None, err, blocked=err))
                     continue
                 headers_state, request_state = dict(captured_headers), captured_request
@@ -954,7 +1000,9 @@ class IterativeAgent:
             if err:
                 diag["rejected_proposals"] += 1
                 consecutive_no_progress += 1
-                history.append(f"[step {step}] action rejected: {err}")
+                note_refusal(policy_refusal.REJECTED_PROPOSAL)
+                history.append(f"[step {step}] action rejected: "
+                               f"{policy_refusal.frame(policy_refusal.REJECTED_PROPOSAL, err)}")
                 emit(IterativeStep(step, action, "(rejected)", None, err, blocked=err))
                 continue
             method, url, headers, body = built
@@ -977,7 +1025,8 @@ class IterativeAgent:
                        else "an earlier run's request on this agent (outcome unknown)")
                 note = (f"DUPLICATE of {ref}: choose a different supported action or stop "
                         f"[attempt {_attempt_id(key)}]")
-                history.append(f"[step {step}] {note}")
+                note_refusal(policy_refusal.DUPLICATE)
+                history.append(f"[step {step}] {policy_refusal.frame(policy_refusal.DUPLICATE, note)}")
                 log.info(
                     "iterative_agent: skipping duplicate request already sent this "
                     "active-probe session: %s %s", method, url)
@@ -998,7 +1047,9 @@ class IterativeAgent:
             result.distinct_requests += 1
 
             self._last_response_headers = {}
+            self._last_refusal = None   # a replaced _execute that does not set it frames nothing
             status, text = await self._execute(method, url, headers, body)
+            refusal = self._last_refusal if status is None else None
             changed = {action["name"]: action["value"]} if kind == "set_header" else {}
             rec = AttemptRecord(
                 step=step, kind="set_header" if kind == "set_header" else "mutate", method=method,
@@ -1008,13 +1059,16 @@ class IterativeAgent:
                 value=(_header_value_view(action.get("name"), action.get("value"))
                        if kind == "set_header" else _excerpt(_value_text(action.get("value")))),
                 outcome=(f"HTTP {status}, {len(text)} bytes" if status is not None else text),
-                key=key)
+                key=key, policy=refusal or "")
             attempts.append(rec)
             attempt_by_key[key] = rec
             if status is None:
                 diag["blocked_attempts"] += 1
                 consecutive_no_progress += 1
-                history.append(f"[step {step}] {req_summary} -> {text} [attempt {rec.attempt_id}]")
+                if refusal:
+                    note_refusal(refusal)
+                shown = policy_refusal.frame(refusal, text) if refusal else text
+                history.append(f"[step {step}] {req_summary} -> {shown} [attempt {rec.attempt_id}]")
                 emit(IterativeStep(step, action, req_summary, None, text, blocked=text,
                                    attempt_id=rec.attempt_id))
                 # A transport failure (or safety/scope block that returned None)

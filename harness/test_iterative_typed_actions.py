@@ -133,7 +133,9 @@ class TypedActionLoopTests(_LoopBase):
              _mutate("body", "qty", 3), _mutate("json", "items.id", 1)], self._post())
         self.assertEqual(self.app.bodies, [{"qty": 3, "price": 10, "items": [{"id": 7, "qty": 1}]}])
         self.assertEqual(result.diagnostics["rejected_proposals"], 3)
-        self.assertIn("action rejected: json path cannot index into a number at 'qty'", ollama.prompts[1])
+        # Framed as harness policy for the model (the raw reason closes the line).
+        self.assertIn("action rejected: HARNESS POLICY REFUSAL [rejected_proposal]", ollama.prompts[1])
+        self.assertIn("Harness reason: json path cannot index into a number at 'qty'", ollama.prompts[1])
         self.assertIn("json path index 5 out of range at 'items' (array length 1)", ollama.prompts[2])
         self.assertIn("json path segment 'id' must be a list index at 'items'", ollama.prompts[4])
 
@@ -148,7 +150,8 @@ class TypedActionLoopTests(_LoopBase):
         result, ollama = await self._drive(
             [_mutate("query", "q", 5), _mutate("query", "q", "5")], self._get())
         self.assertEqual([s[1] for s in self.app.seen], ["/api/search?q=5"])  # only the string send
-        self.assertIn("action rejected: location 'query' takes a string value, got number",
+        self.assertIn("action rejected: HARNESS POLICY REFUSAL [rejected_proposal]", ollama.prompts[1])
+        self.assertIn("Harness reason: location 'query' takes a string value, got number",
                       ollama.prompts[1])
         self.assertEqual(result.diagnostics["rejected_proposals"], 1)
         self.assertEqual(result.distinct_requests, 1)
