@@ -38,7 +38,7 @@ proxy = ["mitmproxy==12.3.1", "brotli>=1.2.1"]    # safety proxy; CVE-2026-11149
 dev = [
   "pytest==9.1.1",
   "Flask==3.1.3",          # loopback leg fixtures; also supplies werkzeug (make_server)
-  "cryptography==48.0.1",  # RSA/JWT key material in the JWT and confirmation-leg tests
+  "cryptography==50.0.2",  # RSA/JWT key material in the JWT and confirmation-leg tests
   "brotli==1.2.1",         # content-encoding tests (same CVE floor as the proxy extra)
   "mitmproxy==12.3.1",     # safety-proxy addon tests
   "playwright==1.63.0",    # real-browser tests (the version CI installs)

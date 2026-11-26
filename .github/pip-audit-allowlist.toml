@@ -19,4 +19,36 @@
 #   reason  = "Not reachable: the harness never calls the vulnerable parser; tracked in #123."
 #   expires = 2027-02-01              # TOML date, last valid day; renew only with a fresh review
 #
-# No vulnerability is accepted today.
+# Four tornado advisories are accepted until mitmproxy allows a fixed tornado (below).
+
+# CVE-2026-116577, quadratic obs-fold header parsing
+[[ignore]]
+id      = "GHSA-pcg2-g6cj-q92c"
+package = "tornado"
+owner   = "Galaeron"
+reason  = "Not reachable: tornado is only mitmproxy's dependency for its mitmweb UI; the harness runs mitmdump (harness/safety_proxy_addon.py, PROXY_SETUP.md) and serves nothing with tornado. Fixed in tornado 6.6, but mitmproxy 12.3.1, the latest release, caps tornado<=6.5.10. Remove when a mitmproxy release allows tornado>=6.6.1."
+expires = 2027-01-31
+
+# CVE-2026-115927, chunked body blocks the event loop
+[[ignore]]
+id      = "GHSA-r4j5-9xpp-3985"
+package = "tornado"
+owner   = "Galaeron"
+reason  = "Not reachable: tornado is only mitmproxy's dependency for its mitmweb UI; the harness runs mitmdump (harness/safety_proxy_addon.py, PROXY_SETUP.md) and serves nothing with tornado. Fixed in tornado 6.6, but mitmproxy 12.3.1, the latest release, caps tornado<=6.5.10. Remove when a mitmproxy release allows tornado>=6.6.1."
+expires = 2027-01-31
+
+# CVE-2026-116578, RedirectHandler open redirect
+[[ignore]]
+id      = "GHSA-pw9p-v7r6-gx4p"
+package = "tornado"
+owner   = "Galaeron"
+reason  = "Not reachable: tornado is only mitmproxy's dependency for its mitmweb UI; the harness runs mitmdump (harness/safety_proxy_addon.py, PROXY_SETUP.md) and serves nothing with tornado. Fixed in tornado 6.6, but mitmproxy 12.3.1, the latest release, caps tornado<=6.5.10. Remove when a mitmproxy release allows tornado>=6.6.1."
+expires = 2027-01-31
+
+# CVE-2026-126347, RedirectHandler open redirect, triple slash
+[[ignore]]
+id      = "GHSA-5cjw-f85j-cv6r"
+package = "tornado"
+owner   = "Galaeron"
+reason  = "Not reachable: tornado is only mitmproxy's dependency for its mitmweb UI; the harness runs mitmdump (harness/safety_proxy_addon.py, PROXY_SETUP.md) and serves nothing with tornado. Fixed in tornado 6.6.1, but mitmproxy 12.3.1, the latest release, caps tornado<=6.5.10. Remove when a mitmproxy release allows tornado>=6.6.1."
+expires = 2027-01-31
