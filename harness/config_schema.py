@@ -361,6 +361,8 @@ _PASSIVE_FORCE_OFF_KNOBS: tuple[str, ...] = (
     # browser file-input capture attaches a file and triggers the upload.
     "engagement.form_templates.baseline",
     "driver_capture.file_uploads",
+    # Click exploration clicks page controls in the browser -- active traffic.
+    "driver_capture.click_explore",
 )
 
 # Profiles whose entire purpose is "no active target traffic" and which

@@ -87,6 +87,11 @@ def _collect_spa_routes(routes, crawl) -> None:
         for probe in getattr(crawl, "probes", None) or []:
             routes.add_probe(probe.get("url") or "", probe.get("names") or [],
                              probe.get("calls") or [])
+        by_click: dict = {}
+        for view, selector, method, url, body in getattr(crawl, "click_calls", None) or []:
+            by_click.setdefault((view, selector), []).append((method, url, body))
+        for (view, selector), calls in by_click.items():
+            routes.add_click(view, selector, calls)
     except Exception as exc:  # discovery bookkeeping never sinks the build
         log.warning("build_engagement: client route collection failed: %s", exc)
 
@@ -99,6 +104,22 @@ def _probe_kwargs(capture_config) -> dict:
     except (TypeError, ValueError):
         probes = 0
     return {"route_probes": probes} if probes else {}
+
+
+def _click_kwargs(capture_config) -> dict:
+    """crawl_spa's click exploration (driver_capture.click_explore), passed only
+    when on (off, the default, keeps the call as it was)."""
+    if not capture_config.get("click_explore", False):
+        return {}
+    try:
+        per_view = max(0, int(capture_config.get("max_clicks_per_view", 8)))
+        total = max(0, int(capture_config.get("max_clicks", 60)))
+        seconds = max(0.0, float(capture_config.get("click_seconds", 120)))
+    except (TypeError, ValueError):
+        return {}
+    if not (per_view and total):
+        return {}
+    return {"clicks_per_view": per_view, "max_clicks": total, "click_seconds": seconds}
 
 
 def _mine_capture_routes(routes, exchange) -> None:
@@ -214,6 +235,7 @@ async def build_engagement(
                             declared_views=max(0, int(capture_config.get("declared_views", 0))),
                             extra_views=extra_views,
                             **_probe_kwargs(capture_config),
+                            **_click_kwargs(capture_config),
                             # File inputs: a benign file attached, the upload held
                             # and captured (driver_capture.file_uploads; off).
                             **({"file_uploads": True, "max_uploads": max(
@@ -231,6 +253,12 @@ async def build_engagement(
                                                      for p in getattr(crawl, "probes", None) or []],
                                           **({"uploads": list(getattr(crawl, "uploads", []) or [])}
                                              if capture_config.get("file_uploads", False) else {}),
+                                          **({"clicks": list(getattr(crawl, "clicks", []) or []),
+                                              "click_skips": list(
+                                                  getattr(crawl, "click_skips", []) or [])[:50],
+                                              "click_stopped_by": getattr(
+                                                  crawl, "click_stopped_by", "")}
+                                             if _click_kwargs(capture_config) else {}),
                                           "stopped_by": crawl.stopped_by})
                         seed_errors.extend("browser spa crawl: " + e for e in crawl.errors)
                         continue
@@ -331,7 +359,7 @@ async def build_engagement(
     for ex, _owners in seeds:
         _mine_capture_routes(client_routes, ex)
     client_routes.finalize()
-    if client_routes.routes() or client_routes.api_links:
+    if client_routes.routes() or client_routes.api_links or client_routes.api_clicks:
         state.client_routes = client_routes
         log.info("build_engagement: client routes %s", client_routes.summary())
     for ex, owners in seeds:

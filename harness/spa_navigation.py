@@ -157,6 +157,18 @@ class SpaCrawlResult:
     # File inputs (uploads > 0): one entry per input tried or passed over --
     # {"view", "input", "accept", "outcome": "captured" | "skipped", "reason"}.
     uploads: list[dict] = field(default_factory=list)
+    # Click exploration (clicks_per_view > 0 and max_clicks > 0): one entry per
+    # control clicked -- {"view": view key, "selector", "label", "outcome",
+    # "reason", "calls": ["METHOD /path", ...], "revealed": visible characters the
+    # click added, "dialog": a dialog or overlay opened, "navigated": the view key
+    # it moved to or "", "held": writes held (never sent), "blocked": requests the
+    # router refused}; the controls passed over, with the reason; every call a
+    # click fired as (view URL as loaded, selector, method, url, body), in memory
+    # for the route map (client_routes.add_click); why clicking stopped early.
+    clicks: list[dict] = field(default_factory=list)
+    click_skips: list[dict] = field(default_factory=list)
+    click_calls: list[tuple] = field(default_factory=list)
+    click_stopped_by: str = ""
 
     def skip(self, reason: str) -> None:
         self.skipped[reason] = self.skipped.get(reason, 0) + 1
@@ -300,10 +312,251 @@ async def _try_uploads(adapter, current: str, result: SpaCrawlResult, keys: set,
     return room
 
 
+# --- click exploration (driver_capture.click_explore) ----------------------
+
+# Read by page.evaluate(): the elements a user could click that are not links
+# (links are views, followed by the walk), in document order, each with a
+# selector that names it alone and the text/attribute hints the denylist reads.
+# An element counts when it is a button, a button-like role, has an inline click
+# handler, is a summary or an anchor without a real href, or is a list item,
+# row, card or focusable element styled with a pointer cursor (the visible trace
+# a script click handler leaves). Hidden and zero-size elements do not count.
+# With a selector argument it describes only the elements that selector names.
+CLICK_CANDIDATES_JS = r"""(only) => {
+  const out = [];
+  const esc = v => (window.CSS && CSS.escape) ? CSS.escape(v) : String(v).replace(/[^\w-]/g, '\\$&');
+  const unique = s => { try { return document.querySelectorAll(s).length === 1; } catch (e) { return false; } };
+  const attr = (e, n) => (e.getAttribute(n) || '').slice(0, 200);
+  const selectorOf = e => {
+    if (e.id && unique('#' + esc(e.id))) return '#' + esc(e.id);
+    const tag = e.tagName.toLowerCase();
+    for (const a of ['data-testid', 'data-test', 'data-cy', 'aria-label', 'name', 'title']) {
+      const v = e.getAttribute(a);
+      if (v && v.length <= 120) {
+        const s = tag + '[' + a + '="' + v.replace(/["\\]/g, '\\$&') + '"]';
+        if (unique(s)) return s;
+      }
+    }
+    const parts = [];
+    let n = e;
+    while (n && n.nodeType === 1 && n !== document.body && n !== document.documentElement) {
+      if (n !== e && n.id && unique('#' + esc(n.id))) { parts.unshift('#' + esc(n.id)); break; }
+      let i = 1, s = n;
+      while ((s = s.previousElementSibling)) if (s.tagName === n.tagName) i++;
+      parts.unshift(n.tagName.toLowerCase() + ':nth-of-type(' + i + ')');
+      n = n.parentElement;
+    }
+    if (n === document.body) parts.unshift('body');
+    return parts.join(' > ');
+  };
+  const roles = ['button', 'tab', 'menuitem', 'option', 'switch', 'treeitem'];
+  const routeAttr = /^(routerlink|ng-reflect-router-link|data-href|data-route|to)$/i;
+  const pick = 'button, input[type=button], [role], [onclick], summary, a, li, tr, mat-card, [tabindex]';
+  let nodes = [];
+  try { nodes = document.querySelectorAll(only || pick); } catch (err) { return []; }
+  for (const e of nodes) {
+    if (out.length >= 300) break;
+    if (only && !e.matches(pick)) continue;
+    const tag = e.tagName.toLowerCase();
+    const role = attr(e, 'role').toLowerCase();
+    const href = e.hasAttribute('href') ? attr(e, 'href') : null;
+    if (tag === 'a' && href !== null && !/^\s*(#!?\s*$|javascript:)/i.test(href)) continue;
+    if ([...e.attributes].some(a => routeAttr.test(a.name))) continue;
+    if (role && !roles.includes(role) && !e.hasAttribute('onclick') && tag !== 'button') continue;
+    const explicit = tag === 'button' || tag === 'input' || tag === 'summary' || tag === 'a'
+      || e.hasAttribute('onclick') || roles.includes(role);
+    const style = getComputedStyle(e);
+    if (!explicit && style.cursor !== 'pointer') continue;
+    const r = e.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0) || style.visibility === 'hidden' || style.display === 'none') continue;
+    const data = [...e.attributes].filter(a => a.name.startsWith('data-'))
+      .map(a => a.name + ' ' + a.value).join(' ').slice(0, 200);
+    out.push({selector: only || selectorOf(e), tag: tag, role: role, type: attr(e, 'type').toLowerCase(),
+              text: (e.innerText || e.value || '').trim().replace(/\s+/g, ' ').slice(0, 160),
+              aria: attr(e, 'aria-label'), title: attr(e, 'title'), id: e.id || '',
+              cls: (typeof e.className === 'string' ? e.className : attr(e, 'class')).slice(0, 200),
+              name: attr(e, 'name'), href: href || '', data: data, onclick: attr(e, 'onclick'),
+              in_form: !!e.closest('form'),
+              disabled: !!e.disabled || attr(e, 'aria-disabled') === 'true'});
+  }
+  return out;
+}"""
+
+# Words that mark a control as destructive or state-changing, matched as whole
+# words of its text, aria-label, title, id, class, name, data-* attributes, inline
+# handler and href (camelCase and -_./ split first). Such a control is never
+# clicked. A write a permitted click still issues is held, never sent
+# (browser_driver._IdentityRouter.click_hold).
+_CLICK_DENY = re.compile(
+    r"\b(?:delete|remove|erase|destroy|purge|wipe|trash|discard|"
+    r"log ?out|log ?off|sign ?out|unsubscribe|unregister|deactivate|disable|revoke|terminate|"
+    r"close account|pay|payment|checkout|check out|place order|order now|buy|purchase|"
+    r"submit|send|post|save|apply|confirm|approve|reject|decline|transfer|withdraw|deposit|"
+    r"donate|reset|clear|empty|cancel|add to (?:basket|cart|bag|wishlist)|add|create|"
+    r"upload|download|install|uninstall|print|block|ban|kick|archive|restore|publish|"
+    r"unpublish|vote|upvote|downvote|like|unlike|follow|unfollow|subscribe|update|rate|"
+    r"report|flag|refund|redeem|claim|reorder|mark)\b", re.IGNORECASE)
+_CAMEL = re.compile(r"([a-z0-9])([A-Z])")
+_HINT_SEPARATORS = re.compile(r"[-_./#:()\[\]{}'\";,=]+")
+
+
+def click_hints(desc: dict) -> str:
+    """The words a click candidate shows or carries, lowercased and split."""
+    raw = " ".join(str(desc.get(k) or "") for k in
+                   ("text", "aria", "title", "id", "cls", "name", "data", "onclick", "href"))
+    return " ".join(_HINT_SEPARATORS.sub(" ", _CAMEL.sub(r"\1 \2", raw)).lower().split())
+
+
+def click_label(desc: dict) -> str:
+    """A short label: the aria-label, title or text, else the selector."""
+    for key in ("aria", "title", "text"):
+        value = " ".join(str(desc.get(key) or "").split())
+        if value:
+            return value[:60]
+    return str(desc.get("selector") or "")[:60]
+
+
+def click_refusal(desc: dict) -> str:
+    """Why this click candidate is never clicked, or "" when it may be."""
+    if not str(desc.get("selector") or "").strip():
+        return "no selector names it"
+    if desc.get("disabled"):
+        return "disabled"
+    if desc.get("in_form"):
+        return "inside a form (forms are never submitted here)"
+    kind = str(desc.get("type") or "").lower()
+    if kind in ("submit", "reset", "file", "image"):
+        return f"a {kind} control"
+    m = _CLICK_DENY.search(click_hints(desc))
+    if m:
+        return f"destructive or state-changing ({m.group(0).lower()})"
+    return ""
+
+
+@dataclass
+class ClickBudget:
+    """Click exploration bounds: clicks per view, clicks per crawl, and seconds
+    from the first click (the deadline is set when clicking starts)."""
+    per_view: int
+    room: int
+    seconds: float
+    deadline: float | None = None
+    seen: set = field(default_factory=set)
+    stopped_by: str = ""
+
+
+def _path_of(url: str) -> str:
+    return urlsplit(url or "").path or "/"
+
+
+async def _explore_clicks(adapter, current: str, result: "SpaCrawlResult", budget: ClickBudget,
+                          capture, *, cancel=None, run_budget=None,
+                          deadline: float | None = None) -> None:
+    """Click the view's candidates (adapter.click_candidates) in document order
+    within `budget`; record each click's calls and what it revealed, and put the
+    view back (adapter.restore) after any click that changed something. A
+    control seen on an earlier view (same selector and label) is not clicked
+    again. When the view cannot be put back, its remaining candidates wait."""
+    view = view_key(current)
+    if budget.deadline is None:
+        budget.deadline = time.monotonic() + max(0.0, float(budget.seconds))
+    try:
+        candidates = await adapter.click_candidates()
+    except Exception as exc:
+        result.errors.append(f"click candidates {view}: {describe_error(exc)}")
+        return
+    done = 0
+    for desc in candidates or ():
+        if not isinstance(desc, dict):
+            continue
+        selector = str(desc.get("selector") or "")
+        label = click_label(desc)
+        key = (selector, label)
+        if key in budget.seen:
+            continue
+        reason = click_refusal(desc)
+        if reason:
+            budget.seen.add(key)
+            result.skip("click_refused")
+            if len(result.click_skips) < 200:
+                result.click_skips.append({"view": view, "selector": selector[:200],
+                                           "label": label, "reason": reason})
+            continue
+        now = time.monotonic()
+        stop = ("max_clicks" if budget.room <= 0
+                else "click_seconds" if now >= budget.deadline
+                else "deadline" if deadline is not None and now >= deadline
+                else "cancelled" if is_cancelled(cancel)
+                else "budget" if _budget_spent(run_budget) else "")
+        if stop:
+            budget.stopped_by = budget.stopped_by or stop
+            return
+        if done >= budget.per_view:
+            result.skip("click_view_cap")
+            return
+        budget.seen.add(key)
+        budget.room -= 1
+        done += 1
+        entry: dict = {"view": view, "selector": selector[:200], "label": label}
+        try:
+            outcome = await adapter.click(desc) or {}
+        except Exception as exc:
+            outcome = {"clicked": False, "reason": describe_error(exc)}
+        try:
+            fired = await adapter.drain()
+        except Exception as exc:
+            fired = []
+            result.errors.append(f"click capture {view}: {describe_error(exc)}")
+        calls = []
+        for exchange in fired:
+            calls.append((exchange.get("method") or "GET", exchange.get("url") or "",
+                          exchange.get("request_body") or ""))
+            capture(exchange, view, f"click on {selector[:120]}")
+        for method, url, body in calls:
+            if len(result.click_calls) < 2000:
+                result.click_calls.append((current, selector, method, url, body))
+        moved = adapter.current_url() or current
+        navigated = "" if _same_view(moved, current) else view_key(moved)
+        entry.update(outcome="clicked" if outcome.get("clicked") else "not_clicked",
+                     reason=str(outcome.get("reason") or "")[:200],
+                     calls=[f"{m} {_path_of(u)}" for m, u, _b in calls][:20],
+                     revealed=int(outcome.get("revealed") or 0),
+                     dialog=bool(outcome.get("dialog")), navigated=navigated)
+        restored = True
+        changed = bool(calls or navigated or entry["revealed"] or entry["dialog"]
+                       or outcome.get("changed") or not outcome.get("clicked"))
+        if changed and callable(getattr(adapter, "restore", None)):
+            try:
+                await adapter.restore(current)
+                restored = _same_view(adapter.current_url() or "", current)
+            except Exception as exc:
+                restored = False
+                result.errors.append(f"click restore {view}: {describe_error(exc)}")
+            try:
+                for exchange in await adapter.drain():
+                    capture(exchange, view)
+            except Exception as exc:
+                result.errors.append(f"click restore capture {view}: {describe_error(exc)}")
+        end_click = getattr(adapter, "end_click", None)
+        if callable(end_click):
+            try:
+                held = await end_click() or {}
+            except Exception:
+                held = {}
+            entry["held"] = [str(h)[:200] for h in held.get("held") or []][:20]
+            entry["blocked"] = [str(b)[:200] for b in held.get("blocked") or []][:20]
+        result.clicks.append(entry)
+        if not restored:
+            result.skip("click_view_lost")
+            return
+
+
 async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_views: int = 30,
                       max_depth: int = 4, max_captured: int = 200, extra_views=(),
                       declared_views: int = 0, route_probes: int = 0,
                       uploads: int = 0,
+                      clicks_per_view: int = 0, max_clicks: int = 0,
+                      click_seconds: float = 120.0,
                       cancel: Any = None, budget: Any = None,
                       deadline: float | None = None) -> SpaCrawlResult:
     """Breadth-first walk of the app's client-side views from `start_url`.
@@ -343,7 +596,18 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
     adapter attaches a benign file the input accepts and returns the upload
     request the page issued (held, never sent), or why there was none. A file
     input in a destructive-looking form is never tried. Every input tried or
-    passed over is recorded in `uploads`; a captured request joins `exchanges`."""
+    passed over is recorded in `uploads`; a captured request joins `exchanges`.
+
+    `clicks_per_view` > 0 and `max_clicks` > 0 (an adapter with
+    `click_candidates()` and `click()`) also click, on each view the walk
+    entered (not a guarded one), up to `clicks_per_view` controls that are not
+    links, in document order, at most `max_clicks` in the crawl and within
+    `click_seconds` of the first click. A control inside a form, disabled, or
+    whose text or attributes look destructive or state-changing
+    (click_refusal) is never clicked; the same control on a later view is not
+    clicked again. The calls a click fires join `exchanges` like a view's;
+    each click is recorded in `clicks` (selector, calls, what it revealed) and
+    the view is put back (`restore()`) after a click that changed it."""
     result = SpaCrawlResult(start_url=start_url)
     origin = urlsplit(start_url)[:2]
     queue: list[tuple[str, int, bool]] = [(start_url, 0, False)]
@@ -362,6 +626,11 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
     text_of = getattr(adapter, "text", None)
     upload_room = max(0, int(uploads or 0))
     upload_keys: set = set()
+    click_budget = (ClickBudget(per_view=int(clicks_per_view), room=int(max_clicks),
+                                seconds=float(click_seconds or 0))
+                    if int(clicks_per_view or 0) > 0 and int(max_clicks or 0) > 0
+                    and callable(getattr(adapter, "click_candidates", None))
+                    and callable(getattr(adapter, "click", None)) else None)
 
     def admit(url: str | None, depth: int, declared: bool = False) -> None:
         if url is None:
@@ -564,6 +833,10 @@ async def crawl_views(adapter: ViewAdapter, start_url: str, *, in_scope, max_vie
         if (upload_room > 0 and not guarded and callable(getattr(adapter, "file_inputs", None))
                 and callable(getattr(adapter, "upload", None))):
             upload_room = await _try_uploads(adapter, current, result, upload_keys, upload_room)
+        if click_budget is not None and not guarded and not click_budget.stopped_by:
+            await _explore_clicks(adapter, current, result, click_budget, capture,
+                                  cancel=cancel, run_budget=budget, deadline=deadline)
+            result.click_stopped_by = click_budget.stopped_by
         if declared_room > 0 and callable(getattr(adapter, "scripts", None)):
             await mine_declared(current)
     else:

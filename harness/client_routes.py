@@ -64,6 +64,8 @@ MAX_API_LINKS = 400
 MAX_API_VIEWS = 200
 MAX_READ_NAMES = 64
 MAX_PENDING_CALLS = 2000
+MAX_API_CLICKS = 200
+MAX_SELECTOR = 300
 
 _PARAM_NAME = re.compile(r"^[A-Za-z_$][\w$.\-\[\]]{0,63}$")
 _ID_SEGMENT = re.compile(r"^(?:\d+|[0-9a-f]{16,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
@@ -506,6 +508,19 @@ def _object_keys(body: str) -> list[str]:
     return out
 
 
+def _view_route(view_url: str) -> "ClientRoute | None":
+    """The route of a view URL as loaded (a hash route, else a history route),
+    its parameters dropped; None when its path is no route."""
+    parts = urlsplit(view_url)
+    fr = fragment_route(parts.fragment)
+    if fr is not None:
+        prefix, path, _query = fr
+        clean = _clean_route_path(path)
+        return None if clean is None else ClientRoute(HASH, parts.path or "/", prefix + clean)
+    clean = _clean_route_path(parts.path or "/")
+    return None if clean is None else ClientRoute(HISTORY, clean)
+
+
 class ClientRouteMap:
     """The client-side routes one engagement learned, bounded and value-free once
     finalized."""
@@ -524,6 +539,11 @@ class ClientRouteMap:
         # API, the route only (never a value). A value the API returns may be
         # rendered by any of them (views_for_api; stored_xss loads them).
         self.api_views: dict[str, list[list[str]]] = {}
+        # "GET path" -> [[kind, document, route, selector]]: click recipes. A crawl
+        # (driver_capture.click_explore) saw that API read only after clicking the
+        # control `selector` names on that view, e.g. a dialog that fetches and
+        # renders its content (clicks_for_api; stored_xss replays the recipe).
+        self.api_clicks: dict[str, list[list[str]]] = {}
         # In memory only, never persisted: (view url, method, api url, body).
         self._pending: list[tuple[str, str, str, str]] = []
         # Query-bearing path literals from bundles, kept until the router config
@@ -706,6 +726,46 @@ class ClientRouteMap:
                 return
             self._pending.append((probe_url, (method or "GET").upper(), url or "", body or ""))
 
+    def add_click(self, view_url: str, selector: str, calls) -> None:
+        """A click recipe (spa_navigation click exploration): on the view loaded as
+        `view_url`, clicking the control `selector` names fired `calls` (method,
+        url, body). Each same-origin GET is kept by route, the route only (never a
+        value), so a read-back can reproduce "open the view, click the control"."""
+        from harness.engagement import normalize_path
+        selector = str(selector or "").strip()
+        if not selector or len(selector) > MAX_SELECTOR or not self._same_origin(view_url):
+            return
+        route = _view_route(view_url)
+        if route is None or _excluded(route.route.lstrip("!") if route.kind == HASH
+                                      else route.document):
+            return
+        recipe = [route.kind, route.document, route.route, selector]
+        netloc = urlsplit(view_url).netloc
+        for method, url, _body in calls or ():
+            if (method or "GET").upper() != "GET" or urlsplit(url or "").netloc not in ("", netloc):
+                continue
+            key = f"GET {normalize_path(url)}"
+            recipes = self.api_clicks.get(key) or []
+            if recipe in recipes or sum(len(v) for v in self.api_clicks.values()) >= MAX_API_CLICKS:
+                continue
+            self.api_clicks[key] = recipes + [recipe]
+
+    def clicks_for_api(self, method: str, url: str) -> list[tuple[str, str]]:
+        """(page URL, selector) for each click recipe that read this API path
+        (object ids collapsed): the view on `url`'s origin with no parameter set,
+        and the control to click there, in the order seen."""
+        from harness.engagement import normalize_path
+        out: list[tuple[str, str]] = []
+        for entry in self.api_clicks.get(
+                f"{(method or 'GET').upper()} {normalize_path(url)}") or []:
+            if not (isinstance(entry, (list, tuple)) and len(entry) == 4):
+                continue
+            kind, document, route, selector = entry
+            pair = (ClientRoute(kind, document, route).seed_url(url), selector)
+            if pair not in out:
+                out.append(pair)
+        return out
+
     def merge(self, other: "ClientRouteMap | None") -> None:
         if other is None:
             return
@@ -733,6 +793,12 @@ class ClientRouteMap:
         for key, views in other.api_views.items():
             for kind, document, route in views:
                 self._view_link(key, ClientRoute(kind, document, route))
+        for key, recipes in other.api_clicks.items():
+            for recipe in recipes:
+                known = self.api_clicks.get(key) or []
+                if (list(recipe) not in known
+                        and sum(len(v) for v in self.api_clicks.values()) < MAX_API_CLICKS):
+                    self.api_clicks[key] = known + [list(recipe)]
         self._pending.extend(other._pending[:max(0, MAX_PENDING_CALLS - len(self._pending))])
         for literal in other._literals:
             if len(self._literals) < MAX_ROUTES and literal not in self._literals:
@@ -878,6 +944,8 @@ class ClientRouteMap:
                 "hash_hint": self.hash_hint,
                 "api_links": {k: list(v) for k, v in self.api_links.items()},
                 "api_views": {k: [list(v) for v in vs] for k, vs in self.api_views.items()},
+                **({"api_clicks": {k: [list(v) for v in vs] for k, vs in self.api_clicks.items()}}
+                   if self.api_clicks else {}),
                 "literals": [[p, list(n)] for p, n in self._literals],
                 "origin": list(self.origin) if self.origin else None}
 
@@ -899,6 +967,8 @@ class ClientRouteMap:
         m.api_links = {k: list(v) for k, v in (d.get("api_links") or {}).items()}
         m.api_views = {k: [list(v) for v in vs if isinstance(v, (list, tuple)) and len(v) == 3]
                        for k, vs in (d.get("api_views") or {}).items()}
+        m.api_clicks = {k: [list(v) for v in vs if isinstance(v, (list, tuple)) and len(v) == 4]
+                        for k, vs in (d.get("api_clicks") or {}).items()}
         m._literals = [(p, list(n)) for p, n in (d.get("literals") or [])][:MAX_ROUTES]
         return m
 

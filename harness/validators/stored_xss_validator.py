@@ -113,6 +113,8 @@ _CHECK_MANUALLY = "check manually"
 # Client views loaded after a JSON render held the payload: at most this many per
 # payload, each given this long to fetch the API and render it.
 _MAX_VIEWS = 3
+# Click recipes loaded per payload shape, apart from _MAX_VIEWS.
+_MAX_CLICK_VIEWS = 2
 _VIEW_WAIT_MS = 2500
 
 
@@ -604,6 +606,23 @@ class StoredXssValidator(Validator):
         return [v for v in views
                 if not self.allowed_hosts or scope_lock.host_in_scope(v, self.allowed_hosts)]
 
+    def _client_click_views(self, api_url: str) -> list[tuple[str, str]]:
+        """(page URL, selector) of each click recipe a crawl recorded for `api_url`
+        (client_routes.clicks_for_api: the view read that API only after a click on
+        that control, e.g. a dialog), in scope, from the same map as _client_views."""
+        rc = self.run_context
+        routes = getattr(rc, "client_routes", None) if rc is not None else None
+        if routes is None:
+            from harness.validators.route_candidates import stored_routes
+            routes = stored_routes(api_url)
+        clicks_for_api = getattr(routes, "clicks_for_api", None)
+        try:
+            recipes = clicks_for_api("GET", api_url) if callable(clicks_for_api) else []
+        except Exception:
+            return []
+        return [(v, s) for v, s in recipes
+                if not self.allowed_hosts or scope_lock.host_in_scope(v, self.allowed_hosts)]
+
     async def _confirm_in_views(self, json_renders: list[str], expected: str, headers: dict,
                                 viewed: list) -> tuple:
         """Load the client views that read the JSON renders holding the payload (at
@@ -611,15 +630,25 @@ class StoredXssValidator(Validator):
         (_browser_confirm). Returns (executed, view, render url, note) for the first
         view that ran it or that no browser could load, else for the last one
         loaded; view is "" when no view is known. Each load goes into `viewed`."""
-        views: list[tuple[str, str]] = []
+        views: list[tuple[str, str, tuple]] = []
         for rurl in json_renders:
             for view in self._client_views(rurl):
-                if len(views) < _MAX_VIEWS and view not in [v for v, _ in views]:
-                    views.append((view, rurl))
+                if len(views) < _MAX_VIEWS and view not in [v for v, _, _c in views]:
+                    views.append((view, rurl, ()))
+        # Click recipes (driver_capture.click_explore): a view that reads the API
+        # only once a control is clicked is loaded and that control clicked.
+        recipes = 0
+        for rurl in json_renders:
+            for view, selector in self._client_click_views(rurl):
+                entry = (view, rurl, (selector,))
+                if recipes < _MAX_CLICK_VIEWS and entry not in views:
+                    views.append(entry)
+                    recipes += 1
         last = (False, "", "", "")
-        for view, rurl in views:
+        for view, rurl, clicks in views:
             executed, note = await self._browser_confirm(
-                view, expected, headers=_identity_headers(headers), wait_ms=_VIEW_WAIT_MS)
+                view, expected, headers=_identity_headers(headers), wait_ms=_VIEW_WAIT_MS,
+                clicks=clicks)
             if executed is not None:
                 viewed.append((view, note))
             last = (executed, view, rurl, note)
@@ -674,7 +703,7 @@ class StoredXssValidator(Validator):
                       f"as <textarea>, or a CSP, stops it). {note}"))
 
     async def _browser_confirm(self, url: str, expected: str, *, headers: dict | None = None,
-                               wait_ms: int = 1200) -> tuple[bool | None, str]:
+                               wait_ms: int = 1200, clicks=()) -> tuple[bool | None, str]:
         """Load the rendered page in a headless browser and look for a console
         message, or an alert/confirm/prompt dialog, exactly equal to
         ``expected``, the value THIS attempt's payload computes when it runs
@@ -684,7 +713,10 @@ class StoredXssValidator(Validator):
         browser could check. Any other output, including a message that merely
         contains the payload's text, is the page's own (E2: a page that logs
         the stored source echoes it without running it). `headers` (an identity's,
-        for a client view) go to the driver only when given."""
+        for a client view) go to the driver only when given. `clicks` (a click
+        recipe's selectors) are clicked after the load (driver.visit(clicks=...));
+        a recipe click that could not be made leaves a candidate to check
+        manually, never a negative."""
         driver = self._driver
         try:
             if driver is None:
@@ -697,11 +729,29 @@ class StoredXssValidator(Validator):
                         if rc is not None else {})
             if headers:
                 visit_kw["headers"] = headers
+            if clicks:
+                visit_kw["clicks"] = tuple(clicks)
             obs = await driver.visit(url, wait_ms=wait_ms, **visit_kw)
         except Exception as e:
             return None, f"The browser check of {url} failed ({type(e).__name__}); execution unproven."
         if getattr(obs, "load_error", None):
             return None, f"The browser could not load {url} ({obs.load_error}); execution unproven."
+        if clicks:
+            done = list(getattr(obs, "clicks", None) or [])
+            clicked = len(done) >= len(clicks) and all(d.endswith(": clicked") for d in done)
+            how = f"After clicking {', '.join(clicks)} on the view: "
+            if not clicked:
+                return False, (f"A headless browser loaded {url}, but the recorded click on "
+                               f"{', '.join(clicks)} could not be made "
+                               f"({'; '.join(done)[:200] or 'no click reported'}); "
+                               f"{_CHECK_MANUALLY}.")
+            executed, note = self._judge(obs, url, expected)
+            return executed, how + note
+        return self._judge(obs, url, expected)
+
+    @staticmethod
+    def _judge(obs, url: str, expected: str) -> tuple[bool, str]:
+        """_browser_confirm's reading of one loaded page."""
         if any(str(m).strip() == expected for m in (getattr(obs, "console", None) or [])):
             return True, (f"Execution confirmed: the payload executed in a headless browser "
                           f"(it logged {expected}, a value computed at run time that the stored "
