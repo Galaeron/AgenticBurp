@@ -206,19 +206,21 @@ class ParameterBindingCallerTests(unittest.TestCase):
         self.assertEqual((v.status, v.control_outcome), ("not_confirmed", NAMED_PARAMETER_UNTESTED))
         self.assertEqual(f.review_verdict, "inconclusive_unverified")
 
-    def test_control_named_parameter_tested_and_clean_is_refuted(self):
+    def test_control_named_parameter_tested_and_clean_is_bound_but_not_refuted(self):
         # Negative control: the named parameter really was tested and only echoes,
-        # so the negative is bound to it and the gate refutes as before.
+        # so the negative is bound to it (no untested marker). EFF-1: the SSTI leg's
+        # silence is the absence of its oracle signal, not a held control, so the
+        # gate leaves the finding unverified instead of refuting it.
         v, f, sent = self.run_caller("/echo" + self.SEVEN, _finding("tpl", "query"))
         self.assertGreater(sent, 0)
         self.assertEqual((v.status, v.control_outcome, v.parameter), ("not_confirmed", "", "tpl"))
-        self.assertEqual(f.review_verdict, "unconfirmed_hypothesis")
+        self.assertEqual(f.review_verdict, "inconclusive_unverified")
         self.assertEqual(f.severity, "low")
 
-    def test_control_unnamed_within_cap_and_clean_is_refuted(self):
+    def test_control_unnamed_within_cap_and_clean_is_not_refuted(self):
         v, f, _ = self.run_caller("/echo?a=1&tpl=hi", _finding())
         self.assertEqual((v.status, v.control_outcome), ("not_confirmed", ""))
-        self.assertEqual(f.review_verdict, "unconfirmed_hypothesis")
+        self.assertEqual(f.review_verdict, "inconclusive_unverified")
 
 
 if __name__ == "__main__":

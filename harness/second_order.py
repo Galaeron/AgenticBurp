@@ -61,7 +61,10 @@ async def send_through_run(run_context, method: str, url: str, *, allowed_hosts,
     transport's ExecutionOutcome (``.ok``/``.status``/``.outcome``/``.body``).
     """
     from harness.run_context import transport_for
-    _tt, _owned = transport_for(run_context, allowed_hosts=allowed_hosts, config=config)
+    # The plant and the read are requests this harness originates: an empty scope
+    # admits no host (active_mode=True).
+    _tt, _owned = transport_for(run_context, allowed_hosts=allowed_hosts, config=config,
+                                active_mode=True)
     try:
         return await _tt.send_creds(method, url, capability=capability,
                                     headers=headers, body=body, case_ref=case_ref,

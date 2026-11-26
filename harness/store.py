@@ -348,6 +348,24 @@ CREATE TABLE IF NOT EXISTS plan_dispatch_notes (
 );
 """
 
+# ARC-4 (2026-11-21): the Burp plane's single-use dispatch nonce. One row per
+# plan holds the sha256 of the nonce POST /test-plans/{id}/dispatch last issued
+# (never the nonce itself), the policy handed to the plane, and when a
+# /validation-results submission consumed it. Versioned additive side table
+# keyed on test_plans.plan_id plus the 'plane-dispatch-schema' marker. Rollback:
+# DROP TABLE plane_dispatches and delete the marker; the previous build never
+# reads either, and its /validation-results ignores the extra nonce field.
+_PLANE_DISPATCH_VERSION = 1
+_PLANE_DISPATCH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS plane_dispatches (
+    plan_id TEXT PRIMARY KEY,
+    nonce_sha256 TEXT NOT NULL,
+    policy_json TEXT NOT NULL,
+    issued_at REAL NOT NULL,
+    consumed_at REAL
+);
+"""
+
 # P0-1: the durable stream for harness.evidence_ledger.EvidenceLedger. Append-only
 # (event_id is the primary key and every write is INSERT OR IGNORE -- a caller
 # re-persisting the same event, e.g. after a retry, is a no-op, never an overwrite)
@@ -643,6 +661,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_DECLARATIONS_SCHEMA)
     conn.executescript(_FINDING_INPUTS_SCHEMA)
     conn.executescript(_PLAN_DISPATCH_SCHEMA)
+    conn.executescript(_PLANE_DISPATCH_SCHEMA)
     conn.executescript(_PRINCIPAL_SCHEMA)
     conn.executescript(_ISSUE_MERGE_SCHEMA)
     conn.executescript(_LEDGER_SCHEMA)
@@ -662,7 +681,9 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
                  (str(_FINDING_INPUTS_VERSION),))
     conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('plan-dispatch-schema', ?)",
                  (str(_PLAN_DISPATCH_VERSION),))
-    ledger_cols = {row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
+    conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('plane-dispatch-schema', ?)",
+                 (str(_PLANE_DISPATCH_VERSION),))
+    ledger_cols ={row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
     if "engagement_id" not in ledger_cols:
         try:
             conn.execute("ALTER TABLE ledger_events ADD COLUMN engagement_id TEXT NOT NULL DEFAULT ''")
@@ -978,12 +999,12 @@ def bind_confirmation_proof(exchange: HttpExchange, finding: Finding, agent_name
     unconfirmed). This marks confirmed only the UNCONFIRMED rows on the same
     host, method and route (`_normalize_endpoint`: query values dropped, names
     kept, the endpoint the fingerprint keys on) whose class is the proof's own
-    class (the fingerprint's canonical reading) and whose recorded parameter is
-    the proven one, or is unnamed. A row of any other class or another parameter
-    is never touched. When no row matches and none is already confirmed, the
-    proven finding is persisted as its own row. `finding` must carry proof_id and
-    case_id; a finding without them binds nothing. Returns the number of rows
-    bound/added.
+    class (categories.finding_class, the reading the R11-1 class gate uses; EFF-2)
+    and whose recorded parameter is the proven one, or is unnamed. A row of any
+    other class or another parameter is never touched. When no row matches and
+    none is already confirmed, the proven finding is persisted as its own row.
+    `finding` must carry proof_id and case_id; a finding without them binds
+    nothing. Returns the number of rows bound/added.
 
     The coverage drive's proofs were not dispatched for any stored row, so it
     narrows the match (r10: 143 confirmed coverage proofs, AV-EXPOSURE-01 among
@@ -1006,10 +1027,13 @@ def bind_confirmation_proof(exchange: HttpExchange, finding: Finding, agent_name
     if not (finding.confirmed and finding.proof_id and finding.case_id):
         return 0
     from urllib.parse import urlsplit
-    from harness.categories import legacy_canonicalize
+    from harness.categories import finding_class
 
     def _check(cls: str) -> str:
-        return legacy_canonicalize(cls) or (cls or "").lower()
+        # EFF-2: the class reading the R11-1 gate uses, so a proof binds the rows
+        # the gate would let it confirm ("potential_idor" beside "idor"). The
+        # fingerprint keeps legacy_canonicalize; this only picks rows to bind.
+        return finding_class(cls)
 
     def _accepts(cls: str) -> bool:
         try:
@@ -1844,6 +1868,39 @@ def capability_can_confirm(capability: str) -> bool:
     return capability in _CONFIRMATION_CAPABILITIES
 
 
+# ARC-12: the in-process writer's wording for each content refusal code (the
+# Burp plane gets the code itself; see persist_plane_submission).
+_CONTENT_REFUSAL_MESSAGES = {
+    "binding_mismatch": "binding_mismatch",
+    "executor_mismatch": "executor does not match the registered capability",
+    "capability_cannot_confirm": "this capability may provide evidence but cannot mark the vulnerability confirmed",
+    "confirmed_status_invalid": "confirmed result has invalid status",
+}
+
+
+def _submission_content_refusal(row, submission: ValidationSubmission) -> str:
+    """Why a submission's content does not fit its plan (row: source_exchange_hash,
+    status, capability, execution_plane), as a stable code (ARC-12), or "" when
+    it fits."""
+    if submission.source_exchange_hash != row[0]:
+        return "binding_mismatch"
+    # The executor prefix must match the plan's OWN execution plane,
+    # not a hardcoded "burp:" -- this previously rejected every
+    # legitimate local_tool (sqlmap) submission outright, silently,
+    # since no local_tool result could ever satisfy an executor
+    # string of the form "burp:<capability>". Caught by a test that
+    # tried to persist a real sqlmap-shaped submission and found it
+    # rejected for a reason that had nothing to do with the test's
+    # actual assertion.
+    if submission.executor != f"{row[3]}:{row[2]}":
+        return "executor_mismatch"
+    if submission.confirmed and not capability_can_confirm(row[2]):
+        return "capability_cannot_confirm"
+    if submission.confirmed and submission.status != "confirmed":
+        return "confirmed_status_invalid"
+    return ""
+
+
 def persist_validation_submission(submission: ValidationSubmission) -> tuple[bool, str]:
     conn = _connect()
     try:
@@ -1852,23 +1909,15 @@ def persist_validation_submission(submission: ValidationSubmission) -> tuple[boo
             (submission.plan_id,)).fetchone()
         if not row:
             return False, "unknown test plan"
-        if submission.source_exchange_hash != row[0]:
-            return False, "binding_mismatch"
-        # The executor prefix must match the plan's OWN execution plane,
-        # not a hardcoded "burp:" -- this previously rejected every
-        # legitimate local_tool (sqlmap) submission outright, silently,
-        # since no local_tool result could ever satisfy an executor
-        # string of the form "burp:<capability>". Caught by a test that
-        # tried to persist a real sqlmap-shaped submission and found it
-        # rejected for a reason that had nothing to do with the test's
-        # actual assertion.
-        expected_executor = f"{row[3]}:{row[2]}"
-        if submission.executor != expected_executor:
-            return False, "executor does not match the registered capability"
-        if submission.confirmed and not capability_can_confirm(row[2]):
-            return False, "this capability may provide evidence but cannot mark the vulnerability confirmed"
-        if submission.confirmed and submission.status != "confirmed":
-            return False, "confirmed result has invalid status"
+        refusal = _submission_content_refusal(row, submission)
+        if refusal:
+            return False, _CONTENT_REFUSAL_MESSAGES[refusal]
+        if row[1] not in _PLANE_DISPATCHABLE_STATUSES and conn.execute(
+                "SELECT 1 FROM plane_dispatches WHERE plan_id = ? AND consumed_at IS NOT NULL",
+                (submission.plan_id,)).fetchone():
+            # ARC-4: a verdict the Burp plane returned under a dispatch nonce is
+            # immutable; no in-process writer replaces it.
+            return False, "plan already has a plane result"
         # Any other status is stored as given: "observed" is a capability that
         # cannot confirm reporting what it saw (confirmed is False, so the
         # coverage ledger reads it as supported evidence, never confirmed/refuted).
@@ -1885,6 +1934,107 @@ def persist_validation_submission(submission: ValidationSubmission) -> tuple[boo
     finally:
         conn.close()
 
+
+# ARC-4: the plan statuses the Burp plane may still (re)run. Every other status
+# is a verdict, and a verdict is never overwritten: "error" means nothing was
+# decided (a failed send, a refused policy), so the plan may be dispatched again.
+_PLANE_DISPATCHABLE_STATUSES = frozenset({"proposed", "not_dispatchable", "error"})
+
+# ARC-12: every refusal code issue_plane_dispatch and persist_plane_submission
+# return. The server maps each to its own HTTP status.
+PLANE_REFUSAL_REASONS = frozenset({
+    "unknown_plan", "wrong_execution_plane", "plan_terminal", "not_dispatched",
+    "dispatch_nonce_required", "dispatch_nonce_mismatch", "duplicate_submission",
+    *_CONTENT_REFUSAL_MESSAGES,
+})
+
+
+def _nonce_digest(nonce: str) -> str:
+    return hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+
+
+def issue_plane_dispatch(plan_id: str, source_exchange_hash: str,
+                         policy: dict) -> tuple[bool, str, str]:
+    """Issue the single-use nonce the Burp plane must return with its result.
+
+    Returns (issued, reason, nonce). Only a stored Burp-plane plan whose
+    exchange binding matches and that holds no verdict yet is dispatched. A
+    new dispatch supersedes an outstanding one, so a result from the earlier
+    run no longer matches. Only the nonce's sha256 is stored."""
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT source_exchange_hash, status, execution_plane FROM test_plans WHERE plan_id = ?",
+            (plan_id,)).fetchone()
+        reason = ("unknown_plan" if not row
+                  else "wrong_execution_plane" if row[2] != "burp"
+                  else "binding_mismatch" if source_exchange_hash != row[0]
+                  else "plan_terminal" if row[1] not in _PLANE_DISPATCHABLE_STATUSES
+                  else "")
+        if reason:
+            conn.rollback()
+            return False, reason, ""
+        nonce = secrets.token_urlsafe(32)
+        conn.execute("INSERT OR REPLACE INTO plane_dispatches VALUES (?, ?, ?, ?, NULL)",
+                     (plan_id, _nonce_digest(nonce), json.dumps(policy, sort_keys=True), time.time()))
+        conn.commit()
+        return True, "issued", nonce
+    finally:
+        conn.close()
+
+
+def persist_plane_submission(submission: ValidationSubmission) -> tuple[bool, str]:
+    """Record a Burp-plane result under its dispatch nonce (ARC-4).
+
+    The submission must carry the nonce issue_plane_dispatch last issued for
+    the plan, unconsumed, and the plan must hold no verdict. Accepting it
+    consumes the nonce in the same transaction as the result row, so a replay
+    of the same submission is refused. A refused submission consumes nothing.
+    The content checks are the same as persist_validation_submission's."""
+    nonce = getattr(submission, "dispatch_nonce", "") or ""
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT source_exchange_hash, status, capability, execution_plane FROM test_plans WHERE plan_id = ?",
+            (submission.plan_id,)).fetchone()
+        dispatch = conn.execute(
+            "SELECT nonce_sha256, consumed_at FROM plane_dispatches WHERE plan_id = ?",
+            (submission.plan_id,)).fetchone() if row else None
+        if not row:
+            reason = "unknown_plan"
+        elif dispatch is None:
+            reason = "not_dispatched"
+        elif not nonce:
+            reason = "dispatch_nonce_required"
+        elif not hmac.compare_digest(_nonce_digest(nonce), dispatch[0]):
+            reason = "dispatch_nonce_mismatch"
+        elif dispatch[1] is not None:
+            reason = "duplicate_submission"
+        elif row[1] not in _PLANE_DISPATCHABLE_STATUSES:
+            reason = "plan_terminal"
+        else:
+            reason = _submission_content_refusal(row, submission)
+        if reason:
+            conn.rollback()
+            return False, reason
+        now = time.time()
+        conn.execute("UPDATE plane_dispatches SET consumed_at = ? WHERE plan_id = ?",
+                     (now, submission.plan_id))
+        conn.execute(
+            """INSERT INTO validation_runs
+               (plan_id, status, confidence, confirmed, summary, evidence, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (submission.plan_id, submission.status, submission.confidence, int(submission.confirmed),
+             submission.summary, submission.evidence, now),
+        )
+        conn.execute("UPDATE test_plans SET status = ? WHERE plan_id = ?",
+                     (submission.status, submission.plan_id))
+        conn.commit()
+        return True, "accepted"
+    finally:
+        conn.close()
 
 
 def record_plan_dispatch(plan_id: str, *, status: str, validator: str, summary: str = "",
@@ -2186,6 +2336,9 @@ def all_host_findings(url: str, include_suppressed: bool = False, *, engagement_
          # report and the Burp tab can show status at a glance rather than a raw
          # confidence number.
          "lifecycle_state": confirmation_gate.lifecycle_state(bool(confirmed), rv),
+         # EFF-5: why a LEAD is LEAD (refuted / untested / rejected / environment),
+         # "" otherwise -- a refuted finding and an untested one are not the same.
+         "lead_reason": confirmation_gate.lead_reason(bool(confirmed), rv),
          "parameter_location": ploc or "", "parameter_name": pname or "",
          # Finding dedup: False only for a row written before finding_inputs existed
          # (no side row, no proof record) -- issues.issue_key then keeps
@@ -2264,6 +2417,7 @@ def _resolve_confirmation_proofs(results: list[dict]) -> None:
             r["proof_status"] = "unavailable"
             r["confirmed"] = False
             r["lifecycle_state"] = confirmation_gate.lifecycle_state(False, r["review_verdict"])
+            r["lead_reason"] = confirmation_gate.lead_reason(False, r["review_verdict"])
             r["oracle_verified"] = False
             r["verification_state"] = "candidate"
 
@@ -3423,6 +3577,10 @@ def apply_retention_from_config(cfg: dict, *, now: float | None = None) -> int:
 #                                content-addressed, so a column-based filter
 #                                would be actively wrong here.
 #
+#     plane_dispatches / plan_dispatch_notes -- plan_id into test_plans.host,
+#                          deleted the same way as validation_runs below; the
+#                          plane's "plan:<plan_id>" ledger events go with them
+#
 #     validation_runs  -- no host column of its own; scoped via `plan_id` FK
 #                          into test_plans.host and wiped with the correlated
 #                          subquery `plan_id IN (SELECT plan_id FROM test_plans
@@ -3648,6 +3806,13 @@ def wipe_engagement(host: str) -> dict:
 
         conn.execute("DELETE FROM plan_dispatch_notes WHERE plan_id IN "
                      "(SELECT plan_id FROM test_plans WHERE host = ?)", (host,))
+        # ARC-4: the plane's dispatch nonces, and the dispatch/submission/refusal
+        # ledger events the server keys on "plan:<plan_id>".
+        conn.execute("DELETE FROM plane_dispatches WHERE plan_id IN "
+                     "(SELECT plan_id FROM test_plans WHERE host = ?)", (host,))
+        counts["ledger_events"] += conn.execute(
+            "DELETE FROM ledger_events WHERE finding_ref IN "
+            "(SELECT 'plan:' || plan_id FROM test_plans WHERE host = ?)", (host,)).rowcount
         cur = conn.execute("DELETE FROM test_plans WHERE host = ?", (host,))
         counts["test_plans"] = cur.rowcount
 

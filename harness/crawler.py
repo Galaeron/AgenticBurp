@@ -155,8 +155,14 @@ async def crawl(
     if robots_url != base_url.split("#", 1)[0]:
         queue.append((robots_url, 0, False))
 
-    client = None if run_context is not None else httpx.AsyncClient(
-        timeout=timeout, follow_redirects=True)
+    # ARC-7: no raw client. Without a run the crawl sends through a standalone one
+    # (transport_for): scope, budget and the connect-time pin apply, every redirect hop
+    # is scope-checked, and an empty scope admits no host.
+    _tt, _owned = (None, None)
+    if run_context is None:
+        from harness.run_context import transport_for
+        _tt, _owned = transport_for(None, allowed_hosts=allowed_hosts or [],
+                                    active_mode=True, timeout=timeout)
     try:
         while (queue and result.pages_fetched + result.scripts_mined
                + result.discovery_files_fetched < max_pages):
@@ -190,9 +196,13 @@ async def crawl(
                     final_url = outcome.final_url or norm_url
                 else:
                     await global_throttle.acquire()
-                    resp = await client.get(norm_url, headers=headers)
-                    body = resp.text or ""
-                    final_url = str(getattr(resp, "url", norm_url) or norm_url)
+                    outcome = await _tt.send_creds("GET", norm_url, capability="crawler",
+                                                   headers=headers, max_redirects=5)
+                    if not outcome.ok:
+                        result.errors.append(f"{norm_url}: {outcome.outcome}")
+                        continue
+                    body = outcome.body or ""
+                    final_url = outcome.final_url or norm_url
             except httpx.HTTPError as e:
                 result.errors.append(f"{norm_url}: {e.__class__.__name__}")
                 continue
@@ -366,6 +376,6 @@ async def crawl(
                             queue.append((link, depth + 1, False))
 
     finally:
-        if client is not None:
-            await client.aclose()
+        if _owned is not None:
+            await _owned.aclose()
     return result

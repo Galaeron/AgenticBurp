@@ -61,6 +61,14 @@ public final class FindingPresentation {
         }
     }
 
+    /**
+     * EFF-4: the model's confidence as text. It is an uncalibrated model score, so it is never
+     * shown as a probability or a likelihood word, and it always comes after {@link #stateLabel}.
+     */
+    public static String modelScore(double score) {
+        return String.format(java.util.Locale.ROOT, "model score %.2f (uncalibrated, not a probability)", score);
+    }
+
     /** Per-state counts for the export headline; impact counts are by severity, not by proof. */
     public record Tally(int total, int critical, int high, int confirmed, int unverified, int other) {
         public String headline(int exchanges) {

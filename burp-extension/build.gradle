@@ -70,9 +70,18 @@ dependencies {
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
+// OPS-2: pin the compile/test JDK to 17 regardless of which JDK launches Gradle,
+// so the shipped bytecode and the test runtime do not drift with the host. This
+// also sets source/target compatibility to 17. Gradle itself is pinned by the
+// wrapper (gradle/wrapper/gradle-wrapper.properties, with a distribution checksum);
+// Gradle 8.7 can only be LAUNCHED by a JDK 8-21, so point JAVA_HOME at JDK 17-21.
+// If no JDK 17 is installed, Gradle fails with "No matching toolchains found"
+// (auto-provisioning needs the foojay resolver plugin; it is deliberately not
+// added here -- it is an extra network-resolved plugin on the build's trust path).
 java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
 }
 
 // Source literals are UTF-8 on every supported host, including Windows/JDK 17.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import logging
+import math
 import re
 import asyncio
 import time
@@ -139,12 +140,37 @@ class OllamaContextTruncatedError(OllamaError):
         self.window_source = window_source
 
 
+class OllamaCloudModelRefusedError(OllamaError):
+    """SEC-1: a call to an Ollama cloud model (`-cloud` / `:cloud` suffix) while
+    `ollama.allow_cloud_models` is false. Such a model runs off-host, so the
+    sanitised but real exchange content in the prompt would leave the machine.
+    Raised before any request is sent; a config fault, never retried and kept
+    out of the circuit breaker. `slots` names the config slots involved when the
+    run-start check raised it (model_egress.refuse_cloud_models)."""
+
+    def __init__(self, message: str = "", *, slots: list[dict] | None = None):
+        super().__init__(message)
+        self.slots = list(slots or [])
+
+
+class OllamaPacerTimeoutError(OllamaError):
+    """The process-wide model-call pacer (`ollama.rate_limit`, see
+    rate_limiter.pacer_config) did not admit the call within its
+    max_wait_seconds, so nothing was sent. A local backlog, not an outage: never
+    retried and kept out of the circuit breaker."""
+
+    def __init__(self, message: str = "", *, max_wait_seconds: float | None = None):
+        super().__init__(message)
+        self.max_wait_seconds = max_wait_seconds
+
+
 # Exceptions that do not count as circuit-breaker failures: a config-level,
 # per-prompt or rate-limit fault, not a service outage. What still counts: a
 # transport failure, a timeout, a 5xx. Shared with RunContext's per-run breaker.
 BREAKER_EXCLUDED_ERRORS = (OllamaModelNotFoundError, OllamaInvalidJSONError,
                            OllamaContextTruncatedError, OllamaEmptyResponseError,
-                           OllamaRateLimitedError)
+                           OllamaRateLimitedError, OllamaCloudModelRefusedError,
+                           OllamaPacerTimeoutError)
 
 
 # Context-window guard. Ollama does not say when it cuts a prompt: the reply
@@ -172,9 +198,30 @@ _OPENAI_SERVER_KEY = "*server*"
 def is_cloud_model(model: str) -> bool:
     """True for an Ollama cloud model (`gemma4:31b-cloud`, `glm-4.6:cloud`). Those
     run off-host, ignore options.num_ctx and are not in /api/ps, so the context
-    guard and the preflight leave them alone."""
+    guard and the preflight leave them alone. SEC-1: OllamaClient refuses them
+    unless `ollama.allow_cloud_models` is true (see parse_allow_cloud_models)."""
     name = str(model or "").strip().lower()
     return name.endswith("-cloud") or name.endswith(":cloud")
+
+
+def parse_allow_cloud_models(value) -> bool:
+    """`ollama.allow_cloud_models`, strictly: unset means false. Anything but an
+    unquoted boolean raises at startup, so the string "false" cannot be read as
+    an opt-in (the same rule as privacy.external_lookups)."""
+    if value is None:
+        return False
+    if type(value) is not bool:
+        raise ValueError("invalid ollama config: ollama.allow_cloud_models must be an unquoted "
+                         f"true or false, got {value!r}")
+    return value
+
+
+def cloud_refusal_reason(models) -> str:
+    """The operator-facing reason a cloud model was refused (SEC-1)."""
+    names = ", ".join(sorted({str(m) for m in models if m}))
+    return (f"cloud model(s) {names} refused: a -cloud/:cloud model runs off-host, so "
+            "exchange content would leave this machine. Use a local model, or set "
+            "ollama.allow_cloud_models: true in harness/config.local.yaml to accept that egress.")
 
 
 def _model_key(model: str) -> str:
@@ -509,17 +556,61 @@ def parse_backend_settings(api=None, max_output_tokens=None, reasoning_effort=No
 
 def backend_options(ollama_config: dict | None) -> dict:
     """The backend keyword arguments for OllamaClient(...) from a config's `ollama`
-    block, so every construction site passes the same three keys."""
+    block, so every construction site passes the same keys (SEC-1 added
+    allow_cloud_models: every client refuses cloud models unless it is true)."""
     cfg = ollama_config or {}
     return {"api": cfg.get("api"), "max_output_tokens": cfg.get("max_output_tokens"),
-            "reasoning_effort": cfg.get("reasoning_effort")}
+            "reasoning_effort": cfg.get("reasoning_effort"),
+            "allow_cloud_models": cfg.get("allow_cloud_models"),
+            "rate_limit": cfg.get("rate_limit")}
 
 
 def backend_setting(ollama_config: dict | None) -> dict:
     """Plain-data description of the backend settings for run provenance:
     {"api", "max_output_tokens", "reasoning_effort"}, validated."""
-    api, cap, effort = parse_backend_settings(**backend_options(ollama_config))
+    options = backend_options(ollama_config)
+    api, cap, effort = parse_backend_settings(
+        options["api"], options["max_output_tokens"], options["reasoning_effort"])
     return {"api": api, "max_output_tokens": cap, "reasoning_effort": effort}
+
+
+def _number(value) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def parse_rate_limit(section) -> rate_limiter.RateLimitConfig | None:
+    """`ollama.rate_limit`, the model-call pacer every OllamaClient in the process
+    shares, as its token-bucket config; None when the block is absent (the pacer
+    keeps the values it has). Keys, each optional, defaulting to the pacer's
+    shipped values (rate_limiter.PACER_DEFAULTS):
+    - enabled: true | false (unquoted). false admits every call at once.
+    - burst_calls: an integer from 1: calls that may start back to back.
+    - calls_per_minute: a number above 0: the refill once the burst is spent.
+    - max_wait_seconds: a number above 0: a call not admitted by then fails
+      with OllamaPacerTimeoutError, unsent. It has no unbounded setting.
+    Strict like the other ollama keys: an unknown key or a wrong type raises at
+    startup instead of being ignored."""
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ValueError("invalid ollama config: ollama.rate_limit must be a mapping, "
+                         f"got {type(section).__name__}")
+    unknown = sorted(set(section) - set(rate_limiter.PACER_DEFAULTS))
+    if unknown:
+        raise ValueError(f"invalid ollama config: ollama.rate_limit has unknown key(s) {unknown}; "
+                         f"allowed: {', '.join(rate_limiter.PACER_DEFAULTS)}")
+    values = {**rate_limiter.PACER_DEFAULTS, **section}
+    if type(values["enabled"]) is not bool:
+        raise ValueError("invalid ollama config: ollama.rate_limit.enabled must be true or "
+                         f"false (unquoted), got {values['enabled']!r}")
+    if type(values["burst_calls"]) is not int or values["burst_calls"] < 1:
+        raise ValueError("invalid ollama config: ollama.rate_limit.burst_calls must be an "
+                         f"unquoted integer of at least 1, got {values['burst_calls']!r}")
+    for key in ("calls_per_minute", "max_wait_seconds"):
+        if not _number(values[key]) or values[key] <= 0:
+            raise ValueError(f"invalid ollama config: ollama.rate_limit.{key} must be an "
+                             f"unquoted finite number above 0, got {values[key]!r}")
+    return rate_limiter.pacer_config(**values)
 
 
 def _openai_envelope(data: dict) -> dict:
@@ -593,13 +684,24 @@ class OllamaClient:
                  num_ctx: int | None = None, seed: int | None = None,
                  transient_retries: int | None = DEFAULT_TRANSIENT_RETRIES,
                  think: bool | list[str] | None = None, *, api: str | None = None,
-                 max_output_tokens: int | None = None, reasoning_effort: str | None = None):
+                 max_output_tokens: int | None = None, reasoning_effort: str | None = None,
+                 allow_cloud_models: bool | None = None, rate_limit: dict | None = None):
         self.base_url = base_url.rstrip("/")
+        # `ollama.rate_limit` (see parse_rate_limit), validated before anything else
+        # so a bad value refuses the client; applied to the shared pacer below.
+        pacer = parse_rate_limit(rate_limit)
         # `ollama.api` / `ollama.max_output_tokens` / `ollama.reasoning_effort`
         # (see parse_backend_settings). All unset => the Ollama payload is
         # byte-identical to the one sent before these keys existed.
         self.api, self.max_output_tokens, self.reasoning_effort = parse_backend_settings(
             api, max_output_tokens, reasoning_effort, think)
+        # SEC-1: `ollama.allow_cloud_models` (default false). Every model call
+        # goes through _chat, which refuses a cloud-suffixed model before any
+        # request unless this is true, whichever slot (coordinator, routing,
+        # agent override, critique, writeups) or live /settings toggle chose it.
+        self.allow_cloud_models = parse_allow_cloud_models(allow_cloud_models)
+        self.model_cloud_refused_count = 0
+        self._cloud_refusal_warned: set[str] = set()
         # AR-10 P2: opt-in thinking mode (`ollama.think`, see
         # parse_think_setting). Default off, so every payload keeps
         # `"think": False` byte-identical unless a config sets it.
@@ -685,6 +787,9 @@ class OllamaClient:
         self._context_probed_at: dict[str, float] = {}
         self._max_prompt_tokens: dict[str, int] = {}
         self._context_warned: set[tuple[str, str]] = set()
+        # TOK-4: each model's trained maximum context from POST /api/show
+        # (0 = the server answered without one, never asked again).
+        self._show_windows: dict[str, int] = {}
 
         # Initialize circuit breaker. Uses the shared-registry accessor
         # (not `OllamaCircuitBreaker(...)` directly) so that every
@@ -717,8 +822,15 @@ class OllamaClient:
             ),
         )
         
-        # Initialize rate limiter
-        self.rate_limiter = rate_limiter.get_token_limiter("ollama")
+        # The model-call pacer: ONE token limiter for every client in the process
+        # (rate_limiter.PACER_NAME), entered before each attempt. With
+        # `ollama.rate_limit` set, this client applies it to that shared limiter,
+        # so the latest configured client sets the pace for all of them; without
+        # it the limiter keeps what it has (the shipped 10-call burst, then one
+        # call every 6 s, unless a client applied other values). The run manifest
+        # records the values in force (rate_limiter.pacer_state).
+        self.rate_limiter = (rate_limiter.configure_pacer(pacer) if pacer is not None
+                             else rate_limiter.get_token_limiter(rate_limiter.PACER_NAME))
         
         # Initialize prompt validator
         self.prompt_validator = prompt_validator.PromptValidator()
@@ -758,10 +870,12 @@ class OllamaClient:
                            "context_truncated": self.model_context_truncated_count,
                            "output_capped": self.model_output_capped_count,
                            "output_capped_retried": self.model_output_capped_retry_count,
-                           "output_capped_recovered": self.model_output_capped_recovered_count},
+                           "output_capped_recovered": self.model_output_capped_recovered_count,
+                           "cloud_refused": self.model_cloud_refused_count},
                 # Which wire protocol served the run, and its output cap.
                 "backend": {"api": self.api, "max_output_tokens": self.max_output_tokens,
-                            "reasoning_effort": self.reasoning_effort},
+                            "reasoning_effort": self.reasoning_effort,
+                            "allow_cloud_models": self.allow_cloud_models},
                 # Whether this run measured reasoning mode: the configured
                 # setting plus the calls that actually sent think on.
                 "think": {**think_setting(self.think),
@@ -820,6 +934,83 @@ class OllamaClient:
         settings = data.get("default_generation_settings") if isinstance(data, dict) else None
         length = settings.get("n_ctx") if isinstance(settings, dict) else None
         self._context_windows[_OPENAI_SERVER_KEY] = length if type(length) is int and length > 0 else 0
+
+    async def _probe_show_window(self, model: str) -> None:
+        """POST /api/show: the model's trained maximum context from model_info
+        (`<architecture>.context_length`). Best-effort, short timeout; a failed
+        lookup leaves the cache as it was."""
+        try:
+            async with httpx.AsyncClient(timeout=_CONTEXT_PROBE_TIMEOUT) as client:
+                resp = await client.post(f"{self.base_url}/api/show", json={"model": model})
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            log.debug("context window lookup (POST /api/show) failed: %s", e)
+            return
+        info = data.get("model_info") if isinstance(data, dict) else None
+        info = info if isinstance(info, dict) else {}
+        arch = info.get("general.architecture")
+        length = info.get(f"{arch}.context_length") if isinstance(arch, str) else None
+        if not (type(length) is int and length > 0):
+            length = next((v for k, v in sorted(info.items()) if isinstance(k, str)
+                           and k.endswith(".context_length") and type(v) is int and v > 0), 0)
+        self._show_windows[_model_key(model)] = length
+
+    async def _cached_lookup(self, key: str, cache: dict, probe, probe_key: str | None = None
+                             ) -> int | None:
+        """cache[key], looked up when absent at most once per
+        _CONTEXT_PROBE_RETRY_SECONDS (0 cached = the server reports none)."""
+        if key not in cache:
+            probe_key = probe_key or key
+            probed_at = self._context_probed_at.get(probe_key)
+            if probed_at is None or time.monotonic() - probed_at >= _CONTEXT_PROBE_RETRY_SECONDS:
+                self._context_probed_at[probe_key] = time.monotonic()
+                await probe()
+        return cache.get(key) or None
+
+    async def discovered_context_window(self, model: str) -> dict:
+        """TOK-4: the context window a prompt for `model` is budgeted against.
+
+        {"window", "source", "model_max"}:
+        - api "openai": llama-server's GET /props n_ctx, the per-slot window
+          ("props"); with ollama.num_ctx also set, the smaller of the two;
+        - else ollama.num_ctx when set ("num_ctx");
+        - a local Ollama model: the window GET /api/ps reports it loaded with
+          ("api_ps"). Not loaded, window is None: it loads at the server's
+          default context, which no endpoint reports. model_max is then its
+          trained maximum from POST /api/show, an upper bound;
+        - a cloud model: POST /api/show's context_length ("api_show").
+
+        Each lookup is cached per model on this client (one client, one
+        endpoint); a failed one is retried at most once per
+        _CONTEXT_PROBE_RETRY_SECONDS. Never raises."""
+        try:
+            if self.api == API_OPENAI:
+                props = await self._cached_lookup(_OPENAI_SERVER_KEY, self._context_windows,
+                                                  self._probe_openai_window)
+                if self.num_ctx and (not props or self.num_ctx <= props):
+                    return {"window": self.num_ctx, "source": "num_ctx", "model_max": None}
+                return {"window": props, "source": "props" if props else None, "model_max": None}
+            if self.num_ctx:
+                return {"window": self.num_ctx, "source": "num_ctx", "model_max": None}
+            key = _model_key(model)
+
+            async def show():
+                return await self._cached_lookup(key, self._show_windows,
+                                                 lambda: self._probe_show_window(model),
+                                                 probe_key=f"show:{key}")
+            if is_cloud_model(model):
+                length = await show()
+                return {"window": length, "source": "api_show" if length else None,
+                        "model_max": length}
+            window = await self._cached_lookup(key, self._context_windows,
+                                               self._probe_context_windows)
+            if window:
+                return {"window": window, "source": "api_ps", "model_max": None}
+            return {"window": None, "source": None, "model_max": await show()}
+        except Exception as e:  # discovery is advisory: the budget falls back
+            log.debug("context window discovery failed: %s", type(e).__name__)
+            return {"window": None, "source": None, "model_max": None}
 
     def _window_key(self, model: str) -> str:
         return _OPENAI_SERVER_KEY if self.api == API_OPENAI else _model_key(model)
@@ -987,8 +1178,28 @@ class OllamaClient:
             return True
         return bool(self.think) and _MODEL_STAGE.get() in self.think
 
+    def _refuse_cloud_model(self, model) -> None:
+        """SEC-1: raise OllamaCloudModelRefusedError, before anything is sent or
+        counted as an attempt, for a cloud model this client may not use. The
+        receipt marks the call as not attempted, so no tokens are settled."""
+        if self.allow_cloud_models or not is_cloud_model(model):
+            return
+        self.model_cloud_refused_count += 1
+        err = OllamaCloudModelRefusedError(cloud_refusal_reason([model]))
+        err.inference_usage = {"prompt_tokens": None, "completion_tokens": None,
+                               "attempted": False, "completed": False, "usable": False,
+                               "outcome": "error", "refused": "cloud_model"}
+        first = model not in self._cloud_refusal_warned
+        self._cloud_refusal_warned.add(model)
+        log.log(logging.WARNING if first else logging.DEBUG, "%s", err)
+        if first:
+            self.audit_logger.log_security_event(
+                event_type="cloud_model_refused", message=str(err), severity="warning")
+        raise err
+
     async def _chat(self, model, system_prompt, user_prompt, temperature=0.1, seed=None):
         """Keep consumption independent of successful JSON parsing."""
+        self._refuse_cloud_model(model)
         started = time.monotonic()
         self.model_attempted_count += 1
         stage = self._stage_row()
@@ -1169,6 +1380,19 @@ class OllamaClient:
                             waited_ms if measurement["queue_ms"] is None
                             else measurement["queue_ms"] + waited_ms)
                         parsed, data = await self._send_once(url, payload, model, measurement)
+                except rate_limiter.RateLimitWaitExceeded as exc:
+                    # The pacer's bound (ollama.rate_limit.max_wait_seconds): the
+                    # wait still counts as queue time; nothing was sent.
+                    waited_ms = (time.monotonic() - attempt_queue_started) * 1000.0
+                    measurement["queue_ms"] = (
+                        waited_ms if measurement["queue_ms"] is None
+                        else measurement["queue_ms"] + waited_ms)
+                    log.warning("Model %s: call not admitted by the model-call pacer within "
+                                "%gs (ollama.rate_limit); not sent", model, exc.max_wait_seconds)
+                    raise OllamaPacerTimeoutError(
+                        f"model call for {model} not admitted by the model-call pacer "
+                        f"(ollama.rate_limit) within {exc.max_wait_seconds:g}s; nothing was sent",
+                        max_wait_seconds=exc.max_wait_seconds) from exc
                 except OllamaOutputCappedError:
                     larger = (None if capped_retried or _cancellation_requested()
                               else self._capped_retry_cap(model, payload, measurement))

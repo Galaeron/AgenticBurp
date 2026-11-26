@@ -41,6 +41,7 @@ import uuid
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from harness import global_throttle
+from harness.control_outcome import CONTROL_FAILED
 from harness.feature_workflow import extract_forms
 from harness.models import Finding, HttpExchange
 from .base import ValidationResult, Validator
@@ -572,7 +573,11 @@ class NosqlValidator(Validator):
         if not control.ok:
             return self._result("error", "negative-control login request failed to execute")
         if _administrator_readback(control.final_url, control.body or ""):
-            return self._result("not_confirmed", "negative control unexpectedly reached an administrator page")
+            # EFF-1: the negative control itself misbehaved, so nothing was compared.
+            result = self._result("not_confirmed",
+                                  "negative control unexpectedly reached an administrator page")
+            result.control_outcome = CONTROL_FAILED
+            return result
 
         probe = await self._attempt(
             exchange, user_name, pass_name, administrator=True)

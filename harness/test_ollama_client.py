@@ -11,12 +11,16 @@ from harness.ollama_client import (
     _loads_lenient,
     _chat_options,
 )
+from harness.testing_fixtures.model_pacer import fresh_model_pacer
 
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 
 def _make_client(testcase: unittest.TestCase, handler) -> OllamaClient:
+    # Its own model-call pacer: every client in the process shares one, and the
+    # earlier tests' calls would pace this test's (up to 6 s a call).
+    fresh_model_pacer(testcase)
     client = OllamaClient(base_url="http://fake-ollama:11434")
 
     class PatchedAsyncClient(_REAL_ASYNC_CLIENT):
@@ -37,6 +41,7 @@ def _seed_capture_client(testcase, captured, *, seed=None) -> OllamaClient:
     """Like _make_client, but constructs the client with a run-level `seed` and
     records every outgoing request payload into `captured` so a test can assert
     exactly what reached Ollama's options."""
+    fresh_model_pacer(testcase)
     client = OllamaClient(base_url="http://fake-ollama:11434", seed=seed)
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -219,6 +224,7 @@ class NumCtxOptInTests(unittest.IsolatedAsyncioTestCase):
                 "message": {"content": json.dumps({"ok": True})},
                 "done": True,
             })
+        fresh_model_pacer(self)
         client = OllamaClient(base_url="http://fake-ollama:11434", num_ctx=num_ctx)
 
         class PatchedAsyncClient(_REAL_ASYNC_CLIENT):
@@ -373,6 +379,7 @@ class InvalidEscapeEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 "done": True, "prompt_eval_count": 100, "eval_count": 20,
             })
         client = _make_client(self, handler)
+        client.allow_cloud_models = True  # SEC-1 opt-in: a cloud model's reply is under test
         result = await client.chat_json(model="gemma4:31b-cloud", system_prompt="s", user_prompt="u")
         self.assertEqual(result["findings"][0]["vulnerability_class"], "sql_injection")
         self.assertIn(r"\s", result["findings"][0]["suggested_test"])

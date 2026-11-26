@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.metadata
 import importlib.util
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -74,6 +75,21 @@ def _digest(path: Path) -> str:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def _warn_on_lock_mismatch(root: Path) -> None:
+    """OPS-3: report installed packages that differ from the snapshot's own lock.
+
+    Advisory: a verification run on other versions is logged, never refused (the
+    caller decides whether that run is evidence). Any failure of the check is
+    swallowed so it cannot turn a good preflight into a bad one."""
+    try:
+        from harness import lock_preflight
+        lock_preflight.log_report(
+            lock_preflight.check_lock(root / 'harness' / 'requirements.lock'),
+            logging.getLogger(__name__))
+    except Exception as error:
+        logging.getLogger(__name__).warning('dependency lock check skipped (%s)', error)
+
+
 def preflight(root: Path, *, dependencies: bool = True) -> None:
     root = root.resolve()
     for name in REQUIRED:
@@ -99,6 +115,7 @@ def preflight(root: Path, *, dependencies: bool = True) -> None:
         for module in PACKAGES:
             if importlib.util.find_spec(module) is None:
                 raise SnapshotError(f'Missing test dependency {module}: see harness/requirements.lock')
+        _warn_on_lock_mismatch(root)
 
 
 class _LocalOnly(importlib.abc.MetaPathFinder):

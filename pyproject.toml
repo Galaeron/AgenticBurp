@@ -31,7 +31,18 @@ dependencies = [
 [project.optional-dependencies]
 browser = ["playwright>=1.40"]   # browser XSS validator (lazy; skips if absent)
 proxy = ["mitmproxy==12.3.1", "brotli>=1.2.1"]    # safety proxy; CVE-2026-111497
-dev = ["pytest==9.1.1"]
+# DOC-2: `pip install -e ".[dev]"` installs everything `python -m harness.suite full`
+# imports beyond the core dependencies (a test-import scan guards this list in
+# harness/test_dev_extra_and_testing_doc.py). Versions equal the CI lock, harness/requirements.lock.
+# Chromium is a browser download, not a wheel: run `python -m playwright install chromium`.
+dev = [
+  "pytest==9.1.1",
+  "Flask==3.1.3",          # loopback leg fixtures; also supplies werkzeug (make_server)
+  "cryptography==48.0.1",  # RSA/JWT key material in the JWT and confirmation-leg tests
+  "brotli==1.2.1",         # content-encoding tests (same CVE floor as the proxy extra)
+  "mitmproxy==12.3.1",     # safety-proxy addon tests
+  "playwright==1.63.0",    # real-browser tests (the version CI installs)
+]
 
 [tool.setuptools.packages.find]
 # The import package is `harness` (distribution name stays burp-llm-harness).

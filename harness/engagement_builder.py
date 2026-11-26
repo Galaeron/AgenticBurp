@@ -460,9 +460,9 @@ async def feature_crawl_captures(
     response body): a public page returning identical content to several roles
     with the same session context collapses to one review candidate, but a
     response that DIFFERS per identity, or a request carrying a DISTINCT session
-    (e.g. a pickle cookie only one role holds -- V26), is always kept. `fetch_fn`
-    defaults to the scope-gated, throttled production client (mutating submits are
-    gated by allow_mutating_replay inside it).
+    (e.g. a pickle cookie only one role holds -- V26), is always kept. The fetch goes
+    through `run_context` (scope, budget, pins, the safety gate); a test may inject
+    `fetch_fn`. With neither, this raises: there is no raw-client fallback (ARC-7).
 
     `seed_paths` cross-seeds the crawl with routes discovered by API surface
     discovery, so the feature crawl starts from EVERY known page (not just /)
@@ -477,6 +477,11 @@ async def feature_crawl_captures(
     def _h(*parts: str) -> str:
         return hashlib.sha1("\x00".join(parts).encode("utf-8", "ignore")).hexdigest()[:12]
 
+    if fetch_fn is None and run_context is None:
+        # ARC-7: there is no raw-client fallback. A caller with no run of its own builds
+        # one (run_context.standalone_context) so the crawl keeps scope, budget and pins.
+        raise ValueError("feature_crawl_captures needs a run_context (or a fetch_fn): "
+                         "build one with run_context.standalone_context()")
     sweep_roles = role_crawl.crawl_roles_for(roles, per_principal) if roles else []
     seen: set[tuple] = set()
     out: list = []
@@ -487,8 +492,8 @@ async def feature_crawl_captures(
             elif run_context is not None:
                 session_ref, _ = run_context.sessions.bind_headers(r.norm_headers())
                 fx = feature_workflow.run_context_fetch_fn(run_context, session_ref)
-            else:
-                fx = feature_workflow.default_fetch_fn(allowed_hosts)
+            else:  # unreachable: refused before the loop
+                raise AssertionError("no fetch path")
             res = await feature_workflow.crawl_features(
                 base_url, r.role, r.norm_headers(), fetch_fn=fx,
                 allowed_hosts=allowed_hosts, submit_forms=submit_forms,

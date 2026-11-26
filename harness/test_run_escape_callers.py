@@ -413,9 +413,9 @@ class EnclosingRunSeamTests(unittest.TestCase):
 
         async def go():
             async with rc:
-                inside = transport_for(None, allowed_hosts=["127.0.0.1"])
+                inside = transport_for(None, allowed_hosts=["127.0.0.1"], active_mode=True)
                 self.assertIs(current_run_context(), rc)
-            outside = transport_for(None, allowed_hosts=["127.0.0.1"])
+            outside = transport_for(None, allowed_hosts=["127.0.0.1"], active_mode=True)
             await outside[1].aclose()
             return inside, outside
 

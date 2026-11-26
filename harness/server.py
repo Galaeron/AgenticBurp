@@ -11,16 +11,19 @@ from harness import surface_prioritizer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from harness.models import (AnalysisRequest, AnalysisResponse, ValidationSubmission, EstimateRequest, EffortStatus,
+from harness.models import (AnalysisRequest, AnalysisResponse, PlaneValidationSubmission, PlanDispatchRequest,
+                     EstimateRequest, EffortStatus,
                      IdentityCreateRequest, SessionCreateRequest, SuppressFindingRequest,
                      PrioritizeRequest, PrioritizeResponse, PrioritizeResultItem, HttpExchange,
                      ObservationAttributionCorrection)
 import harness.identity as identity_mod
 from harness.orchestrator import Orchestrator
+from harness.orchestrator_confirm import ProbeScopeRefused
+from harness.ollama_client import OllamaCloudModelRefusedError
 
 logging.basicConfig(level=logging.INFO)
 security.install_privacy_log_filters()
@@ -93,6 +96,15 @@ config, _explicit_config_keys = load_config()
 orchestrator = Orchestrator(config, explicit_keys=_explicit_config_keys)
 from harness.source_identity import capture_source_snapshot
 _startup_source = capture_source_snapshot()
+# OPS-3: warn at startup when installed packages differ from harness/requirements.lock
+# (advisory: never blocks startup); the same report is served by the authenticated
+# GET /health/details as `dependency_lock`.
+try:
+    from harness import lock_preflight
+    _dependency_lock = lock_preflight.log_report(lock_preflight.check_lock(), log).to_dict()
+except Exception as _lock_check_error:
+    log.warning("dependency lock check skipped (%s)", _lock_check_error)
+    _dependency_lock = {"lock_found": False, "ok": True, "error": str(_lock_check_error)}
 app = FastAPI(title="Burp LLM Harness", version="0.1.0")
 
 
@@ -129,36 +141,74 @@ def _require_target_fetch(url: str, *, bulk: bool = False) -> None:
         raise HTTPException(status_code=403, detail=reason)
 
 
-def _require_active_crawl(url: str) -> None:
-    """Admission for the crawl endpoints, which send ACTIVE outbound traffic.
+def _require_active_scope(url: str, *, action: str = "crawl") -> None:
+    """Active-mode scope admission: an explicit scope that covers `url`.
 
-    Two safety preconditions, each returning a clear 403 (never a silent empty
-    result):
-      1. An explicit scope that covers `url`. Empty server.allowed_hosts is
-         fail-CLOSED for active fetching (W-17 active_mode) -- a default-config
-         crawl must not reach an arbitrary host.
-      2. Active mode armed (validators.active_enabled, live value including the
-         POST /settings toggle). Crawling is active traffic, so it respects the
-         same master switch as the active validators.
-    """
+    Empty server.allowed_hosts is fail-CLOSED for active traffic (W-17
+    active_mode): a default-config crawl or probe must not reach an arbitrary
+    host. Returns a clear 403, never a silent empty result. The master switch is
+    the separate require_active_traffic dependency."""
     from harness.scope_lock import host_in_scope, out_of_scope_reason
     allowed = orchestrator.allowed_hosts
     if not host_in_scope(url, allowed, active_mode=True):
         if not allowed:
             raise HTTPException(
                 status_code=403,
-                detail="crawl refused: no server.allowed_hosts configured. Crawling "
+                detail=f"{action} refused: no server.allowed_hosts configured. This route "
                        "sends active traffic, so it fails closed without an explicit "
                        "scope. Set server.allowed_hosts (e.g. in config.local.yaml) to "
                        "the target host, then retry.")
-        raise HTTPException(status_code=403, detail=f"crawl refused: {out_of_scope_reason(url, allowed)}")
+        raise HTTPException(status_code=403, detail=f"{action} refused: {out_of_scope_reason(url, allowed)}")
+
+
+def _admit_active_traffic() -> None:
+    """The active-mode master switch (validators.active_enabled, live value
+    including the POST /settings toggle) for a request that sends target traffic.
+    require_active_traffic applies it to whole routes; a route that sends only
+    behind a body flag calls it before that branch."""
     if not orchestrator.validator_registry.active_enabled:
         raise HTTPException(
             status_code=403,
-            detail="crawl refused: active operations are disabled. Crawling sends live "
+            detail="refused: active operations are disabled. This route sends live "
                    "requests to the target, so it requires validators.active_enabled "
                    "(set it in config.local.yaml, or arm active mode via POST /settings "
                    "/ the Burp 'Active testing' toggle), on top of a configured scope.")
+
+
+async def require_active_traffic(authorization: str | None = Header(default=None)) -> None:
+    """ARC-1: the ONE admission dependency for every route that sends target
+    traffic. It authenticates first (401 before 403), then applies the master
+    switch, before the handler parses or does anything else. Scope admission
+    stays per route, because each route names its target differently."""
+    _require_auth(authorization)
+    _admit_active_traffic()
+
+
+# ARC-1 admission registry: every route whose handler reaches RunContext.create,
+# standalone_context or transport_for. test_active_traffic_admission scans
+# app.routes and requires this registry to list exactly those routes, so a new
+# traffic-sending route cannot ship without an admission decision.
+#   ACTIVE_TRAFFIC_ROUTES  carry Depends(require_active_traffic).
+#   ACTIVE_TRAFFIC_WHEN    send only when the named body flag is set; the handler
+#                          calls _admit_active_traffic() before that branch.
+#   PASSIVE_RUN_ROUTES     own a run but send nothing to the target while active
+#                          mode is off (the documented passive-default workflow).
+ACTIVE_TRAFFIC_ROUTES = frozenset({
+    ("POST", "/crawl"),
+    ("POST", "/crawl-roles"),
+    ("POST", "/engagement/{host}/advance"),
+    ("POST", "/engagement/{host}/investigate"),
+    ("POST", "/probe-missing-auth"),
+    ("POST", "/active-probe"),
+})
+ACTIVE_TRAFFIC_WHEN = {("POST", "/engagement/{host}/run"): "execute"}
+PASSIVE_RUN_ROUTES = {
+    ("POST", "/analyze"): "Burp 'Send to LLM Harness': reviews the supplied exchange. Its run's "
+                          "gate carries the live active_enabled, so a passive analysis sends "
+                          "nothing to the target (test_captured_shapes_passive, "
+                          "test_engagement_atomic_passive).",
+}
+_ACTIVE_TRAFFIC = [Depends(require_active_traffic)]
 
 
 def _crawl_route_run():
@@ -401,16 +451,52 @@ async def run_provenance(authorization: str | None = Header(default=None)):
 
 @app.get("/health")
 async def health():
-    """Liveness AND readiness. `status` is "ok" only when the LLM backend is
-    actually usable: previously this returned "ok" without ever contacting
-    Ollama, so a server with no `ollama serve` / no pulled model still looked
-    healthy and every analysis silently fell back to deterministic-only output
-    ("it ran and found almost nothing"). Now it probes Ollama and reports
-    "degraded" when it is unreachable or a configured LOCAL model is not pulled,
-    with `ollama` carrying the detail. Cloud model tags (…-cloud) are not pulled
-    locally and are excluded from the missing-model check."""
-    from harness import coordinator
-    probe = await orchestrator.ollama.health_check()
+    """ARC-8: liveness only. Unauthenticated, so it makes no outbound request
+    (no model-server probe) and names no model or agent: {"status": "ok"}
+    whenever this process serves requests. Readiness (model server reachable,
+    configured local models pulled), the agent and model names and the model
+    egress state are at the authenticated GET /health/details."""
+    return {"status": "ok"}
+
+
+# ARC-8: how long GET /health/details reuses its model-server probe, so a
+# client polling it does not send a request to the model server per call.
+_HEALTH_PROBE_TTL_SECONDS = 10.0
+_health_probe_cache: dict = {}
+
+
+async def _cached_backend_probe() -> tuple[dict, float]:
+    """(orchestrator.ollama.health_check() result, its age in seconds), probed
+    again when older than _HEALTH_PROBE_TTL_SECONDS or the client changed."""
+    import time
+    client = orchestrator.ollama
+    cached = _health_probe_cache.get("probe")
+    now = time.monotonic()
+    if cached and cached[2] is client and now - cached[1] < _HEALTH_PROBE_TTL_SECONDS:
+        return cached[0], round(now - cached[1], 3)
+    probe = await client.health_check()
+    # Only a reachable probe is reused: an operator who just started the model
+    # server sees it on the next call, not after the TTL.
+    if probe.get("reachable"):
+        _health_probe_cache["probe"] = (probe, time.monotonic(), client)
+    else:
+        _health_probe_cache.pop("probe", None)
+    return probe, 0.0
+
+
+@app.get("/health/details")
+async def health_details(authorization: str | None = Header(default=None)):
+    """Readiness, authenticated (ARC-8). `status` is "ok" only when the LLM
+    backend is usable: reachable, with every configured LOCAL model pulled
+    (cloud model tags are not pulled locally and are excluded); "degraded"
+    otherwise, with `ollama` carrying the detail. The backend probe is cached
+    for _HEALTH_PROBE_TTL_SECONDS (`probe_age_seconds`). `model_egress` is
+    SEC-1's record: which slots hold cloud models and whether
+    ollama.allow_cloud_models opted in."""
+    _require_read_auth(authorization)
+    from harness import coordinator, model_egress
+    from harness.ollama_client import is_cloud_model
+    probe, probe_age = await _cached_backend_probe()
     present = set(probe.get("models") or [])
 
     def _is_present(model: str) -> bool:
@@ -424,7 +510,7 @@ async def health():
     crit = (config.get("critique") or {}).get("model")
     if crit:
         configured.add(crit)
-    local_models = sorted(m for m in configured if m and not m.endswith("-cloud"))
+    local_models = sorted(m for m in configured if m and not is_cloud_model(m))
     missing = [m for m in local_models if not _is_present(m)]
 
     reachable = bool(probe.get("reachable"))
@@ -453,7 +539,12 @@ async def health():
         "agent_models": {name: a.model
                          for name, a in sorted(orchestrator.agent_manager.agents.items())},
         "ollama": ollama_detail,
+        "probe_age_seconds": probe_age,
         "coordinator_fail_opens": coordinator.fail_open_stats(),
+        "model_egress": model_egress.egress_state(
+            config, model_egress.agent_models_of(orchestrator.agent_manager)),
+        # OPS-3: installed-versus-lock mismatches found at startup (advisory).
+        "dependency_lock": _dependency_lock,
     }
 
 
@@ -579,15 +670,103 @@ async def test_plan(plan_id: str, authorization: str | None = Header(default=Non
     return plan
 
 
+# ARC-4/ARC-12: the HTTP status and wording of each Burp-plane refusal code
+# (store.PLANE_REFUSAL_REASONS). 404 is an unknown plan and nothing else; a
+# refusal by the plan's state is 409, and a result or dispatch that does not
+# fit the plan is 422. The body is {"detail": {"reason": <code>, "message": ...}}.
+_PLANE_REFUSALS = {
+    "unknown_plan": (404, "unknown test plan"),
+    "not_dispatched": (409, "the plan was not dispatched to the Burp plane"),
+    "dispatch_nonce_mismatch": (409, "the dispatch nonce is not the plan's current one"),
+    "duplicate_submission": (409, "this dispatch already has a result"),
+    "plan_terminal": (409, "the plan already holds a verdict"),
+    "dispatch_nonce_required": (422, "the result carries no dispatch nonce"),
+    "wrong_execution_plane": (422, "the plan does not run on the Burp plane"),
+    "binding_mismatch": (422, "the source exchange does not match the plan"),
+    "executor_mismatch": (422, "executor does not match the registered capability"),
+    "capability_cannot_confirm": (422, "this capability may provide evidence but cannot mark the vulnerability confirmed"),
+    "confirmed_status_invalid": (422, "confirmed result has invalid status"),
+}
+
+
+def _plane_refusal(reason: str) -> HTTPException:
+    # A code without an entry is a refusal all the same: 409, never a 404
+    # that reads as "unknown plan".
+    status, message = _PLANE_REFUSALS.get(reason, (409, "refused"))
+    return HTTPException(status_code=status, detail={"reason": reason, "message": message})
+
+
+def _plane_policy() -> tuple[dict, int | None]:
+    """The live policy the Burp plane executes a dispatched plan under: the
+    same two flags the Python SafetyGate reads for a run started now (live
+    active toggle over config, parsed strictly), and the run request ceiling
+    (runs.max_requests; None = no ceiling, as for RunContext)."""
+    from harness.config_schema import parse_validators_flags
+    flags = parse_validators_flags(_live_validators_gate_config())
+    runs = orchestrator.config.get("runs", {})
+    runs = {} if runs is None else runs
+    budget = runs.get("max_requests") if isinstance(runs, dict) else 0
+    if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget < 0):
+        budget = 0  # a malformed ceiling refuses every send rather than lifting the limit
+    return ({"active_enabled": bool(flags["active_enabled"]),
+             "allow_mutating_replay": bool(flags["allow_mutating_replay"])}, budget)
+
+
+async def _plane_ledger(event_type, plan_id: str, summary: str, data: dict) -> None:
+    """One evidence-ledger event for the Burp plane's dispatch protocol, keyed
+    "plan:<plan_id>" (wiped with the plan's host). Best effort, like emit()."""
+    from harness import evidence_ledger
+    await asyncio.to_thread(evidence_ledger.emit, event_type, f"plan:{plan_id}", summary, data=data)
+
+
+@app.post("/test-plans/{plan_id}/dispatch")
+async def dispatch_test_plan(plan_id: str, req: PlanDispatchRequest,
+                             authorization: str | None = Header(default=None)):
+    """Issue the single-use nonce and live policy for one Burp-plane run (ARC-4).
+
+    The plane reads the policy here rather than trusting its own copy: a
+    mutating arm runs only when active_enabled and allow_mutating_replay are
+    both on, and the plane stops at request_budget sends."""
+    _require_auth(authorization)
+    from harness.evidence_ledger import EventType
+    policy, budget = _plane_policy()
+    issued, reason, nonce = await asyncio.to_thread(
+        store.issue_plane_dispatch, plan_id, req.source_exchange_hash,
+        {**policy, "request_budget": budget})
+    if not issued:
+        if reason != "unknown_plan":  # an unknown id has no plan to attach an event to
+            await _plane_ledger(EventType.AUTHORIZATION_DECISION, plan_id,
+                                f"Burp dispatch refused: {reason}",
+                                {"stage": "dispatch", "decision": "refused", "reason": reason})
+        raise _plane_refusal(reason)
+    await _plane_ledger(EventType.AUTHORIZATION_DECISION, plan_id, "Burp dispatch issued",
+                        {"stage": "dispatch", "decision": "dispatched", "policy": policy,
+                         "request_budget": budget})
+    log.info("Burp dispatch issued plan=%s policy=%s budget=%s", plan_id, policy, budget)
+    return {"plan_id": plan_id, "dispatch_nonce": nonce, "policy": policy, "request_budget": budget}
+
+
 @app.post("/validation-results")
-async def validation_result(submission: ValidationSubmission, authorization: str | None = Header(default=None)):
+async def validation_result(submission: PlaneValidationSubmission, authorization: str | None = Header(default=None)):
     _require_auth(authorization)
     # The execution plane (normally Burp) posts only the observed result.
     # It cannot change a plan's target or turn a model assertion into a
-    # confirmation; the server accepts the result as evidence for the plan.
-    accepted, reason = await __import__("asyncio").to_thread(store.persist_validation_submission, submission)
+    # confirmation; the server accepts the result as evidence for the plan,
+    # once, under the nonce POST /test-plans/{plan_id}/dispatch issued (ARC-4).
+    from harness.evidence_ledger import EventType
+    accepted, reason = await asyncio.to_thread(store.persist_plane_submission, submission)
     if not accepted:
-        raise HTTPException(status_code=400 if reason == "binding_mismatch" else 404, detail=reason)
+        if reason != "unknown_plan":
+            await _plane_ledger(EventType.AUTHORIZATION_DECISION, submission.plan_id,
+                                f"Burp result refused: {reason}",
+                                {"stage": "submission", "decision": "refused", "reason": reason,
+                                 "status": submission.status})
+        raise _plane_refusal(reason)
+    await _plane_ledger(EventType.VALIDATION_DECISION, submission.plan_id,
+                        f"Burp result accepted: {submission.status}",
+                        {"stage": "submission", "decision": "accepted", "status": submission.status,
+                         "confirmed": submission.confirmed, "confidence": submission.confidence,
+                         "executor": submission.executor})
     log.info("Validation result received plan=%s status=%s confirmed=%s",
              submission.plan_id, submission.status, submission.confirmed)
 
@@ -613,6 +792,13 @@ async def validation_result(submission: ValidationSubmission, authorization: str
     return response
 
 
+def _cloud_run_refused(e: OllamaCloudModelRefusedError) -> HTTPException:
+    """SEC-1: a run refused for a cloud model without ollama.allow_cloud_models
+    is a config conflict the operator fixes, not a server fault: 409 carrying
+    the refusal reason (config slot and model names, never exchange content)."""
+    return HTTPException(status_code=409, detail=str(e))
+
+
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze(req: AnalysisRequest, authorization: str | None = Header(default=None)):
     _require_auth(authorization)
@@ -629,6 +815,8 @@ async def analyze(req: AnalysisRequest, authorization: str | None = Header(defau
             partition["observation_attribution"] = attribution
         return await orchestrator.analyze(req.exchange, req.force_agents, req.attempt_rediscovery,
                                           **partition)
+    except OllamaCloudModelRefusedError as e:
+        raise _cloud_run_refused(e)
     except Exception as e:
         log.error("Unhandled error during analysis: %s", security.safe_error_summary(e))
         return JSONResponse(status_code=500, content={"error": security.safe_error_summary(e)})
@@ -706,7 +894,7 @@ class CrawlRequest(_BaseModel):
     max_depth: int = 2
 
 
-@app.post("/crawl")
+@app.post("/crawl", dependencies=_ACTIVE_TRAFFIC)
 async def crawl_endpoint(req: CrawlRequest, authorization: str | None = Header(default=None)):
     """Discover the application's real endpoint surface by fetching its pages
     AND mining the JavaScript bundles they load (js_endpoint_extractor.py) --
@@ -716,7 +904,7 @@ async def crawl_endpoint(req: CrawlRequest, authorization: str | None = Header(d
     endpoints for the site map / attack-surface tab."""
     _require_auth(authorization)
     _require_target_fetch(req.base_url, bulk=True)
-    _require_active_crawl(req.base_url)
+    _require_active_scope(req.base_url, action="crawl")
     from harness import crawler
     async with _crawl_route_run() as run_context:
         session_ref = (_route_session(run_context, "crawl:source", req.headers, req.base_url)
@@ -847,7 +1035,7 @@ async def set_identity_session_headers(req: SessionHeadersRequest, authorization
             "identities": [i["name"] for i in identity_headers.identities_for_host(req.host)]}
 
 
-@app.post("/crawl-roles")
+@app.post("/crawl-roles", dependencies=_ACTIVE_TRAFFIC)
 async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None = Header(default=None)):
     """Role-aware crawl: discover the surface per role, probe every endpoint with
     every role, and return the access matrix plus derived auth-bypass and IDOR/
@@ -858,7 +1046,7 @@ async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None 
     max_endpoints. Credentials arrive per call and are never persisted."""
     _require_auth(authorization)
     _require_target_fetch(req.base_url, bulk=True)
-    _require_active_crawl(req.base_url)
+    _require_active_scope(req.base_url, action="crawl")
     from harness import role_crawl
     roles = _role_sessions(req.roles)
     if not roles:
@@ -898,7 +1086,7 @@ async def crawl_roles_endpoint(req: RoleCrawlRequest, authorization: str | None 
     return out
 
 
-@app.post("/probe-missing-auth")
+@app.post("/probe-missing-auth", dependencies=_ACTIVE_TRAFFIC)
 async def probe_missing_auth_endpoint(req: MissingAuthRequest, authorization: str | None = Header(default=None)):
     """Fire discovered endpoints with authentication stripped and flag the ones
     that still return data -- the "generateReport unauthenticated" class an
@@ -984,7 +1172,7 @@ class ActiveProbeRequest(_BaseModel):
     step_budget: int = 0  # 0 -> the configured iterative_agent.max_steps
 
 
-@app.post("/active-probe")
+@app.post("/active-probe", dependencies=_ACTIVE_TRAFFIC)
 async def active_probe(req: ActiveProbeRequest, authorization: str | None = Header(default=None)):
     """Run the iterative (active) agent against one captured exchange, then
     integrate its result through F2 (pause->validate->remember; pivot/combine).
@@ -998,11 +1186,17 @@ async def active_probe(req: ActiveProbeRequest, authorization: str | None = Head
     _require_target_fetch(req.exchange.url, bulk=True)
     if not orchestrator.iterative_agent_enabled:
         raise HTTPException(status_code=403, detail="iterative_agent is disabled in config.yaml")
+    # ARC-2: the model chooses these requests, so they need an explicit scope that
+    # covers the exchange; an empty server.allowed_hosts refuses instead of
+    # admitting whatever host the submitted exchange names.
+    _require_active_scope(req.exchange.url, action="active probe")
     try:
         return await orchestrator.run_active_probe(
             req.exchange, req.hypothesis, req.specialty,
             model=req.model or "", step_budget=req.step_budget or None,
         )
+    except ProbeScopeRefused as e:
+        raise HTTPException(status_code=403, detail=str(e)) from None
     except Exception as e:
         log.error("Unhandled error during active probe: %s", security.safe_error_summary(e))
         return JSONResponse(status_code=500, content={"error": security.safe_error_summary(e)})
@@ -1125,11 +1319,48 @@ class _CoordinatorToggles(_BaseModel):
     cloud_reasoning: StrictBool = False
 
 
+from pydantic import model_validator as _model_validator  # noqa: E402  (ARC-15)
+
+
+def _non_finite_marked(value):
+    """ARC-15: NaN/Infinity (which the JSON parser accepts) become a marker string,
+    so the field fails validation with a 422 that can itself be serialized: the
+    default 422 body echoes the input, and a raw NaN there was a 500."""
+    if isinstance(value, float) and (value != value or abs(value) == float("inf")):
+        return "<non-finite number>"
+    if isinstance(value, dict):
+        return {k: _non_finite_marked(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_non_finite_marked(v) for v in value]
+    return value
+
+
+class _RetryBudgetSettings(_BaseModel):
+    # ARC-15: a typed, bounded schema; a malformed policy is a 422, never applied.
+    # Unknown keys are refused. Bounds are owner values (see the b1 HANDOFF).
+    model_config = ConfigDict(extra="forbid")
+    max_retries: int | None = Field(None, ge=0, le=10, strict=True)
+    max_agents: int | None = Field(None, ge=1, le=10, strict=True)
+    # 0 = no per-vulnerability token cap, as in config.yaml and the Burp field.
+    max_tokens_per_vuln: int | None = Field(None, ge=0, le=2_000_000, strict=True)
+    stop_on_found: StrictBool | None = None
+    min_actionable_confidence: float | None = Field(None, ge=0.0, le=1.0, strict=True,
+                                                    allow_inf_nan=False)
+
+
 class SettingsRequest(_BaseModel):
     # Global outbound throttle ceiling (requests/sec; 0 = unlimited). None -> leave as-is.
-    throttle_rps: float | None = None
+    # ARC-15: finite and >= 0 (a negative or NaN rate used to become "unlimited").
+    throttle_rps: float | None = Field(None, ge=0.0, allow_inf_nan=False)
+    # Removing a throttle that is on (throttle_rps 0) must be confirmed explicitly.
+    confirm_unlimited: StrictBool = False
     # Default retry-budget policy overrides (any omitted -> unchanged).
-    retry_budget: dict | None = None
+    retry_budget: _RetryBudgetSettings | None = None
+
+    @_model_validator(mode="before")
+    @classmethod
+    def _mark_non_finite(cls, data):
+        return _non_finite_marked(data)
     # Runtime validator toggles (in-memory only, never persisted): recognized keys
     # are `active_enabled` and `cross_identity` (both bool). Any omitted -> unchanged.
     validators: _ValidatorToggles | None = None
@@ -1144,13 +1375,31 @@ async def update_settings(req: SettingsRequest, authorization: str | None = Head
     """Apply runtime settings from the UI: retune the global throttle and/or the
     default retry-budget policy. Takes effect immediately for subsequent work."""
     _require_auth(authorization)
+    from harness import global_throttle
     changed: dict = {}
+    # ARC-15: turning a live throttle OFF needs confirm_unlimited; refused before
+    # anything in the request is applied. Every change is logged (source
+    # "settings") and copied into the manifest of each run live at the time.
+    removing = (req.throttle_rps is not None and req.throttle_rps == 0
+                and global_throttle.throttle.enabled)
+    if removing and not req.confirm_unlimited:
+        raise HTTPException(status_code=422,
+                            detail="throttle_rps 0 removes the outbound throttle "
+                                   f"({global_throttle.throttle.stats()['rate_per_second']} req/s); "
+                                   "resend with confirm_unlimited: true to remove it")
     if req.throttle_rps is not None:
-        from harness import global_throttle
-        global_throttle.configure(max(0.0, float(req.throttle_rps)))
+        global_throttle.configure(float(req.throttle_rps), source="settings",
+                                  detail={"confirmed_unlimited": True} if removing else None)
         changed["throttle"] = global_throttle.throttle.stats()
-    if req.retry_budget:
-        orchestrator.retry_budget_policy = orchestrator.retry_budget_policy.merged_with(req.retry_budget)
+    retry = req.retry_budget.model_dump(exclude_unset=True) if req.retry_budget else {}
+    if retry:
+        no_cap = retry.get("max_tokens_per_vuln") == 0
+        policy = orchestrator.retry_budget_policy.merged_with(
+            {k: v for k, v in retry.items() if not (no_cap and k == "max_tokens_per_vuln")})
+        if no_cap:
+            import dataclasses as _dataclasses
+            policy = _dataclasses.replace(policy, max_tokens_per_vuln=None)
+        orchestrator.retry_budget_policy = policy
         p = orchestrator.retry_budget_policy
         changed["retry_budget"] = {"max_retries": p.max_retries, "max_agents": p.max_agents,
                                    "max_tokens_per_vuln": p.max_tokens_per_vuln}
@@ -1347,7 +1596,13 @@ async def engagement_run(host: str, req: RunEngagementRequest, authorization: st
     _require_auth(authorization)
     max_targets = max(1, min(req.max_targets, 50))
     if req.execute:
+        # ARC-1: executing fetches and analyzes target pages (ACTIVE_TRAFFIC_WHEN);
+        # a plan-only call sends nothing and stays available while passive.
+        # The operating-profile denial (e.g. passive-only "captured-only") is
+        # checked first: it names the real reason, and arming active mode
+        # cannot lift it.
         _require_target_fetch(req.base_url or '', bulk=True)
+        _admit_active_traffic()
         if not req.base_url:
             raise HTTPException(status_code=400, detail="execute requires base_url")
         return await orchestrator.run_engagement(
@@ -1366,7 +1621,7 @@ class AdvanceRequest(_BaseModel):
     max_endpoints: int = 100
 
 
-@app.post("/engagement/{host}/advance")
+@app.post("/engagement/{host}/advance", dependencies=_ACTIVE_TRAFFIC)
 async def engagement_advance(host: str, req: AdvanceRequest, authorization: str | None = Header(default=None)):
     """Advance the engagement: re-crawl `base_url` as the given roles and fold the
     result (surface + access matrix + IDOR findings) back into the fused
@@ -1376,7 +1631,7 @@ async def engagement_advance(host: str, req: AdvanceRequest, authorization: str 
     _require_target_fetch(req.base_url, bulk=True)
     # RV-G R03: a re-crawl is active traffic, so it obeys the same scope and
     # active-mode admission as /crawl-roles, before any discovery or probing.
-    _require_active_crawl(req.base_url)
+    _require_active_scope(req.base_url, action="crawl")
     from harness import role_crawl, engagement
     roles = _role_sessions(req.roles)
     if not roles:
@@ -1810,13 +2065,19 @@ async def engagement_writeups(host: str, authorization: str | None = Header(defa
             "writeup_count": len(items), "writeups": items}
 
 
-@app.post("/engagement/{host}/investigate")
+@app.post("/engagement/{host}/investigate", dependencies=_ACTIVE_TRAFFIC)
 async def engagement_investigate(host: str, req: InvestigateRequest,
                                  authorization: str | None = Header(default=None)):
     """Start the flagship graph-driven investigation as a background JOB and return
     a job_id to poll. The job is cancellable. This is the single API entry to
     investigate_engagement (R18)."""
     _require_auth(authorization)
+    try:  # SEC-1: refuse before a job exists, so the client sees why (409)
+        from harness import model_egress
+        model_egress.refuse_cloud_models(
+            orchestrator.config, model_egress.agent_models_of(orchestrator.agent_manager))
+    except OllamaCloudModelRefusedError as e:
+        raise _cloud_run_refused(e)
     _require_target_fetch(req.base_url, bulk=True)
     if not req.base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
@@ -2017,7 +2278,9 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
     def _finish_manifest(status, *, result=None, error=None):
         run_handoff.finish(run_context, status, result)
         try:
-            manifest.finish(status, result=security.sanitize_data(result), error=error)
+            # ARC-3: the run's request-ceiling outcome (stop_reason budget_exhausted).
+            manifest.finish(status, result=security.sanitize_data(result), error=error,
+                            request_ceiling=run_context.budget.state())
         except Exception as exc:
             # Artifact persistence loss is not an unhandled async task failure.
             # Keep cancellation visible, but never advertise a completed durable
@@ -2055,6 +2318,8 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             # Use the persisted, proof-resolved projection of this run and the
             # attempts it resumed. Raw model flags and repeated validator records
             # are not issue counts.
+            from harness.assessment_health import headline_counts
+            from harness.issues import count_units
             attempts = job["attempt_run_ids"]
             rows = _attempt_findings(req.base_url, attempts)
             proven, accounting = _attempt_accounting(attempts, [*rows, *job["result"].get("findings", [])])
@@ -2062,12 +2327,15 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             job["result"]["confirmed_issues"] = len(proven)
             job["result"]["confirmed_issue_refs"] = proven
             job['result']['issue_accounting'] = accounting
-            job['result']['confirmed_vulnerabilities'] = accounting['counts']['vulnerabilities']
+            # EFF-3: the per-case vulnerability groups and their root causes, each
+            # beside its unit; the records' three counts in finding_summary.
+            job['result'].update(headline_counts(accounting))
             job['result']['confirmed_issues_unit'] = 'proof_bound_cases'
             job["result"]["finding_summary"] = {
                 "records": len(rows), "proof_bound_confirmed_cases": len(proven),
                 "unproven_records": sum(not (r.get("confirmed") and r.get("proof_status") == "resolved") for r in rows),
-                "scoreboard_mapping": "not supplied", "issue_counts": accounting['counts']}
+                "scoreboard_mapping": "not supplied", "issue_counts": accounting['counts'],
+                "issue_units": count_units(rows)}
             job["status"] = "done"
             _finish_manifest("done", result=job["result"])
         except asyncio.CancelledError:
@@ -2082,11 +2350,12 @@ async def engagement_investigate(host: str, req: InvestigateRequest,
             # r9's last attempt was cancelled and reported no count at all. The
             # accounting is best effort here: it must never hide the cancel.
             try:
+                from harness.assessment_health import headline_counts
                 proven, accounting = _attempt_accounting(attempts, job['result']['findings'])
                 job['result'].update(
                     confirmed_issues=len(proven), confirmed_issue_refs=proven,
                     issue_accounting=accounting, confirmed_issues_unit='proof_bound_cases',
-                    confirmed_vulnerabilities=accounting['counts']['vulnerabilities'])
+                    **headline_counts(accounting))
             except Exception as exc:
                 job['result']['accounting_error'] = type(exc).__name__
                 log.warning("cancelled job %s: issue accounting failed (%s)", job_id, type(exc).__name__)

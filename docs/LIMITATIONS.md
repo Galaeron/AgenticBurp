@@ -31,18 +31,21 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
     `testing/blind-target-2/ANSWER_KEY.md`), so good scores there may reflect
     tuning, not capability. Measure against an untuned app
     (WebGoat/DVWA/PortSwigger); runbook in [USER_MANUAL.md](USER_MANUAL.md) §7.
-  - Note: the in-flight scope migration (below) currently blocks the live-leg
-    suite in a working tree with no scope set — the fixture host is refused as
-    out of scope — so run it with `server.allowed_hosts` including the loopback
-    fixture host.
-- **[partial] The coverage ledger under-reports what exists.** `harness/
-  coverage_manifest.py` only has **two** requirements registered (mass assignment
-  and open redirect), so every other requirement is reported as
-  `gap_unimplemented` — which means "not registered in this ledger," **not** "no
-  test exists." Real live validator evidence for many more classes lives in
-  `test_leg_live_verification.py` (above); it just isn't wired into the ledger.
-  Two honest issues remain: the ledger should register the tests that exist, and
-  the coverage report does **not** block (it is a report, not a gate).
+  - Note: the live-leg tests pass the loopback fixture host as each validator's
+    `allowed_hosts` themselves, so they do not depend on `server.allowed_hosts`.
+- **[partial] The coverage ledger still under-reports what exists.** `harness/
+  coverage_manifest.py` registers loopback confirm/control tests for **20 of 67**
+  requirements, plus 3 manual-only ones; the other 44 are `gap_unimplemented`,
+  which means "no test registered in this ledger," **not** "no test exists" and
+  never "verified absent." `covered_partial` means one scenario of the
+  requirement passed on an owned loopback fixture in this run, not that the
+  requirement is covered. The smoke and full tiers run
+  `coverage_manifest --check` after their unit tests; it **blocks** when a registered test fails, is
+  skipped, or left no fresh evidence; manual, N/A and unregistered rows do not
+  block. Still unregistered: live tests that need Playwright or sqlmap, slow
+  loopback modules kept out of smoke (write integrity, business flows, exposure
+  leads), and legs with no paired control. The `HS-*` harness safety properties
+  are reported in their own section and are not WSTG coverage.
 - **[open] "Blind" is a misnomer for the committed targets.** `test-target`
   (PixelMart) and `blind-target-2` are developed-against tuning corpora. The only
   genuinely-blind mechanism is `testing/blind-test-kit/` (its target has no
@@ -63,7 +66,7 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
 - **[open] Duplicates Burp Scanner.** CORS/CSP/missing-headers/verbose-error/JWT
   checks overlap what Burp Pro already does deterministically. The LLM's real
   edge is access control across roles, business logic and multi-step workflows;
-  the 36-agent spread dilutes that focus. (A header-noise gate already caps the
+  the wide agent spread dilutes that focus. (A header-noise gate already caps the
   low-value classes to "low".)
 - **[open] Noise ranks next to real issues.** Findings like "[Unconfirmed]
   Multiple anomalies detected" or a medium "suspicious pattern: `Error:`" read as
@@ -77,17 +80,27 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
   `/crawl-roles` now fail closed on an empty `allowed_hosts` and require
   `active_enabled`, with a clear 403; `crawler._host_allowed` fails closed at the
   chokepoint. Regression-tested.
-- **[partial] Empty scope is handled inconsistently across the codebase.** The
-  main analysis path and crawler fail closed in active mode, but `scope_lock`,
-  `safety_gate` and several validators' own inline checks are mid-migration to
-  the same fail-closed contract. The safety guarantee currently leans on the
-  top-level check; set `server.allowed_hosts` explicitly and do not rely on a
-  single backstop. (This migration is in-flight in the working tree and is why
-  some active-gate unit tests are red.)
-- **[partial] A legacy, unscoped transport path still exists.** ~20 modules have
-  both the new scoped executor and a legacy raw HTTP client used when no run
-  context is passed; `subdomain_takeover`'s legacy path can follow scraped
-  redirects without a scope check. The normal pipeline uses the scoped path.
+- **[partial] Empty scope is not one contract everywhere.** Every route that sends
+  target traffic needs `active_enabled`, and a run's transport
+  (`run_context.ScopePolicy`) permits nothing on an empty `allowed_hosts`. The
+  crawlers, the missing-auth probe, API-surface discovery and the standalone
+  active probe (`transport_for`, `standalone_context`) also fail closed on an
+  empty scope. `scope_lock.host_in_scope`, which the safety gate and the validators'
+  inline checks call, still reads an empty list as "no restriction", and the raw
+  no-run clients below are not scope-checked at all. Set `server.allowed_hosts`
+  explicitly and do not rely on a single backstop.
+- **[partial] A legacy, unscoped transport path still exists in some
+  validators.** ARC-7 removed the raw HTTP clients from the crawlers, discovery,
+  feature workflow, the missing-auth probe and the cross-identity probe; they send
+  only through a run's transport. These validators still fall back to a raw client
+  when called without a run context: csp, header_injection, http_request_smuggling,
+  jwt_forge, oauth, race_condition, rate_limit, recon, sqlmap (its boolean-probe
+  fallback), subdomain_takeover, toctou and web_cache_poisoning. The no-run
+  `safety_gate.GatedAsyncClient` is gate-authorised but has no run budget or
+  address pin. `subdomain_takeover`'s fallback follows redirects with no scope
+  check. The normal pipeline passes a run context and uses the scoped path;
+  `transport_inventory.RAW_CLIENT_ALLOWLIST` lists every remaining raw client with
+  its reason, and a test fails on any new one.
 - **[by-design] Scope is hostname-only.** The port is not part of the check, so
   anything else on the same host is technically in scope. Documented in
   `config.yaml`.
@@ -104,28 +117,41 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
 
 ## Model backend & data
 
-- **[fixed] Silent model failure.** `/health` now probes Ollama and reports
-  `degraded` with specifics; `/analyze` sets `degraded`, lists `agent_errors`,
+- **[fixed] Silent model failure.** `/health/details` (authenticated) probes
+  Ollama and reports `degraded` with specifics; `/analyze` sets `degraded`, lists `agent_errors`,
   and warns in the summary when every agent failed. (Previously `/health` said
   "ok" with no model and failures hid in per-agent `raw_error`.)
-- **[fixed] Ten agents silently pinned the default model.** Redundant per-agent
+- **[fixed] Some agents silently pinned the default model.** Redundant per-agent
   `model: qwen3:8b` pins removed; startup now warns on a shadowing override and
-  `/health` exposes `agent_models`.
+  `/health/details` exposes `agent_models`.
 - **[open] Model-outage circuit breaker lingers ~60 s.** After 3 failures the
   shared breaker opens for 60 s before a half-open retry, so a model you just
-  restarted still fails until the window elapses. `/health` now lets you confirm
+  restarted still fails until the window elapses. `/health/details` lets you confirm
   recovery; tuning the window is a follow-up.
 - **[mitigated] Prompts larger than a small `num_ctx`.** Ollama truncates an
   oversized prompt from the start (where the agent's instructions are) with no
   error; r3 (gemma4 at `num_ctx` 4096) logged 88 truncations. When `num_ctx` (or
   `prompt_budget.model_context_tokens`) is set, agent and critique prompts are
-  now fitted to it, every cut marked and listed in `review_stats.elided`. Token
-  counts are estimated, not measured; the context of an unset `num_ctx` is not
-  auto-detected; families routing (`coordinator.routing_mode: families`) is not
-  fitted.
-- **[open] Bodies sent to the model unredacted; cloud egress needs a policy.**
-  Only auth headers are masked. `cloud_reasoning` sends real content off-host.
-  See USER_MANUAL §5. Redaction before cloud is not implemented.
+  now fitted to it, every cut marked and listed in `review_stats.elided`. With
+  `num_ctx` unset, the harness asks the model server for the window it has
+  (llama-server `/props`; Ollama `/api/ps`, then `/api/show`) and fits to the
+  window it reports, never above the model's trained maximum; with none known it fits to
+  `prompt_budget.unknown_context_tokens` (4096), never unfitted. Token counts are
+  estimated, not measured; the discovered window is not refreshed after a server
+  restart; families routing (`coordinator.routing_mode: families`) is not fitted.
+- **[partial] Redaction is by name only; PII is not redacted.** Every model call
+  passes `security.sanitize_for_inference`, which withholds the values of
+  secret-named fields, URL parameters and inline assignments, and of the
+  Authorization, Cookie, Set-Cookie, X-API-Key, X-Auth-Token and
+  Proxy-Authorization headers. It scans no values: personal data (names, e-mail,
+  phone, address, card and ID numbers) and a secret under an unlisted name or in
+  prose reach the model as captured. The exact classes are in USER_MANUAL §5, and
+  `harness/test_data_handling_docs.py` checks them against `security.py`.
+- **[mitigated] Cloud egress is opt-in and refused by default (SEC-1).**
+  `cloud_reasoning` sends the real, name-redacted content off-host, and an Ollama
+  cloud model (`*-cloud`, `*:cloud`) is refused unless `ollama.allow_cloud_models`
+  is true; the flag does not cover a role routed to another provider. A client
+  data-handling statement still needs the policy decision (USER_MANUAL §5).
 - **[open] "Passive" analysis looks up components at third-party services.**
   With the shipped config (`github_advisories`, `package_registry_checks` and
   `kev_check` all enabled), a component that an agent names and that is literally
@@ -170,15 +196,15 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
 
 ## Architecture debt (roadmap, not bugs)
 
-- **[open] Orchestrator import cycle.** ~10 orchestrator/chain/attribution modules
+- **[open] Orchestrator import cycle.** The orchestrator/chain/attribution modules
   import each other; many imports are inside functions to dodge cycles; `store`,
   `evidence_ledger` and `confirmation_gate` form a cycle. Split by size, not
   responsibility.
 - **[open] Process-wide shared state.** `global_throttle`, a default safety gate
   and run context are process singletons, so two engagements can't be cleanly
   isolated. (Opt-in per-run scoping primitives exist but aren't the default.)
-- **[open] Flat package + oversized files.** 114 modules sit flat in `harness/`;
-  `server.py` and `store.py` are ~1,400 lines.
+- **[open] Flat package + oversized files.** The modules sit flat in `harness/`;
+  `server.py`, `store.py` and `orchestrator_chain.py` are each thousands of lines.
 - **[open] Overlapping agents.** `business_logic`/`business_logic_enhanced` and
   `ai_llm`/`ai_security` are new-beside-old rather than replacements.
 - **[open] Broad exception handling.** Many `except Exception` blocks; the proof-
@@ -186,12 +212,14 @@ real engagement. Status tags: **[fixed]**, **[partial]**, **[open]**,
   proof record is an integrity gap), but the pattern is widespread.
 - **[open] Safety routing partly policed by source-grep tests** rather than the
   design forcing all traffic through the gate.
-- **[by-design, minor] `/health` and `/telemetry` need no auth** (DNS-rebinding
-  protection applies; the other ~47 routes require the token).
+- **[by-design, minor] `/health` needs no auth** (DNS-rebinding protection
+  applies). It is liveness only (ARC-8): no outbound request and no model or
+  agent names. Readiness, the agent/model map and the model egress state are at
+  the authenticated `/health/details`; the other routes require the token.
 
 ## What is solid
 
 Independent plug-in agents/validators (no orchestrator/server imports); a shared
 `harness.models` vocabulary; careful model calls (JSON mode, thinking disabled,
 typed errors, token logging); SQLite in WAL mode with per-call connections and
-lock retries; and a large, real test suite (~2,400 Python + ~230 Java tests).
+lock retries; and a large, real test suite (Python and Java; see `docs/TESTING.md`).

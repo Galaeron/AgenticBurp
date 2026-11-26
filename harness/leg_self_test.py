@@ -489,7 +489,9 @@ def run_self_test(*, cases: list[LegCase] | None = None, health_timeout: float =
         token = _SCOPED_THROTTLE.set(local_throttle)
         global_throttle.acquire = _scoped_acquire
         try:
-            with safety_gate.gate_scope(scoped_gate):
+            # ARC-3: the disposable loopback fixture is also exempt from the shared
+            # per-origin bucket (context-local, so a concurrent real run is still paced).
+            with safety_gate.gate_scope(scoped_gate), global_throttle.unpaced():
                 for case in cases:
                     try:
                         if not case.available():

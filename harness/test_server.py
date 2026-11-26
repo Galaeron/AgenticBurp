@@ -65,14 +65,87 @@ class SuppressionEndpointTests(unittest.TestCase):
         return server_module.orchestrator
 
     def _stub_ollama_health(self, *, reachable, models):
+        calls = []
+
         async def _probe(timeout=3.0):
+            calls.append(timeout)
             return {"reachable": reachable, "models": list(models),
                     "error": None if reachable else "stubbed unreachable"}
 
         self._orchestrator().ollama.health_check = _probe
+        return calls
+
+    def _anonymous_client(self):
+        import harness.server as server_module
+        from fastapi.testclient import TestClient
+        return TestClient(server_module.app, base_url="http://localhost")
+
+    def test_health_is_liveness_only(self):
+        # ARC-8: the unauthenticated /health makes no outbound request and
+        # names no model or agent. Negative control: the pre-ARC-8 /health
+        # probed the backend (calls == 1) and listed every agent and model.
+        orch = self._orchestrator()
+        calls = self._stub_ollama_health(reachable=False, models=[])
+        resp = self._anonymous_client().get("/health")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"status": "ok"})
+        self.assertEqual(calls, [], "liveness must not probe the model server")
+        names = {orch.coordinator_model, *orch.agent_manager.agents,
+                 *(a.model for a in orch.agent_manager.agents.values())}
+        for name in sorted(n for n in names if n):
+            self.assertNotIn(name, resp.text)
+
+    def test_health_details_requires_the_token(self):
+        calls = self._stub_ollama_health(reachable=True, models=[])
+        anonymous = self._anonymous_client()
+        self.assertEqual(anonymous.get("/health/details").status_code, 401)
+        self.assertEqual(anonymous.get("/health/details",
+                                       headers={"Authorization": "Bearer wrong"}).status_code, 401)
+        self.assertEqual(calls, [], "an unauthenticated caller triggers no probe")
+        self.assertEqual(self.client.get("/health/details").status_code, 200)
+        self.assertEqual(len(calls), 1)
+
+    def test_health_details_caches_the_backend_probe(self):
+        import harness.server as server_module
+        calls = self._stub_ollama_health(reachable=True, models=[])
+        first = self.client.get("/health/details").json()
+        second = self.client.get("/health/details").json()
+        self.assertEqual(len(calls), 1, "a second call within the TTL reuses the probe")
+        self.assertEqual(first["probe_age_seconds"], 0.0)
+        self.assertGreaterEqual(second["probe_age_seconds"], 0.0)
+        # Control: once the TTL has passed the backend is probed again.
+        original = server_module._HEALTH_PROBE_TTL_SECONDS
+        server_module._HEALTH_PROBE_TTL_SECONDS = 0.0
+        try:
+            self.client.get("/health/details")
+        finally:
+            server_module._HEALTH_PROBE_TTL_SECONDS = original
+        self.assertEqual(len(calls), 2)
+
+    def test_health_details_does_not_cache_an_unreachable_probe(self):
+        # Review fix: a down backend is re-probed on every call, so starting
+        # the model server shows up at once. Control: the reachable case above
+        # is cached (1 probe for 2 calls).
+        calls = self._stub_ollama_health(reachable=False, models=[])
+        self.client.get("/health/details")
+        self.client.get("/health/details")
+        self.assertEqual(len(calls), 2)
+        calls = self._stub_ollama_health(reachable=True, models=[])
+        self.assertEqual(self.client.get("/health/details").json()["ollama"]["reachable"], True)
+        self.assertEqual(len(calls), 1)
+
+    def test_health_details_carries_the_model_egress_state(self):
+        from harness import model_egress
+        import harness.server as server_module
+        self._stub_ollama_health(reachable=True, models=[])
+        body = self.client.get("/health/details").json()
+        orch = self._orchestrator()
+        self.assertEqual(body["model_egress"], model_egress.egress_state(
+            server_module.config, model_egress.agent_models_of(orch.agent_manager)))
+        self.assertFalse(body["model_egress"]["allow_cloud_models"])
 
     def test_health_exposes_fail_open_telemetry(self):
-        # Phase 1.4: /health surfaces the coordinator fail-open counters so the
+        # Phase 1.4: /health/details (ARC-8) surfaces the coordinator fail-open counters so the
         # historically-silent "firing all agents" state is observable. Stub the
         # Ollama probe reachable (with every configured local model present) so
         # the readiness check below is deterministic in CI, where no Ollama runs.
@@ -81,7 +154,7 @@ class SuppressionEndpointTests(unittest.TestCase):
         configured.update(a.model for a in orch.agent_manager.agents.values())
         self._stub_ollama_health(reachable=True,
                                  models=[m for m in configured if m and not m.endswith("-cloud")])
-        resp = self.client.get("/health")
+        resp = self.client.get("/health/details")
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["status"], "ok")
@@ -96,7 +169,7 @@ class SuppressionEndpointTests(unittest.TestCase):
         # model backend must NOT report "ok" (the old behavior that made
         # "ollama isn't running" look healthy).
         self._stub_ollama_health(reachable=False, models=[])
-        body = self.client.get("/health").json()
+        body = self.client.get("/health/details").json()
         self.assertEqual(body["status"], "degraded")
         self.assertFalse(body["ollama"]["reachable"])
         self.assertIn("hint", body["ollama"])
@@ -105,7 +178,7 @@ class SuppressionEndpointTests(unittest.TestCase):
         # Reachable backend but the configured model isn't pulled -> degraded,
         # with the missing model named.
         self._stub_ollama_health(reachable=True, models=["some-other-model:1b"])
-        body = self.client.get("/health").json()
+        body = self.client.get("/health/details").json()
         self.assertEqual(body["status"], "degraded")
         self.assertTrue(body["ollama"]["reachable"])
         self.assertTrue(body["ollama"]["missing_models"])
@@ -316,6 +389,11 @@ class MissingAuthProbeEndpointTests(unittest.TestCase):
         # Scope the probe to a test host; the module-level orchestrator's
         # allowed_hosts is what the endpoint hands the probe.
         server_module.orchestrator.allowed_hosts = ["t.test"]
+        # ARC-1: this route sends target traffic, so admission needs the master switch;
+        # httpx is patched per test, so nothing leaves the process.
+        registry = server_module.orchestrator.validator_registry
+        self.addCleanup(registry.set_active_enabled, registry.active_enabled)
+        registry.set_active_enabled(True)
         global_throttle.configure(0)
         from fastapi.testclient import TestClient
         # RB-1: state-changing routes now require the bearer token even from
@@ -389,6 +467,11 @@ class ActiveProbeEndpointTests(unittest.TestCase):
         importlib.reload(server_module)
         self.server_module = server_module
         server_module.orchestrator.allowed_hosts = ["shop.test"]
+        # ARC-1: this route sends target traffic, so admission needs the master switch;
+        # the agent loop is patched, so nothing leaves the process.
+        registry = server_module.orchestrator.validator_registry
+        self.addCleanup(registry.set_active_enabled, registry.active_enabled)
+        registry.set_active_enabled(True)
         from fastapi.testclient import TestClient
         # RB-1: state-changing routes now require the bearer token even from
         # loopback (ephemeral token generated by server.py at import time
@@ -413,6 +496,7 @@ class ActiveProbeEndpointTests(unittest.TestCase):
         resp = self.client.post("/active-probe", json={
             "exchange": self._EXCHANGE, "hypothesis": "idor on report id", "specialty": "idor"})
         self.assertEqual(resp.status_code, 403)
+        self.assertIn("iterative", resp.json()["detail"].lower())
 
     def test_enabled_runs_and_integrates(self):
         from unittest.mock import patch
@@ -663,6 +747,11 @@ class InvestigateJobEndpointTests(unittest.TestCase):
         # authorize "shop.test" here (NOT via committed config.yaml) and use
         # "http://shop.test:..." base_urls consistently with the route host.
         self.server.orchestrator.allowed_hosts = ["shop.test"]
+        # ARC-1: /investigate needs the master switch; every test patches
+        # investigate_engagement, so nothing reaches shop.test.
+        registry = self.server.orchestrator.validator_registry
+        self.addCleanup(registry.set_active_enabled, registry.active_enabled)
+        registry.set_active_enabled(True)
         from fastapi.testclient import TestClient
         # RB-1: state-changing routes now require the bearer token even from
         # loopback (ephemeral token generated by server.py at import time
@@ -840,6 +929,11 @@ class InvestigateJobAdmissionAndRetentionTests(unittest.TestCase):
         self.server.config["runs"] = {"output_dir": self._tmpdir.name,
                                        "cache_namespace": "test-isolated"}
         self.server.orchestrator.allowed_hosts = ["shop.test"]
+        # ARC-1: /investigate needs the master switch; every test patches
+        # investigate_engagement, so nothing reaches shop.test.
+        registry = self.server.orchestrator.validator_registry
+        self.addCleanup(registry.set_active_enabled, registry.active_enabled)
+        registry.set_active_enabled(True)
         from fastapi.testclient import TestClient
         # IMPORTANT: entered as a context manager (not a bare `TestClient(...)`
         # instance) so a single portal/event loop is pinned for this test's

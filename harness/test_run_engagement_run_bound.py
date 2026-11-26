@@ -175,7 +175,8 @@ async def _legacy_run_engagement(self, host, base_url, *, max_targets=5, max_rou
         funded = [t for t in plan["targets"]
                   if t["action"] != "deferred" and t["method"].upper() == "GET"]
         analyzed = []
-        _tt, _owned = transport_for(None, allowed_hosts=self.allowed_hosts, config=self.config)
+        _tt, _owned = transport_for(None, allowed_hosts=self.allowed_hosts, config=self.config,
+                                    active_mode=True)
         try:
             for t in funded:
                 url = origin + t["path"].replace("{id}", "1")
@@ -285,7 +286,10 @@ class RunEngagementRunBoundTests(unittest.TestCase):
         self.assertEqual(result["run"]["requests_used"], 2 * _TARGETS)
 
     def test_ceiling_falls_back_to_the_standalone_analysis_ceiling(self):
-        result = self._drive(_config(analyze_max=3))
+        # ARC-3 ships runs.max_requests; the fallback applies only when it is unset.
+        cfg = _config(analyze_max=3)
+        cfg["runs"].pop("max_requests", None)
+        result = self._drive(cfg)
         self.assertEqual(len(self.target.requests), 3)
         self.assertEqual(result["run"]["max_requests"], 3)
 

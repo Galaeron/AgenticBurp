@@ -220,7 +220,11 @@ class CrawlRedirectScopeTests(_RouteFixture):
         self.assertEqual(other.paths(), ["/other"])
         self.assertNotIn("x-api-key", other.requests[0][2])
 
-    def test_fault_injection_crawl_without_the_run_escapes(self):
+    def test_fault_injection_crawl_without_the_run_no_longer_escapes(self):
+        """The pre-ARC-7 fault: a crawl handed no run used a raw client that followed the
+        redirect to the out-of-scope host with the credential. Its no-run branch now sends
+        through a standalone transport (scope per hop), so the same injection stays in
+        scope. Control: test_redirect_out_of_scope_is_not_contacted (the run path)."""
         from harness import crawler
         real_crawl = crawler.crawl
 
@@ -232,8 +236,8 @@ class CrawlRedirectScopeTests(_RouteFixture):
         self.arm()
         with patch.object(crawler, "crawl", without_run):
             self._crawl(site.origin + "/")
-        self.assertEqual(outside.paths(), ["/"])
-        self.assertEqual(outside.requests[0][2].get("x-api-key"), "synthetic-key")
+        self.assertEqual(outside.paths(), [])
+        self.assertEqual(outside.requests, [])
 
 
 class RoleRouteRedirectScopeTests(_RouteFixture):
@@ -275,7 +279,9 @@ class RoleRouteRedirectScopeTests(_RouteFixture):
         self.assertEqual(outside.requests, [])
         self.assertIn("/data", site.paths())
 
-    def test_fault_injection_role_crawl_without_the_run_escapes(self):
+    def test_fault_injection_role_crawl_without_the_run_no_longer_escapes(self):
+        """As for the crawl: with no run, the role crawl's raw client is gone (ARC-7), so
+        neither its page fetches nor its access-matrix probes reach the off-scope host."""
         from harness import role_crawl
         real_crawl_roles = role_crawl.crawl_roles
 
@@ -289,8 +295,7 @@ class RoleRouteRedirectScopeTests(_RouteFixture):
                 "base_url": site.origin + "/", "roles": self._roles(), "max_pages": 5,
                 "register_identities": False})
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertTrue(outside.requests)
-        self.assertIn("synthetic-key", [h.get("x-api-key") for _, _, h in outside.requests])
+        self.assertEqual(outside.requests, [])
 
 
 class AdvanceActiveModeTests(_RouteFixture):
@@ -324,7 +329,8 @@ class AdvanceActiveModeTests(_RouteFixture):
     def test_fault_injection_removing_the_gate_sends(self):
         site = self._site()
         self.arm(False)
-        with patch.object(self.server, "_require_active_crawl", lambda url: None):
+        # ARC-1: the master switch the shared route dependency applies.
+        with patch.object(self.server, "_admit_active_traffic", lambda: None):
             resp = self._advance(site)
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertTrue(site.requests)

@@ -43,7 +43,6 @@ from dataclasses import dataclass, field
 from typing import NamedTuple
 from urllib.parse import urlparse, urljoin, urlsplit, urlunsplit, urlencode
 
-import httpx
 
 # Framework "route does not exist" markers some apps leak in the body (Flask/
 # Werkzeug wraps 404s this way; others return a bare 404 status, handled too).
@@ -278,8 +277,9 @@ def _header_value(headers, name: str) -> str:
 
 
 def _host_in_scope(url: str, allowed_hosts) -> bool:
+    # Guards every probe, which is a live send: an empty or unset scope admits no host.
     if not allowed_hosts:
-        return True
+        return False
     return scope_lock.host_in_scope(url, allowed_hosts)
 
 
@@ -481,18 +481,29 @@ class SurfaceDiscovery:
                 elif 300 <= (outcome.status or 0) < 400:
                     self._note_dir_redirect(path, _header_value(outcome.headers, "Location"))
             return outcome.status or 0, outcome.body or "", _header_value(outcome.headers, "Allow")
+        # ARC-7: no raw client. Without a run the probe sends through a standalone one
+        # (transport_for): scope, budget and the connect-time pin apply, and an empty
+        # scope admits no host.
         from harness import global_throttle
+        from harness.run_context import transport_for
         await global_throttle.acquire()
+        _tt, _owned = transport_for(None, allowed_hosts=list(self.allowed_hosts or []),
+                                    active_mode=True, timeout=self.timeout)
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False, verify=False) as client:
-                resp = await client.request(method, url, headers=self.headers or None)
+            outcome = await _tt.send_creds(method, url, capability="surface_discovery",
+                                           headers=self.headers or None, max_redirects=0)
         except Exception:
             return None
+        finally:
+            if _owned is not None:
+                await _owned.aclose()
+        if not outcome.ok:
+            return None
         if method == "GET":
-            self._content_types[path] = _header_value(resp.headers, "Content-Type")
-            if 300 <= resp.status_code < 400:
-                self._note_dir_redirect(path, _header_value(resp.headers, "Location"))
-        return resp.status_code, (resp.text or ""), _header_value(resp.headers, "Allow")
+            self._content_types[path] = _header_value(outcome.headers, "Content-Type")
+            if 300 <= (outcome.status or 0) < 400:
+                self._note_dir_redirect(path, _header_value(outcome.headers, "Location"))
+        return outcome.status or 0, outcome.body or "", _header_value(outcome.headers, "Allow")
 
     def _budget_left(self) -> bool:
         return self._probes < min(self.max_probes, self._phase_limit)

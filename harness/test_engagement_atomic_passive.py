@@ -18,6 +18,17 @@ from harness import test_pairing_contract as pairing
 from harness.test_run_summary_ledger import _build, _InertStubOllama
 
 
+_PRIOR_HEADER = "PRIOR FINDINGS ON THIS HOST"
+
+
+def _prior_findings(prompts) -> str:
+    """Only the PRIOR FINDINGS blocks of the captured prompts. A marker such as
+    "ordinary-A" also appears in the URL "ordinary-A-second", so asserting on the
+    whole prompt cannot tell whether prior context carried it."""
+    return "\n".join(p.split(_PRIOR_HEADER, 1)[1].split("\n\n", 1)[0]
+                     for p in prompts if _PRIOR_HEADER in p)
+
+
 class ContextProvider(_InertStubOllama):
     def __init__(self):
         self.marker = "ordinary-A"
@@ -328,6 +339,14 @@ finally: fixture.doCleanups()
         cache.init_cache(db_path=str(Path(self.tmp.name) / "cache.db"))
         provider = ContextProvider()
         self.server.orchestrator = _build(provider)
+        # A known window large enough that prompt fitting (TOK-4) keeps the prior
+        # findings: with the unknown-window fallback they are elided, and both
+        # the reuse check and the injected-leak control below see nothing.
+        from harness import prompt_budget
+        orch = self.server.orchestrator
+        orch.config.setdefault("ollama", {})["num_ctx"] = 32768
+        for agent in orch.agent_manager.agents.values():
+            agent.prompt_budget = prompt_budget.for_run(orch.config)
         def analyze(path, cookie):
             return self.client.post("/analyze", headers=self.auth, json={"engagement_id": "eng-A",
                 "exchange": {"url": "http://run-summary.test/" + path, "method": "GET",
@@ -358,7 +377,7 @@ finally: fixture.doCleanups()
             provider.prompts.clear()
             again = analyze("ordinary-A-second", "session=private-A")
             self.assertEqual(again.json()["captured_principal_id"], a_id)
-            self.assertIn("ordinary-A", " ".join(provider.prompts))
+            self.assertIn("ordinary-A", _prior_findings(provider.prompts))
             self.assertNotIn("ordinary-B", " ".join(provider.prompts))
             conn = store._connect()
             try:
@@ -385,7 +404,7 @@ finally: fixture.doCleanups()
             with patch.object(store, "prior_findings_summary", side_effect=broken_context):
                 analyze("ordinary-B-second", "session=private-B")
             with self.assertRaises(AssertionError):
-                self.assertNotIn("ordinary-A", " ".join(provider.prompts))
+                self.assertNotIn("ordinary-A", _prior_findings(provider.prompts))
 
     def test_captured_principal_is_keyed_per_database_and_case_normalized(self):
         exchange = HttpExchange(url="http://captured.example/", method="GET",

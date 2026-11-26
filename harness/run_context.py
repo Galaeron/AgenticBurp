@@ -49,6 +49,7 @@ import httpcore
 import httpx
 
 from harness import evidence
+from harness import global_throttle
 from harness import scope_lock
 from harness.server_errors import ServerErrorLedger
 from harness.run_observations import RunObservations
@@ -65,6 +66,36 @@ _REDIRECT_TO_GET = frozenset({301, 302, 303})
 # narrower rule, kept only as a deprecated alias for tests that import it; nothing in
 # this module consults it.
 _CREDENTIAL_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization"})
+# ARC-6: request headers the HTTP client derives from the request itself. Host comes
+# from the URL; the hop-by-hop set (RFC 9110 7.6.1, plus every Proxy-* name) and the
+# framing pair are computed for the bytes actually sent. A caller-supplied copy is
+# dropped here (a replayed exchange's `Connection: keep-alive` loses nothing) and
+# refused outright when a model proposes one (iterative_agent). Names match
+# case-insensitively after surrounding whitespace is stripped.
+_HOP_BY_HOP_HEADERS = frozenset({"connection", "keep-alive", "te", "trailer", "trailers",
+                                 "upgrade"})
+_FRAMING_HEADERS = frozenset({"content-length", "transfer-encoding"})
+TRANSPORT_CONTROLLED_HEADERS = frozenset({"host"}) | _HOP_BY_HOP_HEADERS | _FRAMING_HEADERS
+
+
+def is_transport_controlled_header(name) -> bool:
+    """True for a header name only the transport may set (ARC-6)."""
+    n = str(name or "").strip().lower()
+    return n in TRANSPORT_CONTROLLED_HEADERS or n.startswith("proxy-")
+
+
+def _drop_transport_controlled(headers: dict, *, allow_framing: bool) -> dict:
+    """`headers` without the transport-controlled names. `allow_framing` (one call's
+    explicit opt-in, see TargetTransport.send) keeps the framing and connection
+    headers a desync probe must send as written; Host and Proxy-* go regardless."""
+    kept = {}
+    for k, v in headers.items():
+        n = str(k or "").strip().lower()
+        if allow_framing and n in (_HOP_BY_HOP_HEADERS | _FRAMING_HEADERS):
+            kept[k] = v
+        elif not is_transport_controlled_header(n):
+            kept[k] = v
+    return kept
 # Interval clock for session rechecks and route-circuit cooldowns (a name, so tests
 # can advance it without sleeping).
 _clock = time.monotonic
@@ -161,6 +192,7 @@ class RequestBudget:
         self._max = max_requests
         self._used = 0
         self._held = 0
+        self._denied = 0
         self._by_label: dict[str, int] = {}
         self._lock = threading.Lock()
 
@@ -170,6 +202,7 @@ class RequestBudget:
         not know theirs leave it blank and are counted as "unlabelled"."""
         with self._lock:
             if self._max is not None and self._used + n > self._max - self._held:
+                self._denied += n
                 return False
             self._used += n
             key = label or "unlabelled"
@@ -204,6 +237,16 @@ class RequestBudget:
     @property
     def remaining(self) -> int | None:
         return None if self._max is None else max(0, self._max - self._used - self._held)
+
+    def state(self) -> dict:
+        """ARC-3: the ceiling's outcome for the run manifest. `exhausted` once a
+        reservation was refused (or the ceiling is fully spent): the run stopped,
+        or lost sends, on `budget_exhausted`."""
+        with self._lock:
+            used, denied = self._used, self._denied
+        exhausted = self._max is not None and (used >= self._max or denied > 0)
+        return {"max_requests": self._max, "used": used, "remaining": self.remaining,
+                "denied": denied, "exhausted": exhausted}
 
 
 class CancelToken:
@@ -673,15 +716,18 @@ class TargetTransport:
                    session_ref: str | None = None, headers: dict | None = None,
                    body: str | None = None, case_ref: str = "",
                    max_redirects: int = 5,
-                   allow_cancelled_cleanup: bool = False) -> "ExecutionOutcome":
+                   allow_cancelled_cleanup: bool = False,
+                   allow_framing_headers: bool = False) -> "ExecutionOutcome":
         """Convenience wrapper over execute() for a single (method, url) send, so a
         raw `httpx` call site can migrate to the transport in one line. Pass
-        max_redirects=0 to match a raw client's follow_redirects=False."""
+        max_redirects=0 to match a raw client's follow_redirects=False.
+        `allow_framing_headers` is execute()'s per-call opt-in (ARC-6)."""
         return await self.execute(
             TypedRequest(method=(method or "GET").upper(), url=url,
                          headers=dict(headers or {}), body=body),
             capability=capability, session_ref=session_ref, case_ref=case_ref,
-            max_redirects=max_redirects, allow_cancelled_cleanup=allow_cancelled_cleanup)
+            max_redirects=max_redirects, allow_cancelled_cleanup=allow_cancelled_cleanup,
+            allow_framing_headers=allow_framing_headers)
 
     async def send_creds(self, method: str, url: str, *, capability: str,
                          headers: dict | None = None, body: str | None = None,
@@ -812,14 +858,22 @@ class TargetTransport:
     async def execute(self, request: TypedRequest, *, capability: str,
                       session_ref: str | None = None, case_ref: str = "",
                       max_redirects: int = 5,
-                      allow_cancelled_cleanup: bool = False) -> ExecutionOutcome:
+                      allow_cancelled_cleanup: bool = False,
+                      allow_framing_headers: bool = False) -> ExecutionOutcome:
         """Send one request through scope + gate + budget, following redirects
         MANUALLY so every hop is re-checked. Captures an artifact on every path,
         including blocks and errors. HU-5: every outcome is then offered to the
-        run's change log and handoff (bookkeeping only; it sends nothing)."""
+        run's change log and handoff (bookkeeping only; it sends nothing).
+
+        ARC-6: Host, hop-by-hop, Proxy-* and framing headers are dropped from what
+        is sent. `allow_framing_headers=True` is a per-call opt-in, for a validator
+        that must write Content-Length / Transfer-Encoding / Connection itself (the
+        request-smuggling probe); it never admits Host or Proxy-*. send_creds() --
+        the model-driven agent's path -- does not take it."""
         outcome = await self._execute(request, capability=capability, session_ref=session_ref,
                                       case_ref=case_ref, max_redirects=max_redirects,
-                                      allow_cancelled_cleanup=allow_cancelled_cleanup)
+                                      allow_cancelled_cleanup=allow_cancelled_cleanup,
+                                      allow_framing_headers=allow_framing_headers)
         from harness import run_handoff
         run_handoff.observe_execution(self.ctx, request, outcome, capability=capability,
                                       case_ref=current_case_ref() or case_ref)
@@ -828,7 +882,8 @@ class TargetTransport:
     async def _execute(self, request: TypedRequest, *, capability: str,
                        session_ref: str | None = None, case_ref: str = "",
                        max_redirects: int = 5,
-                       allow_cancelled_cleanup: bool = False) -> ExecutionOutcome:
+                       allow_cancelled_cleanup: bool = False,
+                       allow_framing_headers: bool = False) -> ExecutionOutcome:
         ctx = self.ctx
         # R16 accounting and the record's finding_ref: the caller's own case_ref,
         # never ambient. The record's case: the enclosing case_scope, if any.
@@ -912,6 +967,16 @@ class TargetTransport:
             if not decision.allowed:
                 return ExecutionOutcome(outcome="blocked", final_url=url, error=decision.reason,
                                         artifact=self._artifact(url, "blocked", session_ref, case_ref=case_ref, finding_ref=finding_ref))
+            # 2b. ARC-3 pace -- one slot from this ORIGIN's process-wide bucket
+            #     (global_throttle), shared by every run and concurrent job, so the
+            #     configured rate binds the target however many callers send. Each
+            #     redirect hop is paced. A spent budget is refused at once, unpaced.
+            if getattr(ctx.budget, "remaining", None) != 0:
+                await global_throttle.acquire_origin(ScopePolicy.origin_of(url),
+                                                     capability=capability)
+                if ctx.cancel.cancelled and not allow_cancelled_cleanup:
+                    return ExecutionOutcome(outcome="cancelled", final_url=url,
+                                            artifact=self._artifact(url, "cancelled", session_ref, case_ref=case_ref, finding_ref=finding_ref))
             # 3. Budget -- reserve atomically before sending; a denial does not count as executed.
             # Only RequestBudget (and the driver child budget forwarding to it) takes a label.
             if not (ctx.budget.reserve(1, label=capability) if hasattr(ctx.budget, "by_label")
@@ -935,6 +1000,8 @@ class TargetTransport:
             if session and credential_destination:
                 for k, v in session.headers.items():
                     send_headers.setdefault(k, v)
+            send_headers = _drop_transport_controlled(send_headers,
+                                                      allow_framing=allow_framing_headers)
             use_http2 = bool((ctx.config.get("transport", {}) or {}).get("http2", False))
             client = (session.client(ctx.timeout, http2=use_http2,
                                      trust_policy=ctx.tls_policy, destination=url,
@@ -1175,9 +1242,11 @@ Executor = TargetTransport
 # The pin sits in the httpcore network backend, so the Host header, TLS SNI and
 # certificate hostname checks stay on the name, and nothing changes for clients that
 # never open a socket (mock transports). ON by default; `security.pin_connect_address:
-# false` is an explicit opt-out. Behind an HTTP(S) proxy (trust_env) the proxy
-# resolves the target, so only the connection to the proxy is pinned. A name whose
-# FIRST answer is private or loopback is accepted -- lab targets do that.
+# false` is an explicit opt-out. ARC-14: target clients never honour HTTP(S)_PROXY /
+# ALL_PROXY from the environment (trust_env=False), so a proxy can never take over
+# resolving the target and bypass the pin; the harness has no configured upstream
+# proxy for target traffic. A name whose FIRST answer is private or loopback is
+# accepted -- lab targets do that.
 # ---------------------------------------------------------------------------
 
 class DestinationBlocked(Exception):
@@ -1275,15 +1344,18 @@ def _pinned_backend(pins: "AddressPins | None"):
 
 def _target_client(*, verify, timeout: float, http2: bool,
                    pins: "AddressPins | None") -> httpx.AsyncClient:
-    """An httpx client for target traffic whose connections honour the run's pins."""
-    transport = httpx.AsyncHTTPTransport(verify=verify, http2=http2)
+    """An httpx client for target traffic whose connections honour the run's pins.
+
+    ARC-14: trust_env=False on the client and its transport, so no environment
+    proxy (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY), .netrc or SSL_CERT_* setting is
+    applied: every send connects to the pinned target address itself."""
+    transport = httpx.AsyncHTTPTransport(verify=verify, http2=http2, trust_env=False)
     backend = _pinned_backend(pins)
     if backend is not None:
         transport._pool._network_backend = backend
-    # verify/http2 are passed to the client too, so environment-proxy mounts use the
-    # same trust as the pinned transport.
     return httpx.AsyncClient(follow_redirects=False, verify=verify, timeout=timeout,
-                             cookies=httpx.Cookies(), http2=http2, transport=transport)
+                             cookies=httpx.Cookies(), http2=http2, transport=transport,
+                             trust_env=False)
 
 
 def _address_pins_from_config(config: dict | None) -> "AddressPins | None":
@@ -1292,14 +1364,17 @@ def _address_pins_from_config(config: dict | None) -> "AddressPins | None":
 
 
 def standalone_context(allowed_hosts, *, config: dict | None = None, gate=None,
-                       active_mode: bool = False, timeout: float = 15.0,
+                       active_mode: bool = True, timeout: float = 15.0,
                        max_requests: int | None = None) -> "RunContext":
     """A minimal RunContext for a caller that has no run of its own but still wants
     the ONE TargetTransport path instead of a raw httpx client (W-16 full closure).
 
     Its scope is a HostAllowScope, so a send previously guarded by
     `scope_discovery.is_host_allowed(url, allowed_hosts)` uses the same strict
-    exact-host intersection as the gate. Pass `gate` to
+    exact-host intersection as the gate. ARC-2: `active_mode` defaults to True, so
+    an empty `allowed_hosts` admits no host. A caller that only replays traffic the
+    operator supplied, and keeps the passive empty-scope admission, must pass
+    active_mode=False explicitly (transport_for does, by its own default). Pass `gate` to
     reuse the caller's existing SafetyGate (e.g. the
     iterative agent's) so mutating-method decisions are unchanged; otherwise a fresh
     per-context gate is used. The caller owns the returned context and must aclose()
@@ -1312,9 +1387,12 @@ def standalone_context(allowed_hosts, *, config: dict | None = None, gate=None,
 
 
 def transport_for(run_context, *, allowed_hosts, config: dict | None = None, gate=None,
-                  active_mode: bool = False, timeout: float = 15.0):
+                  active_mode: bool, timeout: float = 15.0):
     """Return (transport, owned_context) for a call site that may or may not have a
-    run of its own. If `run_context` is provided, its TargetTransport is used and
+    run of its own. `active_mode` has no default (a1 open item): each caller states
+    whether an EMPTY `allowed_hosts` admits any host (False, a caller that only
+    replays traffic the operator supplied) or none (True, a caller that originates
+    the request). It only matters when a standalone context is built. If `run_context` is provided, its TargetTransport is used and
     owned_context is None (the caller must NOT close the shared run). Otherwise a
     `standalone_context` is built and returned as owned_context, which the caller
     must aclose() when done. I05: inside an entered run, a call site that passed no

@@ -146,13 +146,60 @@ def _skeleton(doc, depth: int = 4):
     return type(doc).__name__
 
 
+# TOK-7: the classifier's input cap, in characters of JSON text.
+CLASSIFIER_INPUT_CHARS = 6000
+# (depth, keys per object) tried in order until the shape fits the cap.
+_SHAPE_STEPS = ((4, 20), (3, 20), (3, 10), (2, 10), (2, 5), (1, 5), (0, 0))
+
+
+def _prune(shape, depth: int, width: int):
+    """A key skeleton cut to `depth` levels and `width` keys per object."""
+    if isinstance(shape, dict):
+        if depth <= 0:
+            return "dict"
+        return {k: _prune(v, depth - 1, width) for k, v in list(shape.items())[:width]}
+    if isinstance(shape, list):
+        if depth <= 0:
+            return "list"
+        return [_prune(shape[0], depth - 1, width)] if shape else []
+    return shape
+
+
+def fit_classifier_payload(payload: dict, limit: int = CLASSIFIER_INPUT_CHARS) -> str:
+    """The classifier payload as JSON text of at most `limit` characters.
+
+    TOK-7: cut structurally, never mid-token (a `[:limit]` slice of the JSON
+    text left the model an unterminated document). An oversized response shape
+    is pruned shallower and narrower, then the route is shortened, and
+    `response_shape_truncated` says the shape is incomplete."""
+    text = json.dumps(payload)
+    if len(text) <= limit:
+        return text
+    shape = payload.get("response_shape")
+    for depth, width in _SHAPE_STEPS:
+        text = json.dumps(dict(payload, response_shape=_prune(shape, depth, width),
+                               response_shape_truncated=True))
+        if len(text) <= limit:
+            return text
+    route = str(payload.get("route") or "")
+    while route:
+        route = route[:len(route) // 2]
+        text = json.dumps(dict(payload, route=route, response_shape=_prune(shape, 0, 0),
+                               response_shape_truncated=True, route_truncated=True))
+        if len(text) <= limit:
+            return text
+    return json.dumps({"method": str(payload.get("method") or "")[:16], "route": "",
+                       "response_shape": "dict", "response_shape_truncated": True,
+                       "route_truncated": True})
+
+
 def ollama_route_classifier(ollama, model: str):
     """The production classifier: the run's local agent model asked for JSON."""
     async def classify(payload: dict) -> dict:
         from harness.ollama_client import model_stage
         with model_stage("self_ownership"):
             return await ollama.chat_json(model, ROUTE_CLASSIFIER_PROMPT,
-                                          json.dumps(payload)[:6000], temperature=0.0)
+                                          fit_classifier_payload(payload), temperature=0.0)
     return classify
 
 

@@ -93,11 +93,36 @@ ollama:
   #   reasoning included. A reply that reaches it is discarded and counted as
   #   output_capped, so a model stuck repeating itself fails fast instead of
   #   running to timeout_seconds.
+  #
+  # SEC-1: a model named *-cloud or *:cloud runs on Ollama's cloud, so exchange
+  # content in its prompts leaves this machine. With this false, such a model in
+  # any slot (coordinator.model, coordinator.cloud_model while cloud_primary or
+  # cloud_reasoning is on, agent_defaults.model, agents.<name>.model,
+  # critique.model, surface_prioritization.model, writeups.model) refuses the run
+  # before its first model call, and every call to one is refused unsent. Set it
+  # true only in config.local.yaml, for an engagement that permits the egress;
+  # the run manifest and GET /health/details record it under model_egress.
+  allow_cloud_models: false
+  # Model-call pacer (O11): one token bucket shared by every model call in the
+  # process (agents, critique, routing, writeups). Up to burst_calls start back
+  # to back, then calls_per_minute. A call not admitted within max_wait_seconds
+  # fails unsent (not retried, not a circuit-breaker failure). burst_calls and
+  # calls_per_minute are the values the pacer always had; the wait bound is new.
+  # enabled: false admits every call at once. The run manifest records the
+  # values in force under model_rate_limit.
+  rate_limit:
+    enabled: true
+    burst_calls: 10
+    calls_per_minute: 10
+    max_wait_seconds: 300
 
 # Context-window budget for agent and critique prompts (harness/prompt_budget.py).
-# The context is `ollama.num_ctx` when set, else `model_context_tokens` below;
-# with neither (the default, and right for cloud models) prompts go out
-# unchanged. With a context, an oversized prompt is fitted to it minus
+# TOK-4: the context is the window the model's server reports before each
+# prompt (llama-server GET /props n_ctx, Ollama GET /api/ps for a loaded model,
+# POST /api/show for a cloud model), capped by `ollama.num_ctx` when set, else
+# by `model_context_tokens` below. With none of those known, prompts are fitted
+# to `unknown_context_tokens` (capped by the model's trained maximum), never
+# sent unfitted. An oversized prompt is fitted to the context minus
 # `answer_tokens`: methodology notes, inapplicable shared rules, specialty
 # sections the exchange does not match, prior findings, then body text and
 # specialty text are cut in that order, each cut marked in the prompt and listed
@@ -106,6 +131,8 @@ ollama:
 prompt_budget:
   model_context_tokens: null
   answer_tokens: 1024
+  # Ollama's default context on 0.40.13 (a model not loaded yet loads at it).
+  unknown_context_tokens: 4096
 
 # How many specialist agents are allowed to run concurrently against
 # Ollama through one AgentManager. The application orchestrator shares that
@@ -229,8 +256,12 @@ adaptive_respin:
 # each "politely" capped still add up at the target. 0 = OFF (unlimited), the
 # default, so nothing changes until the tester sets a ceiling (exposed as the
 # Burp "Global request throttle" setting). Blocks/paces callers; never drops
-# requests. The race-condition and request-smuggling validators are exempt by
-# design -- they depend on precise intentional concurrency this would defeat.
+# requests. ARC-3: the rate is ENFORCED per target origin inside TargetTransport,
+# one process-wide bucket shared by every run and concurrent job. The race-
+# condition, request-smuggling and TOCTOU validators' bursts are charged to it but
+# not delayed (their point is precise concurrency); the traffic after a burst
+# waits off its cost. Removing a set throttle through Burp /settings needs an
+# explicit confirm_unlimited, and every change is recorded in the run manifest.
 throttle:
   max_requests_per_second: 0   # 0 = unlimited
 
@@ -263,6 +294,10 @@ iterative_agent:
   # probe's diagnostics as model_error_retries and breaker_waits. 0 turns the
   # in-step retry off; capped at 3.
   model_error_retries: 1
+  # TOK-3: steps the prompt's history shows as their own lines; earlier steps
+  # are folded into a compact summary table (at most 12 rows), so the prompt
+  # stops growing once the window is full. At least 1.
+  history_window: 8
 
 # Browser-driven XSS validation -- A2 (validators/browser_xss_validator.py).
 # Loads candidate URLs in a real headless browser and confirms XSS only on
@@ -695,7 +730,7 @@ agent_defaults:
 # that agent behind on the old one. These agents therefore set only `enabled`
 # and inherit the default model; the harness logs each agent's resolved model
 # at startup, warns when an override shadows the default, and exposes the full
-# agent->model map at GET /health so you can verify what actually runs. Add a
+# agent->model map at GET /health/details so you can verify what actually runs. Add a
 # `model:` here ONLY when it must genuinely differ from the default.
 agents:
   sqli:
@@ -842,7 +877,7 @@ server:
   # /telemetry, /test-plans/{plan_id}, GET /settings) require the same
   # effective bearer token already required on mutations (server.auth_token/
   # HARNESS_BEARER_TOKEN if configured, else the ephemeral RB-1 token).
-  # /health stays open either way, for pairing/liveness.
+  # /health (liveness only) stays open either way; /health/details needs the token.
   #
   # SAFE DEFAULT: false. Shipping true here would break the Burp extension's
   # existing unauthenticated reads until its Java side is updated to send the
@@ -1187,6 +1222,12 @@ store:
 # Per-run knobs (harness/run_context.py RunContext.create reads
 # runs.cache_namespace; unset here, so cache_namespace defaults to "").
 runs:
+  # ARC-3: a finite per-run ceiling on real target sends (RequestBudget). A run
+  # that reaches it gets budget_exhausted and its manifest records stop_reason
+  # budget_exhausted plus the request_ceiling block. 100000 is a safety net for an
+  # unattended run, not a tuning value (owner decision); a long live run can raise
+  # it in config.local.yaml. The engagement driver's owned-run ceiling inherits it.
+  max_requests: 100000
   # FR-7 (F11): run-INDEPENDENT reuse of the pre-proof half of an analysis
   # (model-inference-derived reports, never proof/case/oracle fields --
   # see cache.HypothesisCacheEntry/get_hypothesis/put_hypothesis) across

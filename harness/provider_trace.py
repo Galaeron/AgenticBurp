@@ -1,4 +1,9 @@
-"""SC-13: provider composition + one unified cost/latency trace through the
+"""EXPERIMENTAL -- not enforced. No production code imports this module (ARC-10):
+it is exercised only by its own tests, so nothing in a run depends on it and it
+enforces nothing. Whether to wire it in, move it to harness/experimental/ or delete it is an
+owner decision; harness.test_experimental_modules keeps this marker honest.
+
+SC-13: provider composition + one unified cost/latency trace through the
 existing Provider protocol, consumed by the run ledger (harness.effort).
 
 Upstream's borrowable idea is a provider interface + per-role routing + a
@@ -31,6 +36,9 @@ step. Remote use still goes through llm_provider.build_provider, which keeps the
 explicit-opt-in + redaction contract.
 """
 from __future__ import annotations
+
+# ARC-10: no production importer; see the docstring.
+EXPERIMENTAL = True
 
 import time
 from dataclasses import dataclass, field

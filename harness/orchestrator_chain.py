@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import threading
 import time
 import uuid
 
@@ -26,6 +27,7 @@ from harness.circuit_breaker import get_ollama_circuit_breaker
 from harness.run_context import transport_for, ExecutionOutcome, case_scope, count_sends
 from harness.execution_registry import ExecutionRegistry
 from harness.validators.injection_targets import REQUEST_LEVEL_INPUTS, case_target
+from harness.validators.base import binds_routed_class, mechanism_class_of
 from harness.coverage_model import derive_input_cases_from_template
 from harness import run_journal
 from harness import review_overlap
@@ -110,7 +112,7 @@ class _ConfirmationCache:
         returns the cached result. A hit for another case returns a copy
         without the named exchanges, which were recorded under the first case
         and do not resolve here: that proof stays a candidate. The cached
-        original is never changed."""
+        original is never changed. Ungated: callers go through confirm()."""
         if case_ref is None:
             try:
                 case_ref = self._case_for(getattr(finding_obj, "vulnerability_class", ""), exchange)
@@ -134,6 +136,32 @@ class _ConfirmationCache:
         # A same-case hit is the cached object itself: it carries the original
         # attempt id, which the matrix merges by id, so no fresh attempt is
         # counted twice. A hit for another case is the registry's covered copy.
+        return result
+
+    async def confirm(self, validator, finding_obj, exchange, case_ref=None, *,
+                      routed_class: str = "", catalog_bound: bool = False):
+        """validate(), then the R11-1 class gate (EFF-2).
+
+        Every graph, shape-precondition and coverage leg dispatches through
+        here, so this is where the gate PASS1 applies holds for them
+        (validators.base.binds_routed_class). `routed_class` is the class of the
+        _confirm branch that chose the leg; `catalog_bound` marks a coverage leg,
+        which the check catalog chose for the finding's class. A confirmation
+        that does not prove the finding's class comes back as a skipped copy
+        naming the class it proved."""
+        result = await self.validate(validator, finding_obj, exchange, case_ref)
+        if (result is not None and getattr(result, "confirmed", False)
+                and not binds_routed_class(validator, result, finding_obj, exchange,
+                                           routed_class=routed_class,
+                                           catalog_bound=catalog_bound)):
+            import dataclasses
+            proved = mechanism_class_of(validator, result)
+            label = getattr(finding_obj, "vulnerability_class", "") or ""
+            # A copy, as PASS1's gate makes: the cached original stays as it ran.
+            result = dataclasses.replace(
+                result, confirmed=False, status="skipped", confidence=0.0,
+                summary=(f"{result.validator} proved {proved!r}, not this finding's class "
+                         f"{label!r}; not bound to it ({result.summary})"))
         return result
 
 
@@ -627,52 +655,79 @@ class ChainMixin:
         if not fresh:
             return
 
-        # Guard 3: per-host session cap.
-        if self._escalation_counts.get(host, 0) >= self.engagement_max_escalations:
+        # Guard 3: per-host session cap. ARC-11: the slot is RESERVED here, before
+        # the first await, so concurrent escalations of one host cannot all pass
+        # the check and then all count; it is given back if no crawl lands.
+        if not self._reserve_escalation(host):
             log.info("engagement auto-escalate: per-host cap (%d) reached for %s -- skipping",
                      self.engagement_max_escalations, host)
             return
-
-        # Guard 2: verify each credential actually grants access before crawling.
-        verified: list = []
-        for cap in fresh:
-            if await self._credential_grants_access(source_url, cap.get("headers", {}),
-                                                    run_context=run_context):
-                verified.append(cap)
-            else:
-                log.info("engagement auto-escalate: learned credential did not verify -- discarding")
-        if not verified:
-            return
-
-        roles = [role_crawl.RoleSession(role="anonymous", headers={})]
-        for cap in verified:
-            roles.append(role_crawl.RoleSession(role="derived", headers=cap.get("headers", {})))
-        session_refs = None
-        if run_context is not None:
-            from harness.run_context import ScopePolicy
-            session_refs = []
-            for index, role in enumerate(roles):
-                ref = f"auto-escalate:{index}:{role.principal_id()}"
-                run_context.sessions.register(
-                    ref, role.principal_id(), dict(role.headers or {}),
-                    allowed_origins=[ScopePolicy.origin_of(origin)], role=role.role)
-                session_refs.append(ref)
+        landed = False
         try:
-            result = await role_crawl.crawl_roles(
-                origin, roles, allowed_hosts=self.allowed_hosts, max_pages=20, max_endpoints=80,
-                run_context=run_context, session_refs=session_refs)
-            st.ingest_role_crawl(result.to_dict())
+            # Guard 2: verify each credential actually grants access before crawling.
+            verified: list = []
+            for cap in fresh:
+                if await self._credential_grants_access(source_url, cap.get("headers", {}),
+                                                        run_context=run_context):
+                    verified.append(cap)
+                else:
+                    log.info("engagement auto-escalate: learned credential did not verify -- discarding")
+            if not verified:
+                return
+
+            roles = [role_crawl.RoleSession(role="anonymous", headers={})]
             for cap in verified:
-                st.resolve_action("recrawl_as_derived",
-                                  f"derived:{cap.get('kind', 'cred')}@{engagement.normalize_path(source_url)}")
-            self._escalation_counts[host] = self._escalation_counts.get(host, 0) + 1
-            log.info("engagement auto-escalate: re-crawled %s as derived identity, +%d endpoints (host total %d)",
-                     origin, len(result.endpoints), self._escalation_counts[host])
-        except Exception as e:
-            log.warning("engagement auto-escalate failed: %s", e)
+                roles.append(role_crawl.RoleSession(role="derived", headers=cap.get("headers", {})))
+            session_refs = None
+            if run_context is not None:
+                from harness.run_context import ScopePolicy
+                session_refs = []
+                for index, role in enumerate(roles):
+                    ref = f"auto-escalate:{index}:{role.principal_id()}"
+                    run_context.sessions.register(
+                        ref, role.principal_id(), dict(role.headers or {}),
+                        allowed_origins=[ScopePolicy.origin_of(origin)], role=role.role)
+                    session_refs.append(ref)
+            try:
+                result = await role_crawl.crawl_roles(
+                    origin, roles, allowed_hosts=self.allowed_hosts, max_pages=20, max_endpoints=80,
+                    run_context=run_context, session_refs=session_refs)
+                st.ingest_role_crawl(result.to_dict())
+                for cap in verified:
+                    st.resolve_action("recrawl_as_derived",
+                                      f"derived:{cap.get('kind', 'cred')}@{engagement.normalize_path(source_url)}")
+                landed = True   # the reserved slot is kept
+                log.info("engagement auto-escalate: re-crawled %s as derived identity, +%d endpoints (host total %d)",
+                         origin, len(result.endpoints), self._escalation_counts.get(host, 0))
+            except Exception as e:
+                log.warning("engagement auto-escalate failed: %s", e)
+            finally:
+                for ref in session_refs or ():
+                    await run_context.sessions.unregister(ref)
         finally:
-            for ref in session_refs or ():
-                await run_context.sessions.unregister(ref)
+            if not landed:   # unverified, failed or cancelled: the slot goes back
+                self._release_escalation(host)
+
+    def _escalation_lock(self) -> threading.Lock:
+        # On the instance, not the counts dict (tests replace that dict).
+        return self.__dict__.setdefault("_escalation_counts_lock", threading.Lock())
+
+    def _reserve_escalation(self, host: str) -> bool:
+        """ARC-11: take one of `host`'s auto-escalation slots, or False when the
+        cap (engagement_max_escalations) is reached. Check and count are one step."""
+        with self._escalation_lock():
+            used = self._escalation_counts.get(host, 0)
+            if used >= self.engagement_max_escalations:
+                return False
+            self._escalation_counts[host] = used + 1
+            return True
+
+    def _release_escalation(self, host: str) -> None:
+        """ARC-11: give back a reserved slot whose escalation crawled nothing."""
+        with self._escalation_lock():
+            used = self._escalation_counts.get(host, 0)
+            if used > 0:
+                self._escalation_counts[host] = used - 1
 
     async def _credential_grants_access(self, url: str, headers: dict, *,
                                         run_context=None) -> bool:
@@ -710,7 +765,8 @@ class ChainMixin:
         # URL's origin), matching a raw client that just sent it to `url`. I05: it
         # spends the analysis run when there is one; a standalone context otherwise.
         _tt, _owned = transport_for(
-            run_context, allowed_hosts=self.allowed_hosts, config=self.config)
+            run_context, allowed_hosts=self.allowed_hosts, config=self.config,
+            active_mode=True)
         try:
             await global_throttle.acquire()
             cred = await _tt.send_creds("GET", url, capability="credential_probe",
@@ -1120,6 +1176,11 @@ class ChainMixin:
         `protected_paths` and `owners` are the operator's engagement declarations
         (I16): merged into the state after discovery, where the missing-auth (RV-S)
         and ownership (RV-T) confirmations read them. None or empty changes nothing."""
+        # SEC-1: a cloud-suffixed model in any slot, without
+        # ollama.allow_cloud_models, refuses the run here, before any model call.
+        from harness import model_egress
+        model_egress.refuse_cloud_models(
+            self.config, model_egress.agent_models_of(getattr(self, "agent_manager", None)))
         from harness import engagement_builder
         from harness import worklist_investigator
         from harness import chain_linker
@@ -1368,11 +1429,22 @@ class ChainMixin:
                 import harness.engagement as _eng
                 from harness.safety_gate import get_default_gate as _get_gate
                 discovered_paths = [ep.path for ep in rc.endpoints] if rc.endpoints else None
-                feature_caps = await engagement_builder.feature_crawl_captures(
-                    base_url, roles, allowed_hosts=self.allowed_hosts,
-                    submit_forms=_get_gate().config.allow_mutating_replay,
-                    seed_paths=discovered_paths, run_context=run_context, errors=_errors,
-                    **({"per_principal": True} if _per_principal else {}))
+                # ARC-7: the crawl sends only through a run: this one, the enclosing
+                # one, or a standalone one closed here.
+                _fc_run = run_context or _run_context_mod.current_run_context()
+                _fc_owned = None
+                if _fc_run is None:
+                    _fc_owned = _fc_run = _run_context_mod.standalone_context(
+                        self.allowed_hosts, config=self.config, active_mode=True)
+                try:
+                    feature_caps = await engagement_builder.feature_crawl_captures(
+                        base_url, roles, allowed_hosts=self.allowed_hosts,
+                        submit_forms=_get_gate().config.allow_mutating_replay,
+                        seed_paths=discovered_paths, run_context=_fc_run, errors=_errors,
+                        **({"per_principal": True} if _per_principal else {}))
+                finally:
+                    if _fc_owned is not None:
+                        await _fc_owned.aclose()
                 # Make workflow routes and their real request shapes visible to
                 # prioritisation. Content-level model review remains deferred.
                 for ex in feature_caps:
@@ -1588,7 +1660,7 @@ class ChainMixin:
         # review or the drive.
         _cached_validate = _ConfirmationCache(
             run_context, lambda cls, exchange: _rb4_case(cls, exchange).case_id,
-            registry=_exec_registry).validate
+            registry=_exec_registry).confirm
 
         # RB-4/INV-2: this path (worklist_investigator's confirm_fn for agent
         # findings, and its precondition_fn for every shape-driven leg dispatch
@@ -1806,15 +1878,27 @@ class ChainMixin:
                             top = max(authed, key=lambda r: role_crawl._trust(r.role))
                             baseline = {**(baseline or {}), **{
                                 k: v for k, v in top.headers.items() if _credential(k)}}
-                    outcome = await missing_auth_probe.probe(
-                        base_url, (method, path),
-                        allowed_hosts=self.allowed_hosts,
-                        baseline_headers=baseline,
-                        send_garbage_token=False,
-                        expected_protected=declared is not None,
-                        protected_baseline=True,
-                        run_context=run_context,
-                        identity_headers=supplied)
+                    # ARC-7: the probe sends only through a run. This analysis's run
+                    # (or the enclosing one) when there is one, else a standalone one
+                    # that is closed here.
+                    _probe_run = run_context or _run_context_mod.current_run_context()
+                    _probe_owned = None
+                    if _probe_run is None:
+                        _probe_owned = _probe_run = _run_context_mod.standalone_context(
+                            self.allowed_hosts, config=self.config, active_mode=True)
+                    try:
+                        outcome = await missing_auth_probe.probe(
+                            base_url, (method, path),
+                            allowed_hosts=self.allowed_hosts,
+                            baseline_headers=baseline,
+                            send_garbage_token=False,
+                            expected_protected=declared is not None,
+                            protected_baseline=True,
+                            run_context=_probe_run,
+                            identity_headers=supplied)
+                    finally:
+                        if _probe_owned is not None:
+                            await _probe_owned.aclose()
                     if outcome.finding is not None:
                         proof = outcome.finding
                         why = (f" Route declared protected by {declared.describe()}."
@@ -1846,7 +1930,7 @@ class ChainMixin:
                 # Before access control: "cross_identity_write" and friends are
                 # creates this leg reads back and deletes, not object reads.
                 try:
-                    await _apply(finding, await _cached_validate(_wi, _as_finding(finding, "write_integrity"), exchange),
+                    await _apply(finding, await _cached_validate(_wi, _as_finding(finding, "write_integrity"), exchange, routed_class="write_integrity"),
                            "write-integrity", 0.9, exchange)
                 except Exception:
                     return
@@ -1865,7 +1949,7 @@ class ChainMixin:
                     # when present, else a standalone one). send_creds forwards the probe
                     # role's own credentials; max_redirects=0 == follow_redirects=False.
                     _tt, _owned = transport_for(run_context, allowed_hosts=self.allowed_hosts,
-                                                config=self.config)
+                                                config=self.config, active_mode=True)
                     try:
                         await global_throttle.acquire()
                         out = await _tt.send_creds("GET", exchange.url,
@@ -1880,21 +1964,21 @@ class ChainMixin:
                         if _owned is not None:
                             await _owned.aclose()
                 try:
-                    await _apply(finding, await _cached_validate(_xval, _as_finding(finding, "idor"), exchange), "cross-identity", 0.9, exchange)
+                    await _apply(finding, await _cached_validate(_xval, _as_finding(finding, "idor"), exchange, routed_class="idor"), "cross-identity", 0.9, exchange)
                     # Single-principal follow-up: if no second identity confirmed a
                     # cross-identity breach, run the object-id read differential
                     # (own vs foreign vs absent) as the captured principal. It never
                     # confirms (RV-D2), so `_apply` leaves the finding unconfirmed
                     # and keeps only any manual-verification guidance it carries.
                     if not finding.get("confirmed"):
-                        await _apply(finding, await _cached_validate(_idor_read, _as_finding(finding, "idor"), exchange), "idor-read", 0.75, exchange)
+                        await _apply(finding, await _cached_validate(_idor_read, _as_finding(finding, "idor"), exchange, routed_class="idor"), "idor-read", 0.75, exchange)
                 except Exception:
                     return
             elif ("dom" in low and "xss" in low) or "dom_xss" in low or "dom-based" in low or "client-side xss" in low:
                 # DOM-based XSS: fragment-payload browser execution (client-side
                 # source->sink), distinct from server-reflected browser_xss.
                 try:
-                    await _apply(finding, await _cached_validate(_domxss, _as_finding(finding, "dom_xss"), exchange),
+                    await _apply(finding, await _cached_validate(_domxss, _as_finding(finding, "dom_xss"), exchange, routed_class="dom_xss"),
                            "dom-xss", 0.95, exchange)
                 except Exception:
                     return
@@ -1903,26 +1987,26 @@ class ChainMixin:
                 # XSS and (crucially for a JSON API) declines what never reaches an HTML
                 # sink. Skips gracefully if no browser engine is installed.
                 try:
-                    await _apply(finding, await _cached_validate(_bxss, _as_finding(finding, "xss"), exchange), "browser-xss", 0.95, exchange)
+                    await _apply(finding, await _cached_validate(_bxss, _as_finding(finding, "xss"), exchange, routed_class="xss"), "browser-xss", 0.95, exchange)
                     # reflected browser_xss handles GET reflections; a write-shaped
                     # exchange may instead be a STORED-XSS plant point -- try that leg too.
                     if not finding.get("confirmed") and (exchange.method or "GET").upper() in ("POST", "PUT", "PATCH"):
-                        await _apply(finding, await _cached_validate(_sxss, _as_finding(finding, "xss"), exchange), "stored-xss", 0.9, exchange)
+                        await _apply(finding, await _cached_validate(_sxss, _as_finding(finding, "xss"), exchange, routed_class="xss"), "stored-xss", 0.9, exchange)
                 except Exception:
                     return
             elif "jwt" in low or "algorithm confusion" in low or "algorithm_confusion" in low or "weak_token" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_jwt, _as_finding(finding, "jwt"), exchange), "jwt-forge", 0.9, exchange)
+                    await _apply(finding, await _cached_validate(_jwt, _as_finding(finding, "jwt"), exchange, routed_class="jwt"), "jwt-forge", 0.9, exchange)
                 except Exception:
                     return
             elif "ssrf" in low or "server-side request" in low or "server_side_request" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_ssrf, _as_finding(finding, "ssrf"), exchange), "ssrf", 0.95, exchange)
+                    await _apply(finding, await _cached_validate(_ssrf, _as_finding(finding, "ssrf"), exchange, routed_class="ssrf"), "ssrf", 0.95, exchange)
                 except Exception:
                     return
             elif "xxe" in low or "xml external" in low or "xml_external" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_xxe, _as_finding(finding, "xxe"), exchange), "xxe", 0.95, exchange)
+                    await _apply(finding, await _cached_validate(_xxe, _as_finding(finding, "xxe"), exchange, routed_class="xxe"), "xxe", 0.95, exchange)
                 except Exception:
                     return
             elif ("sqli" in low or "sql injection" in low
@@ -1932,44 +2016,46 @@ class ChainMixin:
                 try:
                     await _apply(
                         finding,
-                        await _cached_validate(_sqlmap, _as_finding(finding, "sqli"), exchange),
+                        await _cached_validate(_sqlmap, _as_finding(finding, "sqli"), exchange, routed_class="sqli"),
                         "sqlmap", 0.95, exchange)
                 except Exception:
                     return
             elif "nosql" in low or "mongodb injection" in low or "mongo injection" in low:
                 try:
                     await _apply(finding, await _cached_validate(
-                        _nosql, _as_finding(finding, "nosql"), exchange),
+                        _nosql, _as_finding(finding, "nosql"), exchange,
+                        routed_class="nosql"),
                         "nosql", 0.95, exchange)
                 except Exception:
                     return
             elif "race_condition" in low or "race condition" in low:
                 try:
                     await _apply(finding, await _cached_validate(
-                        _race, _as_finding(finding, "race_condition"), exchange),
+                        _race, _as_finding(finding, "race_condition"), exchange,
+                        routed_class="race_condition"),
                         "race-condition", 0.95, exchange)
                 except Exception:
                     return
             elif "command" in low or low in ("rce", "remote code execution", "code injection", "shell injection"):
                 try:
-                    await _apply(finding, await _cached_validate(_cmdi, _as_finding(finding, "command_injection"), exchange),
+                    await _apply(finding, await _cached_validate(_cmdi, _as_finding(finding, "command_injection"), exchange, routed_class="command_injection"),
                            "command-injection", 0.95, exchange)
                 except Exception:
                     return
             elif "ssti" in low or "template injection" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_ssti, _as_finding(finding, "ssti"), exchange), "ssti", 0.95, exchange)
+                    await _apply(finding, await _cached_validate(_ssti, _as_finding(finding, "ssti"), exchange, routed_class="ssti"), "ssti", 0.95, exchange)
                 except Exception:
                     return
             elif "traversal" in low or "lfi" in low or "file inclusion" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_path, _as_finding(finding, "path_traversal"), exchange),
+                    await _apply(finding, await _cached_validate(_path, _as_finding(finding, "path_traversal"), exchange, routed_class="path_traversal"),
                            "path-traversal", 0.95, exchange)
                 except Exception:
                     return
             elif "redirect" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_redir, _as_finding(finding, "open_redirect"), exchange),
+                    await _apply(finding, await _cached_validate(_redir, _as_finding(finding, "open_redirect"), exchange, routed_class="open_redirect"),
                            "open-redirect", 0.9, exchange)
                 except Exception:
                     return
@@ -1979,19 +2065,19 @@ class ChainMixin:
                 # TOCTOU privilege-escalation race: concurrent check-then-write.
                 # Must precede the mass/privilege->sequence branch below.
                 try:
-                    await _apply(finding, await _cached_validate(_toctou, _as_finding(finding, "toctou"), exchange),
+                    await _apply(finding, await _cached_validate(_toctou, _as_finding(finding, "toctou"), exchange, routed_class="toctou"),
                            "toctou", 0.85, exchange)
                 except Exception:
                     return
             elif "mass" in low or "assignment" in low or "privilege" in low or low in ("api_security", "api security"):
                 try:
-                    await _apply(finding, await _cached_validate(_seq, _as_finding(finding, "mass_assignment"), exchange),
+                    await _apply(finding, await _cached_validate(_seq, _as_finding(finding, "mass_assignment"), exchange, routed_class="mass_assignment"),
                            "sequence", 0.9, exchange)
                 except Exception:
                     return
             elif "deserial" in low or "pickle" in low or "object injection" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_deser, _as_finding(finding, "deserialization"), exchange),
+                    await _apply(finding, await _cached_validate(_deser, _as_finding(finding, "deserialization"), exchange, routed_class="deserialization"),
                            "deserialization", 0.95, exchange)
                 except Exception:
                     return
@@ -2008,34 +2094,35 @@ class ChainMixin:
                     _record_no_applicable_leg(finding, "auth-sequence", _gap)
                     return
                 try:
-                    await _apply(finding, await _cached_validate(_auth, _as_finding(finding, low or "broken_authentication"), exchange),
+                    await _apply(finding, await _cached_validate(_auth, _as_finding(finding, low or "broken_authentication"), exchange, routed_class=low or "broken_authentication"),
                            "auth-sequence", 0.85, exchange)
                 except Exception:
                     return
             elif ("client_trust" in low or "business" in low or "client-side" in low or "price" in low
                   or "excessive trust" in low or "logic_flaw" in low):
                 try:
-                    await _apply(finding, await _cached_validate(_ct, _as_finding(finding, "business_logic"), exchange),
+                    await _apply(finding, await _cached_validate(_ct, _as_finding(finding, "business_logic"), exchange, routed_class="business_logic"),
                            "client-trust", 0.9, exchange)
                 except Exception:
                     return
             elif "rate limit" in low or "rate_limit" in low or "lockout" in low or "brute" in low:
                 try:
-                    await _apply(finding, await _cached_validate(_rate, _as_finding(finding, "rate_limit"), exchange),
+                    await _apply(finding, await _cached_validate(_rate, _as_finding(finding, "rate_limit"), exchange, routed_class="rate_limit"),
                            "rate-limit", 0.85, exchange)
                 except Exception:
                     return
             elif "csrf" in low or "cross-site request forgery" in low or "cross site request forgery" in low:
                 try:
                     await _apply(finding, await _cached_validate(
-                        _csrf, _as_finding(finding, "csrf"), exchange),
+                        _csrf, _as_finding(finding, "csrf"), exchange,
+                        routed_class="csrf"),
                         "csrf", 0.95, exchange)
                 except Exception:
                     return
             elif ("reset_token" in low or "reset token" in low or "predictable token" in low
                   or "weak token" in low or "token entropy" in low):
                 try:
-                    await _apply(finding, await _cached_validate(_reset, _as_finding(finding, "reset_token"), exchange),
+                    await _apply(finding, await _cached_validate(_reset, _as_finding(finding, "reset_token"), exchange, routed_class="reset_token"),
                            "reset-token", 0.9, exchange)
                 except Exception:
                     return
@@ -2864,9 +2951,12 @@ class ChainMixin:
                         leg_finding = leg_finding.model_copy(update={
                             "parameter_location": REQUEST_LEVEL_INPUTS[check.confirmation],
                             "parameter_name": "", "parameter_only": True})
+                    # EFF-2: the catalog chose this leg for the check's class, so only
+                    # the result itself (an observation) can say it proved another.
                     res = await _cached_validate(
                         validator, leg_finding, ex,
-                        case_ref=leg_case.case_id if leg_case is not None else "")
+                        case_ref=leg_case.case_id if leg_case is not None else "",
+                        routed_class=capability["finding_class"], catalog_bound=True)
                     source = (node.get("capture") or {}).get("substituted_from")
                     if source and res is not None:
                         # R11-10: the cell, the proof and the finding all say whose

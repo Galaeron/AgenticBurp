@@ -1,3 +1,10 @@
 # Hash-pinned wordlists (tools/ffuf-seclists.lock.json): byte-exact, never EOL-converted.
 tools/seclists/** -text
 tools/ffuf-wordlist-seclists.txt -text
+
+# OPS-2: the Gradle wrapper scripts must keep their native line endings on every
+# checkout (CRLF in gradlew breaks "#!/bin/sh"; LF in gradlew.bat is tolerated
+# but kept CRLF by convention). The wrapper jar is binary.
+burp-extension/gradlew text eol=lf
+burp-extension/gradlew.bat text eol=crlf
+burp-extension/gradle/wrapper/gradle-wrapper.jar binary

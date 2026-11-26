@@ -22,6 +22,7 @@ P8  store: additive versioned side table, legacy DB unchanged, rollback, version
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import shutil
 import sqlite3
@@ -200,7 +201,9 @@ class SavedDeclarationsReachTheChainTests(rvs._ChainCase, unittest.TestCase):  #
         self.server = fx.server
         self.server.orchestrator.allowed_hosts = ["captured.example"]
         self.server.orchestrator.config = self.server.config
-        self.server.orchestrator.validator_registry = SimpleNamespace(active_enabled=False)
+        # ARC-1: /investigate needs the master switch; the bridge below is the only
+        # double, and it runs the chain on RV-S's own loopback.
+        self.server.orchestrator.validator_registry = SimpleNamespace(active_enabled=True)
         self.server.orchestrator.agent_manager.agents = {}
         self.server.config["runs"] = {"output_dir": fx.tmp.name}
         self.client = fx.client
@@ -218,7 +221,12 @@ class SavedDeclarationsReachTheChainTests(rvs._ChainCase, unittest.TestCase):  #
 
         async def bridge(base_url, roles, **kwargs):
             declared = {k: kwargs[k] for k in ("protected_paths", "owners") if k in kwargs}
-            return {"summary": {}, "findings_q3": await asyncio.to_thread(chain, declared)}
+            # The route's run (scoped to captured.example) is ambient here, and
+            # to_thread would copy it into the worker. The double's chain targets
+            # RV-S's loopback, so it runs in a fresh context: the probe's ambient-run
+            # lookup (ARC-7) must not pick up the route's run for another target.
+            return {"summary": {}, "findings_q3": await asyncio.to_thread(
+                contextvars.Context().run, chain, declared)}
         self.server.orchestrator.investigate_engagement = bridge
 
     def _findings(self, **extra) -> list[dict]:
@@ -329,6 +337,8 @@ class DeclarationsStoreMigrationTests(unittest.TestCase):  # P8
                 DROP TABLE plan_dispatch_notes;
                 DROP TABLE proof_evidence_source;
                 DELETE FROM state_metadata WHERE name = 'plan-dispatch-schema';
+                DROP TABLE plane_dispatches;
+                DELETE FROM state_metadata WHERE name = 'plane-dispatch-schema';
             """)
             after = _legacy_identity(conn)
         finally:

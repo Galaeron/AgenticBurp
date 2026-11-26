@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 
 /**
@@ -303,21 +304,43 @@ public class HarnessToolsPanel extends JPanel {
             runAsync(applyModels, out, () -> client.selectModel(req));
         });
 
-        JTextField throttleField = new JTextField("0", 6);
+        // ARC-15: the throttle is sent only when the field holds a new value. Blank,
+        // or the value last loaded/applied, leaves the harness throttle unchanged;
+        // 0 (removing the throttle) is sent only with the explicit confirmation.
+        JTextField throttleField = new JTextField("", 6);
+        AtomicReference<Double> throttleBaseline = new AtomicReference<>();
+        JCheckBox confirmUnlimited = new JCheckBox("Confirm removing the throttle (0 = unlimited)");
         JTextField retriesField = new JTextField("", 4);
         JTextField agentsField = new JTextField("", 4);
         JTextField perVulnField = new JTextField("", 8);
         JButton applySettings = new JButton("Apply settings");
         applySettings.addActionListener(e -> {
-            Double rps = parseDoubleOrNull(throttleField.getText());
+            Double rps = throttleToSend(throttleField.getText(), throttleBaseline.get());
+            boolean confirmed = confirmUnlimited.isSelected();
+            if (rps != null && rps == 0.0 && !confirmed) {
+                out.setText("Throttle 0 removes the request throttle. Tick \"Confirm removing the"
+                        + " throttle\" to apply it. Nothing was sent.");
+                return;
+            }
             Map<String, Object> retry = new HashMap<>();
             putIntIfPresent(retry, "max_retries", retriesField.getText());
             putIntIfPresent(retry, "max_agents", agentsField.getText());
             putIntIfPresent(retry, "max_tokens_per_vuln", perVulnField.getText());
-            runAsync(applySettings, out, () -> client.updateSettings(rps, retry.isEmpty() ? null : retry));
+            confirmUnlimited.setSelected(false);    // the confirmation covers one apply
+            runAsync(applySettings, out, () -> {
+                JsonObject r = client.updateSettings(rps, confirmed, retry.isEmpty() ? null : retry);
+                if (rps != null) throttleBaseline.set(rps);
+                return r;
+            });
         });
         JButton loadSettings = new JButton("Load current settings");
-        loadSettings.addActionListener(e -> runAsync(loadSettings, out, client::getSettings));
+        loadSettings.addActionListener(e -> runAsync(loadSettings, out, () -> {
+            JsonObject s = client.getSettings();
+            Double live = liveThrottle(s);
+            throttleBaseline.set(live);
+            SwingUtilities.invokeLater(() -> throttleField.setText(live == null ? "" : formatRate(live)));
+            return s;
+        }));
 
         JComponent north = form(
                 new JLabel("Model selection (the two dropdowns): coordinator/governor and agent model."),
@@ -326,7 +349,8 @@ public class HarnessToolsPanel extends JPanel {
                 buttonRow(refresh, applyModels),
                 new JSeparator(),
                 new JLabel("Runtime settings: throttle (req/s, 0 = unlimited) and default retry budget."),
-                labeled("Throttle req/s:", throttleField),
+                labeled("Throttle req/s (blank = unchanged):", throttleField),
+                confirmUnlimited,
                 labeled("Retry budget -- max_retries:", retriesField),
                 labeled("max_agents:", agentsField),
                 labeled("max_tokens_per_vuln (0 = none):", perVulnField),
@@ -827,6 +851,28 @@ public class HarnessToolsPanel extends JPanel {
         JPanel p = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
         for (Component b : buttons) p.add(b);
         return p;
+    }
+
+    /** The throttle to send from the panel's field: null (leave the harness
+     * throttle unchanged) when the field is blank, not a number, or equal to
+     * {@code baseline}, the rate last loaded from or applied to the harness. */
+    static Double throttleToSend(String text, Double baseline) {
+        Double rps = parseDoubleOrNull(text);
+        if (rps == null || (baseline != null && rps.doubleValue() == baseline.doubleValue())) return null;
+        return rps;
+    }
+
+    /** The live throttle in a GET /settings reply: 0 when it is off, null when absent. */
+    static Double liveThrottle(JsonObject settings) {
+        if (settings == null || !settings.has("throttle") || !settings.get("throttle").isJsonObject()) return null;
+        JsonObject t = settings.getAsJsonObject("throttle");
+        if (t.has("enabled") && !t.get("enabled").getAsBoolean()) return 0.0;
+        JsonElement rate = t.get("rate_per_second");
+        return rate == null || rate.isJsonNull() ? null : rate.getAsDouble();
+    }
+
+    private static String formatRate(double rate) {
+        return rate == Math.rint(rate) ? Long.toString((long) rate) : Double.toString(rate);
     }
 
     private static Double parseDoubleOrNull(String s) {

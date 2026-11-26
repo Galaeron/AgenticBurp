@@ -375,6 +375,19 @@ class SessionFixationCallerTests(_CallerBase):
         reports, sent = self._reviewer(rotated=True)
         self.assertEqual(sent, ["GET", "POST"])
         self.assertEqual([v.status for v in reports], ["not_confirmed"], _verdicts(reports))
+        # EFF-1: a pre-login id replaced by a successful login is a held control.
+        self.assertEqual(reports[0].control_outcome, "control_held")
+
+    def test_control_no_pre_login_cookie_is_not_a_held_rotation(self):
+        # EFF-1: with no pre-login cookie nothing was rotated, so the negative
+        # carries no held control and cannot refute.
+        async def fake_request(client, method, url, **kwargs):
+            headers = {} if method == "GET" else {"Set-Cookie": "session=authenticated-new; Path=/"}
+            return httpx.Response(200, headers=headers, text="Logged in",
+                                  request=httpx.Request(method, url))
+        reports = self._run(self._login_exchange(), fake_request)
+        self.assertEqual([v.status for v in reports], ["not_confirmed"], _verdicts(reports))
+        self.assertEqual(reports[0].control_outcome, "")
 
     def test_owned_app_that_binds_the_fixed_id_confirms(self):
         app = _LoginApp("fixate")

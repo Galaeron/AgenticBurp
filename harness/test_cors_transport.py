@@ -2,6 +2,9 @@
 import asyncio
 import unittest
 
+import harness.coverage_manifest as cm
+from harness.coverage_evidence_case import EvidenceCase, evidence_for
+from harness.testing_fixtures.leg_fault import bound_test_names, outcomes_with_leg_severed
 from harness.run_context import RunContext
 from harness.test_run_context import _Fixture
 from harness.validators.cors_validator import CorsValidator
@@ -56,7 +59,7 @@ class CorsTransportTests(unittest.TestCase):
 
 
 
-class CorsDecodedResponseTests(unittest.TestCase):
+class CorsDecodedResponseTests(EvidenceCase):
     """Real HTTP -> TargetTransport -> CORS consumer, including failed sends."""
 
     def _run(self, encoding, reflected=True, in_scope=True, conversion_error=False, standalone=False):
@@ -137,6 +140,7 @@ class CorsDecodedResponseTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    @evidence_for(**cm.caller_evidence("cors_confirm"))
     def test_compressed_and_plain_grants_agree(self):
         results = []
         for encoding in ("plain", "gzip", "br"):
@@ -151,14 +155,21 @@ class CorsDecodedResponseTests(unittest.TestCase):
         self.assertEqual(len(results), 3)
         self.assertEqual(results[0], results[1])
         self.assertEqual(results[0], results[2])
+        self.record_observation({"statuses": [r[0] for r in results]})
 
+    @evidence_for(**cm.caller_evidence("cors_control"))
     def test_compressed_and_plain_secure_controls_agree(self):
+        statuses = []
         for encoding in ("plain", "gzip", "br"):
             with self.subTest(encoding=encoding):
                 result, events, received, _ = self._run(encoding, reflected=False)
+                # A secure-control verdict is only evidence if the probe reached the fixture.
+                self.assertTrue(received, "the CORS probe never reached the fixture")
                 self.assertEqual(result.status, "safe", result.summary)
                 self.assertFalse(result.confirmed)
                 self.assertEqual(events, ["ok"] * len(received))
+                statuses.append(result.status)
+        self.record_observation({"statuses": statuses})
 
     def test_malformed_encoding_is_incomplete(self):
         result, events, received, _ = self._run("malformed")
@@ -193,6 +204,15 @@ class CorsDecodedResponseTests(unittest.TestCase):
         self.assertEqual(result.status, "safe")
         self.assertFalse(result.confirmed)
         self.assertEqual(events, ["ok"] * len(received))
+
+    # --- Fault injection: a bound aspect must notice a disconnected leg ---------
+    def test_bound_aspects_fail_when_the_leg_is_disconnected(self):
+        names = bound_test_names(type(self))
+        self.assertEqual(len(names), 2, f"bound tests went missing: {names}")
+        for name, outcome in outcomes_with_leg_severed(type(self), names).items():
+            with self.subTest(test=name):
+                self.assertNotEqual(outcome, "passed",
+                                    f"{name} still passes with the leg disconnected: not evidence")
 
 
 if __name__ == "__main__":

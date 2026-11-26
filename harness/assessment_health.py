@@ -321,9 +321,26 @@ def stored_proof_artifacts_resolve(proof):
 # Batch 08: mechanisms whose proven flaw is a host trust policy, not a route: the same
 # policy fingerprint on several routes is one issue with several locations. AR-08b:
 # one set, shared with the report path's issue key (issues.py).
-from harness.issues import ROUTE_INDEPENDENT_MECHANISMS, issue_class  # noqa: E402
+from harness.issues import (ISSUE_UNITS, ROUTE_INDEPENDENT_MECHANISMS, issue_class,  # noqa: E402
+                            root_cause_id_for, root_cause_key)
 from harness.evidence import is_tool_reported  # noqa: E402
 _ORPHAN_REASONS = {'proof not found for case', 'proof belongs to another run', 'proof belongs to another case'}
+
+
+_ROOT_CAUSE_KINDS = ('vulnerability', 'hardening', 'reconnaissance', 'candidate', 'tool_reported')
+
+
+def _root_cause_id(finding, proof, case, validator):
+    """The root-cause id of one confirmed proof instance, or None for a chain
+    hypothesis: the finding as its proof decided it (mechanism, observed result,
+    and the case's principal and input win over the finding's own fields)."""
+    view = dict(finding, confirmed=True, validator=validator,
+                proof_observed_result=proof.get('observed_result') or '')
+    for key in ('principal_id', 'parameter_location', 'parameter_name'):
+        if case.get(key):
+            view[key] = case[key]
+    key = root_cause_key(view)
+    return root_cause_id_for(key) if key is not None else None
 
 
 def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(), artifact_resolver=None):
@@ -463,12 +480,22 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
             group['proof_ids'].append(proof_id)
             group['case_ids'] = sorted(set([*group['case_ids'], case['case_id']]))
             group['routes'] = sorted(set([*group['routes'], instance['route']]))
+            # EFF-3: the root cause this instance shows (issues.root_cause_key), read
+            # from what its mechanism proved on the case's input and principal. An
+            # explicit root_cause_id on the finding stays the operator's decision.
+            rc_id = finding.get('root_cause_id') or _root_cause_id(finding, proof, case, validator)
+            if rc_id:
+                instance['root_cause_id'] = rc_id
+                group['root_cause_ids'] = sorted({*group.get('root_cause_ids', ()), rc_id})
             if kind == 'candidate':
                 candidate_cases.add(case_key(case))
                 instance['limitation'] = 'legacy, missing controls or unresolved exchange artifacts'
         instances.append(instance)
     counts = {kind: sum(g['kind'] == kind for g in groups.values())
               for kind in ('vulnerability', 'hardening', 'reconnaissance')}
+    root_causes = {kind: set() for kind in _ROOT_CAUSE_KINDS}
+    for group in groups.values():
+        root_causes[group['kind']].update(group.get('root_cause_ids', ()))
     ledger_confirmed = [p for p in instances if p['verdict'] == 'confirmed' and p['kind'] != 'tool_reported']
     orphans = [dict(e, repair='re-link the finding to a stored proof of this case and run, or re-run '
                               'its check; the link is not shown as proof') for e in excluded
@@ -476,8 +503,12 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
     attempts = ({'run_id': list(run_id)[-1], 'attempt_run_ids': list(run_id)} if several
                 else {'run_id': next(iter(runs))})
     return {'schema_version': 1, **attempts,
-            'units': {'confirmed_issues': 'unique proof-bound cases (compatibility count)',
-                      'vulnerabilities': 'distinct structured, artifact-resolved vulnerability groups',
+            'units': {'confirmed_issues': 'proof-bound cases, each case counted once (compatibility count, '
+                                          'not vulnerabilities)',
+                      'vulnerabilities': 'structured, artifact-resolved vulnerability groups: one per proof-bound '
+                                         'case and boundary, not per root cause (see vulnerability_root_causes)',
+                      'root_causes': '<kind>_root_causes: ' + ISSUE_UNITS['root_causes'] + ', over the groups '
+                                     'of that kind; a root cause proven under two kinds counts under each',
                       'observations': 'presentation groups retaining route/principal proof instances',
                       'tool_reported': 'cases whose only proof is an external tool detection the harness '
                                        'did not reproduce (neither confirmed nor a generic candidate)'},
@@ -485,6 +516,7 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
                        'ledger_confirmed_proof_instances': len(ledger_confirmed),
                        'unreferenced_confirmed_proof_instances': sum(not p['referenced'] for p in ledger_confirmed),
                        'vulnerabilities': counts['vulnerability'],
+                       **{f'{kind}_root_causes': len(root_causes[kind]) for kind in _ROOT_CAUSE_KINDS},
                        'hardening_observations': counts['hardening'],
                        'reconnaissance': counts['reconnaissance'],
                        'candidate_cases': len(candidate_cases - tool_reported_cases),
@@ -498,3 +530,22 @@ def confirmed_issue_accounting(findings, run_id, proof_lookup, *, run_proofs=(),
             'orphaned_proof_links': orphans,
             'limitations': ['Presentation grouping is not proof of a shared root cause.',
                            'Legacy confirmations are retained; they do not count as resolved vulnerabilities.']}
+
+
+# EFF-3: r11's headline read "117 unique proof-backed vulnerabilities" from
+# confirmed_vulnerabilities, which counts one group per proof-bound case: r11 had about
+# 16-18 root causes. A run result and its manifest carry both counts, each with its unit.
+VULNERABILITY_COUNT_UNITS = {'confirmed_vulnerabilities': 'proof_bound_vulnerability_groups',
+                             'confirmed_vulnerability_root_causes': 'root_causes'}
+
+
+def headline_counts(accounting) -> dict:
+    """The run-level vulnerability counts of an issue accounting, each beside its unit
+    (VULNERABILITY_COUNT_UNITS): the per-case groups runs have always reported and the
+    root causes those groups show (issues.root_cause_key). None when unknown."""
+    counts = (accounting or {}).get('counts') or {}
+    return {'confirmed_vulnerabilities': counts.get('vulnerabilities'),
+            'confirmed_vulnerabilities_unit': VULNERABILITY_COUNT_UNITS['confirmed_vulnerabilities'],
+            'confirmed_vulnerability_root_causes': counts.get('vulnerability_root_causes'),
+            'confirmed_vulnerability_root_causes_unit':
+                VULNERABILITY_COUNT_UNITS['confirmed_vulnerability_root_causes']}

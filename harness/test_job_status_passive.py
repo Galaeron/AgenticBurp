@@ -24,7 +24,9 @@ class DurableJobCallerTests(unittest.TestCase):
         self.server = self.fixture.server
         self.server.orchestrator.allowed_hosts = ['captured.example']
         self.server.orchestrator.config = self.server.config
-        self.server.orchestrator.validator_registry = SimpleNamespace(active_enabled=False)
+        # ARC-1: /investigate is an active-traffic route, so admission needs the master
+        # switch; the stubbed investigation and the I/O guards below keep the jobs inert.
+        self.server.orchestrator.validator_registry = SimpleNamespace(active_enabled=True)
         self.server.orchestrator.agent_manager.agents = {}
         self.server.config['runs'] = {'output_dir': self.fixture.tmp.name}
         self.client = self.fixture.client

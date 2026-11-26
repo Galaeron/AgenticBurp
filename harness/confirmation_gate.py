@@ -375,13 +375,67 @@ def lifecycle_state(confirmed: bool, review_verdict: str | None = "") -> str:
 
 def finding_lifecycle_state(finding) -> str:
     """lifecycle_state for a Finding object or a finding dict."""
-    if isinstance(finding, dict):
-        confirmed = bool(finding.get("confirmed", False))
-        verdict = finding.get("review_verdict", "") or ""
-    else:
-        confirmed = bool(getattr(finding, "confirmed", False))
-        verdict = getattr(finding, "review_verdict", "") or ""
+    confirmed, verdict = _confirmed_and_verdict(finding)
     return lifecycle_state(confirmed, verdict)
+
+
+def _confirmed_and_verdict(finding) -> tuple[bool, str]:
+    if isinstance(finding, dict):
+        return bool(finding.get("confirmed", False)), finding.get("review_verdict", "") or ""
+    return bool(getattr(finding, "confirmed", False)), getattr(finding, "review_verdict", "") or ""
+
+
+# EFF-5: LEAD covers findings a check REFUTED and findings no leg TESTED (a live
+# leg exists for the class but none ran a held negative for this case). They are
+# not the same thing to an analyst, so every count and badge splits LEAD by this
+# reason; the LEAD state value itself is unchanged for API compatibility.
+LEAD_REFUTED = "refuted"          # a held negative control said no
+LEAD_UNTESTED = "untested"        # no leg ran a held negative for this case
+LEAD_REJECTED = "rejected"        # cross-identity reject cap or critique rejection
+LEAD_ENVIRONMENT = "environment"  # a fact of the test deployment, a hardening item
+LEAD_REASONS = (LEAD_REFUTED, LEAD_UNTESTED, LEAD_REJECTED, LEAD_ENVIRONMENT)
+_LEAD_REASON_BY_VERDICT = {
+    "unconfirmed_hypothesis": LEAD_REFUTED,
+    "inconclusive_unverified": LEAD_UNTESTED,
+    "downgraded": LEAD_REJECTED,
+    "rejected": LEAD_REJECTED,
+    "environment_observation": LEAD_ENVIRONMENT,
+}
+
+
+def lead_reason(confirmed: bool, review_verdict: str | None = "") -> str:
+    """Why a finding is LEAD (one of LEAD_REASONS); "" for CONFIRMED / SUSPECTED."""
+    if lifecycle_state(confirmed, review_verdict) != STATE_LEAD:
+        return ""
+    return _LEAD_REASON_BY_VERDICT[(review_verdict or "").lower()]
+
+
+def finding_lead_reason(finding) -> str:
+    """lead_reason for a Finding object or a finding dict."""
+    return lead_reason(*_confirmed_and_verdict(finding))
+
+
+def lifecycle_counts(findings) -> dict:
+    """Lifecycle totals with LEAD split by reason (EFF-5): {"CONFIRMED": n,
+    "SUSPECTED": n, "LEAD": n, "lead_by_reason": {reason: n for LEAD_REASONS}}.
+    A finding dict that already carries `lifecycle_state` / `lead_reason` (the
+    findings API, where an unresolved proof clears `confirmed`) is counted as it
+    reads; otherwise both are derived."""
+    counts = {STATE_CONFIRMED: 0, STATE_SUSPECTED: 0, STATE_LEAD: 0,
+              "lead_by_reason": {reason: 0 for reason in LEAD_REASONS}}
+    for finding in findings or []:
+        given = finding.get("lifecycle_state") if isinstance(finding, dict) else None
+        state = given if given in (STATE_CONFIRMED, STATE_SUSPECTED, STATE_LEAD) \
+            else finding_lifecycle_state(finding)
+        counts[state] += 1
+        if state == STATE_LEAD:
+            given_reason = finding.get("lead_reason") if isinstance(finding, dict) else None
+            reason = given_reason or _LEAD_REASON_BY_VERDICT.get(
+                _confirmed_and_verdict(finding)[1].lower(), "")
+            # A LEAD with no known reason had no held negative on record: untested,
+            # so the split always sums to the LEAD total.
+            counts["lead_by_reason"][reason if reason in LEAD_REASONS else LEAD_UNTESTED] += 1
+    return counts
 
 
 def finding_triage(finding) -> dict[str, str]:
@@ -663,9 +717,12 @@ def _controlled_negative_classes(validation_reports: list | None) -> set:
 
 def _controlled_negatives(validation_reports: list | None) -> dict:
     """Case-aware collector (FR-5/F09) of controlled NEGATIVEs: validators that
-    actually ran and returned `not_confirmed` (R08) -- as opposed to a leg that
-    never produced a verdict (skipped / error / disabled / absent), which is NOT
-    evidence of a false positive and must not be labelled as one.
+    actually ran, returned `not_confirmed` (R08) AND observed their control hold
+    (EFF-1: `control_outcome == "control_held"`) -- as opposed to a leg that
+    never produced a verdict (skipped / error / disabled / absent), or one that
+    returned `not_confirmed` with no held control (an empty outcome, a failed
+    control, a tool that did not run). Neither is evidence of a false positive,
+    so neither may be labelled as one: the finding stays UNVERIFIED.
 
     Returns {canonical_class: {(parameter_or_empty, principal_or_empty), ...}}.
     A negative whose `ValidationReport.parameter` is empty (the pre-FR-5
@@ -683,12 +740,12 @@ def _controlled_negatives(validation_reports: list | None) -> dict:
     so a negative recorded for one principal cannot be used to refute a
     finding discovered under a different, resolved principal."""
     from harness.categories import canonicalize
+    from harness.control_outcome import is_controlled_negative
     neg: dict = {}
     for vr in validation_reports or []:
-        status = (getattr(vr, "status", "") or "").lower()
-        confirmed = bool(getattr(vr, "confirmed", False))
-        outcome = (getattr(vr, "control_outcome", "") or "").lower()
-        if status == "not_confirmed" and not confirmed and outcome in ("", "control_held"):
+        if is_controlled_negative(getattr(vr, "status", ""),
+                                  bool(getattr(vr, "confirmed", False)),
+                                  getattr(vr, "control_outcome", "")):
             fc = getattr(vr, "finding_class", "") or ""
             fc_canon = canonicalize(fc) or fc.lower()
             param = getattr(vr, "parameter", "") or ""
@@ -745,7 +802,9 @@ def apply_confirmation_suppression(
     - REFUTED  (live-verified leg AND a real controlled negative for the SAME CASE
       in `validation_reports`): the leg actually ran against this finding's own
       parameter (or a class-level/parameter-less negative -- backward compat for
-      non-parameter-scoped checks) and said no -> likely false positive.
+      non-parameter-scoped checks), said no, AND reported its control held
+      (EFF-1: `control_outcome == "control_held"`) -> likely false positive.
+      A `not_confirmed` with an empty / failed / not-run control is UNVERIFIED.
       severity -> "low", confidence <= 0.35, verdict "unconfirmed_hypothesis",
       prefix "[Hypothesis]". FR-5 (F09): a controlled negative recorded against a
       DIFFERENT parameter of the same class does NOT refute this finding.

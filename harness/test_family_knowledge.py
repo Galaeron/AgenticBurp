@@ -47,8 +47,11 @@ class RecordingStubOllama:
 
 
 def _config(routing_mode: str) -> dict:
+    # TOK-4: a configured window, as a deployment whose model server reports one.
+    # Without it the prompt is fitted to the 4096-token unknown-window fallback,
+    # which elides methodology notes first, and these are tests of the notes.
     return {
-        "ollama": {"base_url": "http://localhost:11434"},
+        "ollama": {"base_url": "http://localhost:11434", "num_ctx": 32768},
         "coordinator": {"model": "stub-model", "routing_mode": routing_mode},
         "agent_defaults": {"model": "stub-model", "temperature": 0.1},
         "agents": {},

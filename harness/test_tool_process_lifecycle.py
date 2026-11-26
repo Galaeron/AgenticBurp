@@ -408,6 +408,12 @@ class JobCancelLifecycleTests(_ToolFixture, unittest.TestCase):
         self.server.config["runs"] = {"output_dir": self._jobdir.name,
                                       "cache_namespace": "i05c-isolated"}
         self.server.orchestrator.allowed_hosts = ["shop.test"]
+        # ARC-1: /investigate needs the master switch; the stubbed investigation runs
+        # only the fake sqlmap binary, so nothing reaches shop.test.
+        registry = self.server.orchestrator.validator_registry
+        was_active = registry.active_enabled
+        registry.set_active_enabled(True)
+        self.addCleanup(registry.set_active_enabled, was_active)
         from fastapi.testclient import TestClient
         # One event loop for every request: outside the context manager each request
         # runs on its own loop, whose teardown cancels the job's background task.

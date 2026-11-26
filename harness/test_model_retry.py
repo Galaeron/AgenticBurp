@@ -53,8 +53,18 @@ class Wire:
     def __init__(self, *steps):
         self.steps = list(steps)
         self.calls = 0
+        self.preflight = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        # TOK-4: the context-window preflight (GET /api/ps, POST /api/show) is not a
+        # model call. It is answered as "not loaded, size unknown" and consumes no
+        # step, so each scripted step still answers the chat call it was written for.
+        if request.url.path == "/api/ps":
+            self.preflight += 1
+            return httpx.Response(200, json={"models": []})
+        if request.url.path == "/api/show":
+            self.preflight += 1
+            return httpx.Response(404, json={"error": "model not found"})
         step = self.steps[min(self.calls, len(self.steps) - 1)]
         self.calls += 1
         if callable(step):
@@ -795,6 +805,7 @@ class EscalationModelThroughTheServerTests(unittest.TestCase):
         self.chat = AsyncMock(return_value={"payload": "<svg/onload=__CANARY__>", "rationale": "r"})
         self.server.orchestrator.ollama = SimpleNamespace(chat_json=self.chat)
         self.server.orchestrator.config = {"coordinator": {"model": "qwen-selected:7b"}}
+        self.server.orchestrator.validator_registry = SimpleNamespace(active_enabled=False)
 
     def _walk_a_lineage_to_escalation(self):
         from harness.test_active_verification import _make_plan
@@ -802,10 +813,15 @@ class EscalationModelThroughTheServerTests(unittest.TestCase):
         store.persist_retry_plan(plan)
         plan_id, body = plan.id, None
         for _ in range(3):  # 2 curated retries, then the escalation
+            # ARC-4: each run of a plan (the retries are new plans) is dispatched first.
+            dispatch = self.client.post(f"/test-plans/{plan_id}/dispatch",
+                                        json={"source_exchange_hash": "hash-abc"})
+            self.assertEqual(dispatch.status_code, 200, dispatch.text)
             reply = self.client.post("/validation-results", json={
                 "plan_id": plan_id, "status": "not_confirmed", "confirmed": False,
                 "executor": "burp:reflection_context_validation",
-                "source_exchange_hash": "hash-abc", "context_tags": []})
+                "source_exchange_hash": "hash-abc", "context_tags": [],
+                "dispatch_nonce": dispatch.json()["dispatch_nonce"]})
             self.assertEqual(reply.status_code, 200, reply.text)
             body = reply.json()
             self.assertIn("next_plan", body, body)

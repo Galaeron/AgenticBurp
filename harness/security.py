@@ -7,12 +7,15 @@ consistently applied across all prompt-construction code paths.
 """
 from __future__ import annotations
 import base64
+import hashlib
 import json
 import logging
 import re
 import os
 import subprocess
 import tempfile
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, unquote_plus, quote
 
@@ -416,14 +419,16 @@ def sanitize_text(text, *, known_values=()):
         if brace < 0:
             break
         try:
-            parsed, length = decoder.raw_decode(result[brace:])
+            # raw_decode(text, idx) parses in place: slicing result[brace:] copied the
+            # whole remainder once per brace, O(n * braces) on a script or style body.
+            parsed, end = decoder.raw_decode(result, brace)
         except ValueError:
             offset = brace + 1
             continue
         clean = sanitize_data(parsed, _keep_metrics=False)
         if clean != parsed:
-            replacements.append((brace, brace + length, json.dumps(clean)))
-        offset = brace + length
+            replacements.append((brace, end, json.dumps(clean)))
+        offset = end
     for start, end, clean in reversed(replacements):
         result = result[:start] + clean + result[end:]
     result = _TEXT_URL_RE.sub(lambda match: redact_secrets_in_url(match.group()), result)
@@ -465,16 +470,68 @@ def sanitize_data(value, *, known_values=(), _keep_metrics=True):
     return sanitize_text(value, known_values=known_values) if isinstance(value, str) else value
 
 
+# TOK-6: one sanitised view per exchange. One exchange is routed to several agents
+# (and the coordinator), and each used to sanitise the same bodies again from scratch;
+# sanitising a large body dominates the cost of building a prompt. The view is a pure
+# function of the exchange's text and of the redaction policy, so it is cached by a
+# hash of that content (not by object identity: a mutated or re-parsed copy of the same
+# exchange still hits, and an edited one never does) plus the secret-name sets the
+# redactors read, so a changed policy cannot be served a stale view.
+_VIEW_CACHE_SIZE = 16
+_view_cache: "OrderedDict[tuple, object]" = OrderedDict()
+_view_cache_lock = threading.Lock()
+
+
+def exchange_fingerprint(exchange) -> str:
+    """Content hash of everything the sanitised prompt view reads from `exchange`."""
+    payload = json.dumps([exchange.url, exchange.request_headers, exchange.response_headers,
+                          exchange.request_body, exchange.response_body, exchange.analyst_note],
+                         sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def cached_exchange_view(namespace: str, exchange, build):
+    """`build()` once per (namespace, exchange content, redaction policy); later calls
+    for the same content return that value. The value is shared: callers treat it as
+    read-only. Bounded to the most recent _VIEW_CACHE_SIZE views."""
+    key = (namespace, exchange_fingerprint(exchange),
+           frozenset(SECRET_FIELD_NAMES), frozenset(SECRET_HEADER_NAMES))
+    with _view_cache_lock:
+        if key in _view_cache:
+            _view_cache.move_to_end(key)
+            return _view_cache[key]
+    value = build()
+    with _view_cache_lock:
+        _view_cache[key] = value
+        _view_cache.move_to_end(key)
+        while len(_view_cache) > _VIEW_CACHE_SIZE:
+            _view_cache.popitem(last=False)
+    return value
+
+
+def clear_exchange_views() -> None:
+    """Drop every cached view (tests)."""
+    with _view_cache_lock:
+        _view_cache.clear()
+
+
 def sanitized_exchange(exchange):
-    """A prompt-only copy of captured traffic, retaining method/status/shape."""
-    return exchange.model_copy(update={
-        "url": redact_secrets_in_url(exchange.url),
-        "request_headers": redact_headers(exchange.request_headers),
-        "response_headers": redact_headers(exchange.response_headers),
-        "request_body": sanitize_text(exchange.request_body),
-        "response_body": sanitize_text(exchange.response_body),
-        "analyst_note": sanitize_text(exchange.analyst_note),
-    })
+    """A prompt-only copy of captured traffic, retaining method/status/shape.
+
+    The redaction is computed once per exchange content (see cached_exchange_view);
+    each call still returns its own copy of `exchange` with the cached fields."""
+    def build():
+        return {
+            "url": redact_secrets_in_url(exchange.url),
+            "request_headers": redact_headers(exchange.request_headers),
+            "response_headers": redact_headers(exchange.response_headers),
+            "request_body": sanitize_text(exchange.request_body),
+            "response_body": sanitize_text(exchange.response_body),
+            "analyst_note": sanitize_text(exchange.analyst_note),
+        }
+    fields = cached_exchange_view("sanitized_exchange", exchange, build)
+    return exchange.model_copy(update={k: (dict(v) if isinstance(v, dict) else v)
+                                       for k, v in fields.items()})
 
 
 def sanitize_for_inference(system_prompt, user_prompt):

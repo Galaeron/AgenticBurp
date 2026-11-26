@@ -2,7 +2,7 @@
 Report Generator
 
 Turns confirmed and unconfirmed findings for a host into a submission
--ready Markdown report: title, severity, confidence/status, affected
+-ready Markdown report: title, status/evidence tier, severity, affected
 endpoint, evidence, reproduction steps, generic remediation guidance,
 and a clearly-separated "Potential Attack Chains" section for anything
 chaining.py produced.
@@ -129,6 +129,8 @@ class ReportFinding:
     issue_id: str = ""
     # W-7: explicit CONFIRMED/SUSPECTED/LEAD state (from confirmation_gate).
     lifecycle_state: str = "SUSPECTED"
+    # EFF-5: why a LEAD is LEAD (confirmation_gate.LEAD_REASONS); "" otherwise.
+    lead_reason: str = ""
     # Oracle-verification axis (precision items #1/#2): "verified" only when the
     # oracle reproduced the finding N-of-N with a clean negative control; else
     # "candidate". Orthogonal to lifecycle_state -- a CONFIRMED finding (a leg
@@ -178,7 +180,9 @@ def _from_store_dict(d: dict) -> ReportFinding:
     from harness import issues
     from harness.confirmation_gate import leg_tier
     vc = d.get("vulnerability_class", "")
-    from harness.confirmation_gate import finding_triage
+    from harness.confirmation_gate import (
+        STATE_LEAD, finding_lead_reason, finding_lifecycle_state, finding_triage)
+    state = d.get("lifecycle_state") or finding_lifecycle_state(d)
     return ReportFinding(
         url=d.get("url", ""),
         vulnerability_class=vc,
@@ -198,9 +202,9 @@ def _from_store_dict(d: dict) -> ReportFinding:
         parameter_name=d.get("parameter_name", "") or "",
         issue_id=("" if vc.startswith("potential-attack-chain:")
                   else issues.issue_id_for(issues.issue_key(d))),
-        lifecycle_state=d.get("lifecycle_state")
-        or __import__("harness.confirmation_gate",
-                      fromlist=["finding_lifecycle_state"]).finding_lifecycle_state(d),
+        lifecycle_state=state,
+        lead_reason=((d.get("lead_reason") or finding_lead_reason(d))
+                     if state == STATE_LEAD else ""),
         is_observation=(leg_tier(vc) == "none"),
         verification_state=__import__("harness.oracle_framework",
                       fromlist=["derive_verification_state"]).derive_verification_state(d),
@@ -218,14 +222,11 @@ def _from_store_dict(d: dict) -> ReportFinding:
     )
 
 
-def _confidence_label(confidence: float) -> str:
-    if confidence >= 0.85:
-        return "very likely"
-    if confidence >= 0.6:
-        return "likely"
-    if confidence >= 0.35:
-        return "possible"
-    return "speculative"
+def _model_score(confidence: float) -> str:
+    """EFF-4: numeric confidence as text. It is an uncalibrated model score (the
+    larger of the model's value and a fixed per-validator constant), so it is never
+    worded as a probability or a likelihood; the evidence tier is the signal."""
+    return f"{float(confidence):.2f} (uncalibrated, not a probability)"
 
 
 def _basis_note(basis: str) -> str:
@@ -554,6 +555,11 @@ def generate_markdown_report(host: str, findings: list[dict], generated_at: date
     lines.append(f"**{len(confirmed)} confirmed finding(s)**, {_tool_note}"
                  f"**{len(unconfirmed)} unconfirmed finding(s)**, "
                  f"**{len(chains)} potential attack chain(s)**{_leads_note}{_appendix_note}.")
+    lines.append("")
+    lines.append(_lifecycle_line(confirmed + tool_reported + unconfirmed + leads_bucket))
+    lines.append("")
+    lines.append(_units_line([raw for raw, _ in individual_pairs],
+                             [raw for raw, f in individual_pairs if f.confirmed and not f.tool_reported]))
     if collapsed_count:
         lines.append("")
         lines.append(f"*{collapsed_count} duplicate finding(s) were collapsed* -- the same class proven or "
@@ -737,12 +743,50 @@ def _render_scanner_appendix(appendix: list[ReportFinding]) -> list[str]:
 _STATE_BADGE = {
     "CONFIRMED": "✅ CONFIRMED",
     # SUSPECTED: a still-open hypothesis (no leg, or a not-yet-live-verified
-    # leg). LEAD: a reliable check had its shot and it did not hold -- likely a
-    # false positive or unverifiable. Both are unconfirmed, but they are not the
-    # same thing to an analyst deciding what to look at first (W-7).
+    # leg). LEAD: a reliable check had its shot and the finding did not hold --
+    # refuted by a held control, or left untested (EFF-5 splits these). Both are
+    # unconfirmed, but they are not the same thing to an analyst deciding what to
+    # look at first (W-7).
     "SUSPECTED": "❓ SUSPECTED (unconfirmed)",
     "LEAD": "🔻 LEAD (demoted, unconfirmed)",
 }
+# EFF-5: a LEAD reads by its reason -- a refuted finding (a held negative control
+# said no) is not an untested one (no leg ran a held negative for this case).
+_LEAD_BADGE = {
+    "refuted": "🔻 LEAD -- refuted (a held negative control did not reproduce it)",
+    "untested": "🔻 LEAD -- untested (no leg ran a held negative control; not a false-positive verdict)",
+    "rejected": "🔻 LEAD -- rejected on review (cross-identity reject or critique)",
+    "environment": "🔻 LEAD -- environment observation (a fact of the test deployment)",
+}
+_LEAD_REASON_WORDS = (("refuted", "refuted by a held negative control"),
+                      ("untested", "untested -- no leg ran a held negative"),
+                      ("rejected", "rejected on review"),
+                      ("environment", "environment observation(s)"))
+
+
+def _lifecycle_line(findings: "list[ReportFinding]") -> str:
+    """The headline's lifecycle totals, LEAD split by reason (EFF-5)."""
+    from harness.confirmation_gate import lifecycle_counts
+    counts = lifecycle_counts([{"lifecycle_state": f.lifecycle_state, "lead_reason": f.lead_reason,
+                                "confirmed": f.confirmed} for f in findings])
+    by_reason = counts["lead_by_reason"]
+    split = ", ".join(f"{by_reason[key]} {words}" for key, words in _LEAD_REASON_WORDS
+                      if by_reason[key])
+    return (f"Lifecycle: **{counts['CONFIRMED']} CONFIRMED**, **{counts['SUSPECTED']} SUSPECTED**, "
+            f"**{counts['LEAD']} LEAD**" + (f" ({split})" if split else "") + ".")
+
+
+def _units_line(records: list[dict], confirmed: list[dict]) -> str:
+    """The headline's three counts, each with its unit (EFF-3, issues.ISSUE_UNITS):
+    records, issue_key groups and root_cause_key groups, before any section routing
+    or duplicate collapse, plus the root causes a confirmed record shows."""
+    from harness.issues import count_units
+    every, proven = count_units(records), count_units(confirmed)
+    return (f"Counts: **{every['occurrences']} occurrence(s)** (finding records), "
+            f"**{every['issues']} issue(s)** (issue-key groups), "
+            f"**{every['root_causes']} root cause(s)** (root-cause groups); "
+            f"**{proven['root_causes']} root cause(s) with a confirmed record**.")
+
 
 # Oracle-verification badge (precision item #2): VERIFIED means an oracle
 # reproduced it N-of-N with a clean negative control; CANDIDATE means it did not
@@ -769,17 +813,18 @@ def _render_finding(f: ReportFinding, recon_map: "dict[str, dict] | None" = None
 
     lines = []
     status = ("🧰 TOOL-REPORTED (not reproduced by the harness)" if f.tool_reported
+              else _LEAD_BADGE.get(f.lead_reason) if f.lifecycle_state == "LEAD" and f.lead_reason
               else _STATE_BADGE.get(f.lifecycle_state, "❓ SUSPECTED (unconfirmed)"))
     verification = _VERIFICATION_BADGE.get(f.verification_state, "🧪 CANDIDATE")
     lines.append(f"### {f.vulnerability_class} -- {url}")
     lines.append("")
-    lines.append(f"**Status:** {status} &nbsp;|&nbsp; **Verification:** {verification} "
-                 f"&nbsp;|&nbsp; **Severity:** {_SEVERITY_BADGE.get(f.severity, f.severity)} "
-                 f"&nbsp;|&nbsp; **Confidence:** {f.confidence:.2f} ({_confidence_label(f.confidence)}) "
-                 f"&nbsp;|&nbsp; **Basis:** {f.basis}")
-    lines.append(f"**Evidence maturity:** {f.evidence_maturity} &nbsp;|&nbsp; "
-                 f"**Triage priority:** {f.triage_priority} &nbsp;|&nbsp; "
-                 f"**Impact severity:** {f.impact_severity}")
+    # EFF-4: the evidence tier leads; the model score trails and is never a probability.
+    lines.append(f"**Status:** {status} &nbsp;|&nbsp; **Evidence maturity:** {f.evidence_maturity} "
+                 f"&nbsp;|&nbsp; **Verification:** {verification} "
+                 f"&nbsp;|&nbsp; **Severity:** {_SEVERITY_BADGE.get(f.severity, f.severity)}")
+    lines.append(f"**Triage priority:** {f.triage_priority} &nbsp;|&nbsp; "
+                 f"**Impact severity:** {f.impact_severity} &nbsp;|&nbsp; **Basis:** {f.basis} "
+                 f"&nbsp;|&nbsp; **Model score:** {_model_score(f.confidence)}")
     if f.evidence_maturity == "unverified_no_leg":
         lines.append("_Unverified: no deterministic confirmation leg exists for this class. "
                      "Preserve the captured observation and verify manually; impact and model confidence do not prove it._")

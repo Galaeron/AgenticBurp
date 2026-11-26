@@ -219,6 +219,7 @@ class TokenLogoutTests(_Base):
         report = self.dispatch("session_timeout", _login(app))
         self.assertEqual(report.status, "not_confirmed", report.summary)
         self.assertIn("Token revoked on logout", report.summary)
+        self.assertEqual(report.control_outcome, "control_held")   # EFF-1
         self.assertIn("/rest/session/revoke", [r["path"] for r in app.received])
 
     def test_crawled_logout_route_that_keeps_the_token_confirms(self):

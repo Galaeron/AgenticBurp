@@ -495,30 +495,34 @@ class DuplicateProposalTests(unittest.IsolatedAsyncioTestCase):
     # -- negative controls: genuinely different requests are never merged -------
 
     async def test_header_value_difference_is_not_a_duplicate(self):
-        """Requests differing only in one header value -- an authorization
-        header, a probe header -- are all sent."""
+        """Requests differing only in one header value -- a tenant header, a probe
+        header -- are all sent. (ARC-6: an Authorization header is no longer a knob
+        the model may turn; see test_iterative_header_policy.)"""
         hdr = lambda n, v: {"action": "set_header", "name": n, "value": v}
         result, net, ollama = await self._drive([
-            hdr("Authorization", "Bearer user-two"), hdr("Authorization", "Bearer user-three"),
+            hdr("X-Tenant", "tenant-two"), hdr("X-Tenant", "tenant-three"),
             hdr("X-Probe", "one"), hdr("X-Probe", "two"), _STOP])
         self.assertEqual(len(net.sent), 4)
         self.assertEqual(result.duplicate_proposals, 0)
         self.assertEqual(result.distinct_requests, 4)
-        self.assertEqual([s[2]["Authorization"] for s in net.sent[:2]],
-                         ["Bearer user-two", "Bearer user-three"])
+        self.assertEqual([s[2]["X-Tenant"] for s in net.sent[:2]],
+                         ["tenant-two", "tenant-three"])
         self.assertEqual([s[2]["X-Probe"] for s in net.sent[2:]], ["one", "two"])
-        # secret-named headers are shown as a fingerprint of the value, never the value
-        # (the raw value stays in the attempt key, so the two tokens are two attempts)
         last = ollama.prompts[-1]
-        fingerprints = re.findall(r"hdr\[Authorization=<redacted #([0-9a-f]{8})>\]", last)
-        self.assertEqual(fingerprints, [hashlib.sha256(v.encode()).hexdigest()[:8]
-                                        for v in ("Bearer user-two", "Bearer user-three")])
-        self.assertEqual(len(set(fingerprints)), 2)
-        for token in ("user-two", "user-three"):
-            self.assertFalse(any(token in p for p in ollama.prompts), token)
-        # ... in the value column as well as in the target's hdr[...]
-        self.assertIn(f'- step 1: set_header header:Authorization="<redacted #{fingerprints[0]}>" | ', last)
-        self.assertIn("hdr[X-Probe=two]", last)  # a non-secret header value is still shown
+        self.assertIn('- step 1: set_header header:X-Tenant="tenant-two" | ', last)
+        self.assertIn("hdr[X-Probe=two]", last)  # a non-secret header value is shown
+
+    def test_secret_named_header_values_render_as_fingerprints(self):
+        """Defence in depth behind the ARC-6 refusal: were a secret-named header ever
+        shown, it reads as a fingerprint of the value, never the value, and two
+        tokens still read as two attempts."""
+        from harness.iterative_agent import _header_value_view
+        views = [_header_value_view("Authorization", v)
+                 for v in ("Bearer user-two", "Bearer user-three")]
+        self.assertEqual(views, ["<redacted #" + hashlib.sha256(v.encode()).hexdigest()[:8] + ">"
+                                 for v in ("Bearer user-two", "Bearer user-three")])
+        self.assertNotEqual(views[0], views[1])
+        self.assertEqual(_header_value_view("X-Probe", "two"), "two")
 
     async def test_different_object_ids_are_not_duplicates(self):
         result, net, _ = await self._drive([_path("2"), _path("3"), _path("22"), _STOP])
@@ -537,10 +541,15 @@ class DuplicateProposalTests(unittest.IsolatedAsyncioTestCase):
                           request_headers={"Content-Type": "application/json"},
                           request_body='{"subject":"x","note":"n"}', response_status=201)
         body = lambda p, v: _fresh({"action": "mutate", "location": "body", "param": p, "value": v})
-        with patch("harness.iterative_agent.get_default_gate", return_value=gate):
+        from harness.run_context import standalone_context
+        ctx = standalone_context(["localhost"], gate=gate)   # ARC-11: injected, not patched
+        try:
             result, net, ollama = await self._drive(
                 [body("subject", "y"), body("subject", "z"), body("note", "y"),
-                 body("subject", "y"), _STOP], exchange=ex)
+                 body("subject", "y"), _STOP], exchange=ex,
+                agent=IterativeAgent(None, "m", ["localhost"], run_context=ctx))
+        finally:
+            await ctx.aclose()
         self.assertEqual([s[3] for s in net.sent],
                          ['{"subject": "y", "note": "n"}', '{"subject": "z", "note": "n"}',
                           '{"subject": "x", "note": "y"}'])

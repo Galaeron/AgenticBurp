@@ -29,6 +29,25 @@ def _fallback_result_binds(result, routed) -> bool:
     return tested_class == fallback_label
 
 
+class ProbeScopeRefused(PermissionError):
+    """ARC-2: a standalone active probe was refused for scope. Its message names
+    only the host and the configured scope, so a route may return it verbatim."""
+
+
+def _require_standalone_probe_scope(url: str, allowed_hosts) -> None:
+    """ARC-2: a standalone probe (no owning run) sends requests the model chooses,
+    so it needs an explicit scope that covers the probed exchange. Unlike passive
+    review, an empty allowed_hosts refuses here instead of admitting any host."""
+    from harness import scope_lock
+    if scope_lock.host_in_scope(url, allowed_hosts, active_mode=True):
+        return
+    if not scope_lock.configured_entries(allowed_hosts):
+        raise ProbeScopeRefused(
+            "active probe refused: no server.allowed_hosts configured; a standalone "
+            "probe sends model-chosen requests and fails closed without an explicit scope")
+    raise ProbeScopeRefused("active probe refused: " + scope_lock.out_of_scope_reason(url, allowed_hosts))
+
+
 class ConfirmMixin:
     async def get_run_derived_live_markers(self):
         """P0-2: the run-derived confirmation-trust-tier override.
@@ -117,6 +136,21 @@ class ConfirmMixin:
 
         oracle_framework.stamp_finding(finding, capsule)
 
+    def _standalone_probe_gate(self):
+        """ARC-11: a SafetyGate of this probe's own -- never the process-wide default
+        gate, whose policy is frozen at startup (it misses the /settings
+        active_enabled toggle) and whose audit log and per-finding mutation counts
+        every standalone probe shared. The validators policy with the LIVE
+        active_enabled, scoped to this orchestrator's hosts (as RunContext.create
+        folds them)."""
+        from harness import scope_lock
+        from harness.safety_gate import SafetyGate, SafetyGateConfig
+        from harness.target_request_policy import TargetRequestPolicy
+        cfg = per_run_gate_config(self.config, getattr(self, "validator_registry", None))
+        cfg["allowed_hosts"] = list(scope_lock.configured_entries(self.allowed_hosts))
+        cfg["target_policy"] = TargetRequestPolicy.from_config(self.config or {})
+        return SafetyGate(SafetyGateConfig.from_dict(cfg))
+
     async def run_active_probe(
         self,
         exchange: HttpExchange,
@@ -148,7 +182,6 @@ class ConfirmMixin:
         from harness import pivot_memory
         from harness import activity_feed
         from harness.run_context import standalone_context
-        from harness.safety_gate import get_default_gate
 
         # Phase 4 cloud-coordinator seam: the iterative agent's reasoning runs on
         # the cloud model when the seam is toggled on (else local).
@@ -168,12 +201,16 @@ class ConfirmMixin:
         probe_ctx = run_context
         _ia_cfg = (self.config or {}).get("iterative_agent", {}) or {}
         if probe_ctx is None:
+            # ARC-2: no owning run means no run scope to inherit; refuse before
+            # building the context or calling the model.
+            _require_standalone_probe_scope(exchange.url, self.allowed_hosts)
             _cfg_max = _ia_cfg.get("max_requests")
             ceiling = effective_budget * 2 + 10 if _cfg_max is None else _cfg_max
             if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
                 raise ValueError("iterative_agent.max_requests must be a nonnegative integer")
             owned_ctx = standalone_context(self.allowed_hosts, config=self.config,
-                                           gate=get_default_gate(), max_requests=ceiling)
+                                           gate=self._standalone_probe_gate(), active_mode=True,
+                                           max_requests=ceiling)
             probe_ctx = owned_ctx
         async def experiment_handoff(action):
             return await self._handoff_experiment(action, probe_ctx)
@@ -183,6 +220,7 @@ class ConfirmMixin:
             experiment_handoff=experiment_handoff,
             experiment_catalog=lambda: self._experiment_catalog(probe_ctx),
             model_error_retries=_ia_cfg.get("model_error_retries"), deadline=deadline,
+            history_window=_ia_cfg.get("history_window"),  # TOK-3
         )
 
         # Publish each step to the live feed (V1), and still call any caller-

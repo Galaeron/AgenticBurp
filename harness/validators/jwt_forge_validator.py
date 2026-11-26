@@ -41,6 +41,7 @@ import httpx
 
 from harness import global_throttle, identity_compare
 import harness.missing_auth_probe as map_
+from harness.control_outcome import CONTROL_HELD
 from harness.models import Finding, HttpExchange
 from harness.run_observations import public_keys_in
 from .base import SentAnswer, Validator, ValidationResult
@@ -570,8 +571,16 @@ class JwtForgeValidator(Validator):
                 evidence=f"garbage -> HTTP {g_status}; {total - len(misses)} answered probe(s) were "
                          f"rejected at {exchange.url}, but a forgery that never answered was not "
                          f"rejected."))
+        # EFF-1: the control HELD only when the captured token's own replay was seen
+        # accepted (r_sent, the positive reference) while the garbage control and
+        # every forgery were rejected. Without that replay a rejection could be the
+        # route rejecting every token (an expired capture), so it is not a held
+        # control and the gate reports the finding unverified, not refuted.
+        replay_accepted = (r_sent is not None and r_sent[0] is not None
+                           and map_._substantive(*r_sent))
         return _counted(ValidationResult(
             self.name, "not_confirmed", "jwt", confidence=0.6, confirmed=False,
+            control_outcome=CONTROL_HELD if replay_accepted else "",
             summary="JWT signature appears to be verified: alg:none, reused-signature, and kid "
                     "key-confusion forgeries were all rejected like the garbage control.",
             evidence=f"garbage -> HTTP {g_status}; all {len(forgeries)} forgeries rejected at {exchange.url}."

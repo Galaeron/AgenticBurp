@@ -1,4 +1,9 @@
-"""SC-15: evidence-first report polish + retest classification.
+"""EXPERIMENTAL -- not enforced. No production code imports this module (ARC-10):
+it is exercised only by its own tests, so nothing in a run depends on it and it
+enforces nothing. Whether to wire it in, move it to harness/experimental/ or delete it is an
+owner decision; harness.test_experimental_modules keeps this marker honest.
+
+SC-15: evidence-first report polish + retest classification.
 
 Presentation only, built on the SAME canonical export the rest of the reporting
 stack uses -- :func:`harness.report_generator.export_issues_for_host` /
@@ -30,6 +35,9 @@ verbatim). Nothing in the default pipeline calls this yet; wiring it into a live
 ``/report`` route or the CLI is a separate, deferred step.
 """
 from __future__ import annotations
+
+# ARC-10: no production importer; see the docstring.
+EXPERIMENTAL = True
 
 import html
 from dataclasses import dataclass, field

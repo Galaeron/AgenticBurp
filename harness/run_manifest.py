@@ -104,6 +104,11 @@ class RunManifest:
         out = Path(output_dir or Path(__file__).parent / "run-output")
         root = Path(repo_root or Path(__file__).parent.parent)
         revision, dirty = _git_state(root)
+        # SEC-1: which slots send prompts off-host (cloud models) and whether
+        # ollama.allow_cloud_models opted in, from the config and the models the
+        # agents resolved. A run that would be refused records refused: true.
+        from harness.model_egress import egress_state
+        egress = egress_state(config, (model_versions or {}).get("agents"))
         data = {
             "schema_version": SCHEMA_VERSION, "run_id": run_id,
             "git": {"revision": revision, "dirty": dirty},
@@ -111,6 +116,7 @@ class RunManifest:
             "config": redact(deepcopy(config)), "config_fingerprint": config_fingerprint(config),
             "cache_namespace": cache_namespace, "target_identifier": target_identifier,
             "model_versions": redact(model_versions or {}),
+            "model_egress": redact(egress),
             "tool_versions": redact(tool_versions or {"python": platform.python_version(),
                                                         "platform": platform.platform()}),
             "started_at": time.time(), "finished_at": None, "request_count": None,
@@ -120,17 +126,55 @@ class RunManifest:
             "measurement": {"fixture_kind": "unscored", "precision": None, "recall": None,
                             "scoring_limitation": "No independent expected-case mapping supplied"},
         }
+        # ARC-3: the outbound throttle the run started under (and who set it).
+        from harness import global_throttle
+        data["throttle"] = {"at_start": global_throttle.throttle.audit_state()}
+        # ARC-11: validators.active_enabled at the start (and who set it last).
+        from harness import safety_gate
+        data["active_enabled"] = {"at_start": safety_gate.active_enabled_state()}
+        # O11: the model-call pacer's values in force (ollama.rate_limit, read off
+        # the live shared limiter) and its process-lifetime counters.
+        from harness import rate_limiter
+        data["model_rate_limit"] = {"at_start": rate_limiter.pacer_state()}
         manifest = cls(data, out)
         manifest._persist(append_ledger=True)
         return manifest
 
-    def finish(self, status: str, *, result: dict | None = None, error: str | None = None) -> None:
+    def finish(self, status: str, *, result: dict | None = None, error: str | None = None,
+               request_ceiling: dict | None = None) -> None:
         result = result or {}
+        # ARC-3: every throttle change made while the run was live (Burp /settings,
+        # config), the setting it ended under, and its request-ceiling outcome.
+        from harness import global_throttle
+        self.data["throttle"] = {**(self.data.get("throttle") or {}),
+                                 "at_finish": global_throttle.throttle.audit_state(),
+                                 "changes": global_throttle.throttle.changes(
+                                     since=self.data.get("started_at"))}
+        # ARC-11: every active_enabled toggle made while the run was live.
+        from harness import safety_gate
+        self.data["active_enabled"] = {**(self.data.get("active_enabled") or {}),
+                                       "at_finish": safety_gate.active_enabled_state(),
+                                       "changes": safety_gate.active_enabled_changes(
+                                           since=self.data.get("started_at"))}
+        # O11: the pacer at the finish, and the run's share of its counters (the
+        # difference; a run overlapping another shares the one process-wide pacer).
+        from harness import rate_limiter
+        pacer = dict(self.data.get("model_rate_limit") or {})
+        pacer["at_finish"] = rate_limiter.pacer_state()
+        if isinstance(pacer.get("at_start"), dict):
+            pacer["during_run"] = {
+                key: round(pacer["at_finish"][key] - pacer["at_start"].get(key, 0), 3)
+                for key in rate_limiter.PACER_COUNTERS}
+        self.data["model_rate_limit"] = pacer
+        if request_ceiling is not None:
+            self.data["request_ceiling"] = _counters(request_ceiling)
+            if request_ceiling.get("exhausted"):
+                self.data["stop_reason"] = "budget_exhausted"
         errors = list(result.get("errors") or [])
         instrumentation = result.get("instrumentation") or {}
         if error:
             errors.append({"phase": "job", "error": error})
-        from harness.assessment_health import assessment_health
+        from harness.assessment_health import assessment_health, headline_counts
         health = assessment_health(result.get("coverage"), errors,
                                    stopped_on_confirmation=result.get("stopped_on_confirmation", False))
         self.data.update({"finished_at": time.time(), "completion_status": status,
@@ -143,7 +187,8 @@ class RunManifest:
                           "confirmed_issue_refs": redact(result.get("confirmed_issue_refs", [])),
                           "confirmed_issues_unit": "proof_bound_cases",
                           "issue_accounting": redact(result.get("issue_accounting")),
-                          "confirmed_vulnerabilities": (result.get("issue_accounting") or {}).get("counts", {}).get("vulnerabilities"),
+                          # EFF-3: the per-case groups and their root causes, each beside its unit.
+                          **headline_counts(result.get("issue_accounting")),
                           "worklist_summary": redact(result.get("worklist_summary")),
                           # R01/R07: the auditable executed-vs-inferred coverage
                           # breakdown (coverage_summary.summarize_coverage's
@@ -161,7 +206,9 @@ class RunManifest:
                           "sqlmap_targeting": redact(instrumentation.get("sqlmap_targeting")),
                           # Whether each local model's context window held the
                           # largest prompt at run start (OllamaClient.context_preflight).
-                          "context_preflight": _counters(instrumentation.get("context_preflight"))})
+                          "context_preflight": _counters(instrumentation.get("context_preflight")),
+                          # TOK-5: routing calls, fail-opens and the fail-open rate.
+                          "coordinator_routing": _counters(instrumentation.get("coordinator_routing"))})
         self._persist(append_ledger=True)
 
     def _persist(self, *, append_ledger: bool) -> None:

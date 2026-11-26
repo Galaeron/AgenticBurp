@@ -84,16 +84,25 @@ def _install(testcase, fake: FakeOllama) -> None:
 
 class _FreshBreaker:
     """A fresh shared breaker registry per test, so a test's failures cannot open
-    the breaker another test (or this one's assertion) reads."""
+    the breaker another test (or this one's assertion) reads. Also a fresh
+    rate-limiter registry: every OllamaClient shares the process-wide "ollama"
+    token limiter (a 10-call burst, then about one call per 6 s), so calls made
+    by earlier tests would otherwise pace this test's calls past
+    run_context_preflight's 5 s timeout, which cancels the engagement's call."""
 
     def setUp(self):
         import harness.circuit_breaker as cb_module
+        import harness.rate_limiter as rl_module
         self._original_registry = cb_module._registry
+        self._original_limiters = rl_module._registry
         cb_module._registry = None
+        rl_module._registry = None
 
     def tearDown(self):
         import harness.circuit_breaker as cb_module
+        import harness.rate_limiter as rl_module
         cb_module._registry = self._original_registry
+        rl_module._registry = self._original_limiters
 
 
 class ContextOverflowRuleTests(unittest.TestCase):
@@ -217,7 +226,8 @@ class GuardCallerTests(_FreshBreaker, unittest.IsolatedAsyncioTestCase):
             with self.subTest(num_ctx=num_ctx):
                 fake = FakeOllama(prompt_eval_count=9000, eval_count=4000,
                                   loaded={"qwen3:8b": 4096})
-                client = self._client(fake, num_ctx=num_ctx)
+                # SEC-1: a cloud model is refused unless the client opts in.
+                client = self._client(fake, num_ctx=num_ctx, allow_cloud_models=True)
                 result = await client.chat_json_metered(model="gemma4:31b-cloud", system_prompt="s",
                                                         user_prompt=LONG_PROMPT)
                 self.assertEqual(result.data, {"ok": True})
@@ -291,7 +301,7 @@ class BreakerClassificationTests(_FreshBreaker, unittest.IsolatedAsyncioTestCase
         # NEGATIVE CONTROL: a cloud model's length stop is its provider's output
         # cap, not this host's window; num_ctx advice would be wrong.
         fake = FakeOllama(prompt_eval_count=500, eval_count=80, done_reason="length")
-        client = self._client(fake)
+        client = self._client(fake, allow_cloud_models=True)  # SEC-1 opt-in
         result = await client.chat_json(model="gpt-oss:120b-cloud", system_prompt="s", user_prompt="u")
         self.assertEqual(result, {"ok": True})
 
@@ -304,7 +314,7 @@ class BreakerClassificationTests(_FreshBreaker, unittest.IsolatedAsyncioTestCase
                 return httpx.Response(429, headers={"Retry-After": "3"}, json={"error": "rate limited"})
             return httpx.Response(200, json={"message": {"content": '{"ok": true}'}, "done": True,
                                              "prompt_eval_count": 10, "eval_count": 5})
-        client = self._client(handler)
+        client = self._client(handler, allow_cloud_models=True)  # SEC-1 opt-in
         sleep = AsyncMock()
         with patch.object(mod, "_backoff_sleep", sleep):
             result = await client.chat_json(model="gpt-oss:120b-cloud", system_prompt="s", user_prompt="u")
@@ -319,7 +329,7 @@ class BreakerClassificationTests(_FreshBreaker, unittest.IsolatedAsyncioTestCase
         def handler(request):
             requests.append(request)
             return httpx.Response(429, headers={"Retry-After": "600"}, json={"error": "quota"})
-        client = self._client(handler)
+        client = self._client(handler, allow_cloud_models=True)  # SEC-1 opt-in
         sleep = AsyncMock()
         with patch.object(mod, "_backoff_sleep", sleep):
             for _ in range(5):
