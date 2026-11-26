@@ -36,7 +36,7 @@ from harness import coverage_tracker
 from harness import engagement_builder
 from harness import evidence_ledger
 from harness import global_throttle
-from harness import orchestrator_helpers
+from harness import orchestrator_review
 from harness import role_crawl
 from harness import store
 from harness import worklist_investigator
@@ -49,6 +49,7 @@ from harness.review_overlap import ReviewOverlap
 from harness.role_crawl import RoleSession
 from harness.run_context import RunContext
 from harness.run_journal import RunJournal
+from harness.chain_stage_patch import chain_patch
 
 _HARNESS = Path(__file__).resolve().parent
 
@@ -306,7 +307,7 @@ class _Run:
                    patch.object(worklist_investigator, "investigate_worklist",
                                 new=AsyncMock(return_value=[])),
                    patch.object(coverage_tracker, "build_coverage_driven", new=drive),
-                   patch("harness.orchestrator_chain.universal_header_audit",
+                   chain_patch("universal_header_audit",
                          new=AsyncMock(return_value=0)),
                    patch("harness.ffuf_runner.ffuf_available",
                          return_value=(False, "ffuf disabled for this test")),
@@ -545,7 +546,7 @@ class ReviewLoopCancelTests(unittest.TestCase):
         caps = _captures(3)
 
         async def go():
-            task = asyncio.create_task(orchestrator_helpers.review_captured_exchanges(
+            task = asyncio.create_task(orchestrator_review.review_captured_exchanges(
                 orch, state, caps, seen=seen, stats=stats, errors=errors))
             await asyncio.sleep(0.05)
             task.cancel()
@@ -563,7 +564,7 @@ class ReviewLoopCancelTests(unittest.TestCase):
 
     def test_control_a_finished_review_counts_every_capture(self):
         orch, state, seen, stats = _FakeReviewOrch(0), EngagementState(host="h"), set(), {}
-        asyncio.run(orchestrator_helpers.review_captured_exchanges(
+        asyncio.run(orchestrator_review.review_captured_exchanges(
             orch, state, _captures(3), seen=seen, stats=stats))
         self.assertEqual(len(seen), 3)
         self.assertEqual(stats["reviewed"], 3)
@@ -571,7 +572,7 @@ class ReviewLoopCancelTests(unittest.TestCase):
 
     def test_should_stop_ends_the_review_before_the_next_capture(self):
         orch, state, stats, out = _FakeReviewOrch(0), EngagementState(host="h"), {}, {}
-        asyncio.run(orchestrator_helpers.review_captured_exchanges(
+        asyncio.run(orchestrator_review.review_captured_exchanges(
             orch, state, _captures(4), stats=stats, outcome_out=out,
             should_stop=lambda: "stop requested" if len(orch.started) >= 2 else None))
         self.assertEqual(out, {"stopped_by": "stop requested", "reviewed": 2,
@@ -593,7 +594,7 @@ class ReviewOverlapUnitTests(unittest.TestCase):
 
     def _overlap(self, orch, seen, stats, deadline):
         async def review(captured, **bounds):
-            return await orchestrator_helpers.review_captured_exchanges(
+            return await orchestrator_review.review_captured_exchanges(
                 orch, EngagementState(host="h"), captured, seen=seen, stats=stats, **bounds)
         return ReviewOverlap(review, deadline=deadline)
 

@@ -179,11 +179,20 @@ TRANSPORT_SITES: tuple[TransportSite, ...] = (
                        "It no longer constructs its own httpx client."),
     TransportSite("orchestrator_chain.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
                   owner="astra-identity (T03/T08/W-16)", constructs_client=False,
-                  note="W-16: the ChainMixin's target sends -- the engagement-driver GET, the "
-                       "credential probe, and the investigate_engagement second-order / "
-                       "discovery-confirm reads -- all route through the single TargetTransport "
+                  note="W-16: the ChainMixin's target sends -- the engagement-driver GET and the "
+                       "credential probe -- route through the single TargetTransport "
                        "(this run's when present, else a standalone one). No direct httpx client "
                        "remains, closing the last graph-loop routing gap."),
+    TransportSite("orchestrator_chain_legs.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="astra-identity (T03/T08/W-16)", constructs_client=False,
+                  note="ARC-9: the investigate_engagement stage that holds the confirmation legs; its "
+                       "access-control baseline read (moved here from orchestrator_chain.py) routes "
+                       "through the single TargetTransport exactly as before. No direct httpx client."),
+    TransportSite("orchestrator_chain_worklist.py", CHANNEL_HTTP, SCOPE_TARGET, ROUTING_EXECUTOR,
+                  owner="astra-identity (T03/T08/W-16)", constructs_client=False,
+                  note="ARC-9: the investigate_engagement stages that hold the second-order plant and "
+                       "read (moved here from orchestrator_chain.py); both travel the run's one "
+                       "TargetTransport via second_order.send_through_run. No direct httpx client."),
 
     # ---- target: confirmation legs (validators) ----
     # Mutating legs pass through the SafetyGate/GatedAsyncClient; read-only legs open

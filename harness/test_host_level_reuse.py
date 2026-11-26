@@ -27,7 +27,7 @@ from harness.categories import canonicalize
 from harness.engagement import EngagementState
 from harness.execution_registry import ExecutionRegistry, execution_key
 from harness.models import AgentReport, Finding, HttpExchange
-from harness.orchestrator_helpers import universal_header_audit
+from harness.orchestrator_review import universal_header_audit
 from harness.run_context import RunContext, ScopePolicy
 from harness.test_confirmation_soundness_rve import _CallerBase, _finding
 from harness.validators.base import header_fingerprint

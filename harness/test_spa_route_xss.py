@@ -47,6 +47,7 @@ from harness.role_crawl import RoleSession
 from harness.validators.browser_xss_validator import BrowserXssValidator
 from harness.validators.dom_xss_validator import DomXssValidator
 from harness.validators.injection_targets import NAMED_PARAMETER_UNTESTED, case_target
+from harness.chain_stage_patch import chain_patch
 
 _HARNESS = Path(__file__).resolve().parent
 ROLES = [RoleSession("anonymous", {})]
@@ -615,7 +616,7 @@ class SpaRouteCoverageCallerTest(_Server):
                     base, ROLES, max_nodes=0, step_budget=4, max_chain_rounds=0, run_context=ctx)
 
         with patch("harness.engagement_builder.build_engagement", side_effect=canned), \
-                patch("harness.orchestrator_chain.shape_precondition_legs", return_value=[]):
+                chain_patch("shape_precondition_legs", return_value=[]):
             result = asyncio.run(investigate())
         coverage = result.get("coverage") or {}
         cls.result = result

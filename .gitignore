@@ -20,6 +20,9 @@ burp-extension/build/
 burp-extension/.gradle/
 harness/*.db
 harness/run-output/
+# OPS-5: per-engagement stores and their close-time exports hold client data.
+harness/engagements/
+harness/engagement_exports/
 
 # Runtime SQLite DBs anywhere under testing/ (W-19): regenerable fixtures, and a
 # captured target DB like helpdesk.db is a planted-vuln fixture, never source.

@@ -22,6 +22,7 @@ from harness.orchestrator import Orchestrator
 from harness.role_crawl import RoleSession
 from harness.validators.base import ValidationResult
 from harness.validators.ssti_validator import SstiValidator
+from harness.chain_stage_patch import chain_patch
 
 
 _HARNESS = Path(__file__).resolve().parent
@@ -84,8 +85,8 @@ class ObjectiveCompletionWiringTest(unittest.TestCase):
         with patch.object(engagement_builder, "build_engagement", new=_build), \
              patch.object(worklist_investigator, "investigate_worklist",
                           new=AsyncMock(return_value=[])), \
-             patch("harness.orchestrator_chain.review_captured_exchanges", new=review), \
-             patch("harness.orchestrator_chain.universal_header_audit",
+             chain_patch("review_captured_exchanges", new=review), \
+             chain_patch("universal_header_audit",
                    new=AsyncMock(return_value=0)), \
              patch.object(SstiValidator, "validate", new=AsyncMock(return_value=confirmed)), \
              patch.object(objective_completion_mod, "attempt_completion",
@@ -150,8 +151,8 @@ class ObjectiveCompletionWiringTest(unittest.TestCase):
         with patch.object(engagement_builder, "build_engagement", new=_build), \
              patch.object(worklist_investigator, "investigate_worklist",
                           new=AsyncMock(return_value=[])), \
-             patch("harness.orchestrator_chain.review_captured_exchanges", new=review), \
-             patch("harness.orchestrator_chain.universal_header_audit",
+             chain_patch("review_captured_exchanges", new=review), \
+             chain_patch("universal_header_audit",
                    new=AsyncMock(return_value=0)), \
              patch.object(SstiValidator, "validate", new=AsyncMock(return_value=confirmed)), \
              patch.object(objective_completion_mod, "attempt_completion", new=fake), \

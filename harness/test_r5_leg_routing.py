@@ -33,6 +33,8 @@ from harness.validators.cross_identity_validator import CrossIdentityValidator
 from harness.validators.idor_read_validator import IdorReadValidator
 from harness.validators.verb_tamper_validator import VerbTamperValidator
 from harness.validators.verbose_error_validator import VerboseErrorValidator
+from harness.chain_stage_patch import chain_patch
+from harness import orchestrator_chain_support as ocs
 
 _O = "http://127.0.0.1:3000"
 
@@ -112,21 +114,21 @@ class VerboseErrorNoLegTests(unittest.TestCase):
 # ------------------------------------------------------------------ helpers / plan
 class RoutingHelperTests(unittest.TestCase):
     def test_user_enumeration_vs_object_enumeration(self):
-        self.assertTrue(oc._USER_ENUMERATION.search("user enumeration via login"))
-        self.assertTrue(oc._USER_ENUMERATION.search("enumeration of accounts"))
-        self.assertIsNone(oc._USER_ENUMERATION.search("broken object/resource enumeration"))
+        self.assertTrue(ocs._USER_ENUMERATION.search("user enumeration via login"))
+        self.assertTrue(ocs._USER_ENUMERATION.search("enumeration of accounts"))
+        self.assertIsNone(ocs._USER_ENUMERATION.search("broken object/resource enumeration"))
 
     def test_authentication_only_class(self):
-        self.assertTrue(oc._authentication_only_class("Broken Authentication"))
-        self.assertFalse(oc._authentication_only_class("Broken Authentication / IDOR"))
-        self.assertFalse(oc._authentication_only_class("idor"))
+        self.assertTrue(ocs._authentication_only_class("Broken Authentication"))
+        self.assertFalse(ocs._authentication_only_class("Broken Authentication / IDOR"))
+        self.assertFalse(ocs._authentication_only_class("idor"))
 
     def test_missing_auth_class(self):
-        self.assertTrue(oc._missing_auth_class("Exposed Administrative Configuration Data", "GET"))
-        self.assertTrue(oc._missing_auth_class("missing_authentication", "POST"))
-        self.assertFalse(oc._missing_auth_class("Exposed Administrative Configuration Data", "POST"))
-        self.assertFalse(oc._missing_auth_class("Information Disclosure", "GET"))
-        self.assertFalse(oc._missing_auth_class("idor", "GET"))
+        self.assertTrue(ocs._missing_auth_class("Exposed Administrative Configuration Data", "GET"))
+        self.assertTrue(ocs._missing_auth_class("missing_authentication", "POST"))
+        self.assertFalse(ocs._missing_auth_class("Exposed Administrative Configuration Data", "POST"))
+        self.assertFalse(ocs._missing_auth_class("Information Disclosure", "GET"))
+        self.assertFalse(ocs._missing_auth_class("idor", "GET"))
 
     def test_auth_plan_binds_auth_sequence(self):
         self.assertIn("auth_sequence",
@@ -204,9 +206,9 @@ class ChainLegRoutingTests(unittest.TestCase):
         orch.allowed_hosts = ["127.0.0.1"]
         with patch.object(engagement_builder, "build_engagement", new=build), \
                 patch.object(worklist_investigator, "investigate_worklist", new=investigate), \
-                patch("harness.orchestrator_chain.review_captured_exchanges",
+                chain_patch("review_captured_exchanges",
                       new=AsyncMock(return_value=0)), \
-                patch("harness.orchestrator_chain.universal_header_audit",
+                chain_patch("universal_header_audit",
                       new=AsyncMock(return_value=0)), \
                 patch.object(CrossIdentityValidator, "validate", new=xval), \
                 patch.object(IdorReadValidator, "validate", new=idor), \
@@ -231,11 +233,11 @@ class ChainLegRoutingTests(unittest.TestCase):
         """Negative control: auth-sequence needs a credential write."""
         label, legs, _ = self._run("Broken Authentication", "GET", "/rest/user/whoami")
         self.assertEqual(legs["auth"].await_count, 0)
-        self.assertEqual(label.get("leg_disposition"), oc.NO_APPLICABLE_LEG)
+        self.assertEqual(label.get("leg_disposition"), ocs.NO_APPLICABLE_LEG)
 
     def test_collection_bola_is_no_applicable_leg_and_sends_nothing(self):
         label, legs, reqs = self._run("Insecure Data Exposure / BOLA", "GET", "/rest/memories/")
-        self.assertEqual(label.get("leg_disposition"), oc.NO_APPLICABLE_LEG)
+        self.assertEqual(label.get("leg_disposition"), ocs.NO_APPLICABLE_LEG)
         self.assertEqual(legs["xval"].await_count, 0)
         self.assertNotIn(("GET", "/rest/memories/"), reqs)
         self.assertFalse(label.get("confirmed"))
@@ -254,7 +256,7 @@ class ChainLegRoutingTests(unittest.TestCase):
 
     def test_information_disclosure_is_no_applicable_leg(self):
         label, legs, _ = self._run("Information Disclosure", "GET", "/api/SecurityQuestions/")
-        self.assertEqual(label.get("leg_disposition"), oc.NO_APPLICABLE_LEG)
+        self.assertEqual(label.get("leg_disposition"), ocs.NO_APPLICABLE_LEG)
         self.assertFalse(label.get("confirmed"))
         for leg in legs.values():
             self.assertEqual(leg.await_count, 0)

@@ -323,7 +323,7 @@ class _EngagementBase(unittest.TestCase):
                 run.run_journal = journal
                 patches = [patch("harness.engagement_builder.build_engagement", new=self._discover)]
                 if review is not None:
-                    patches.append(patch("harness.orchestrator_chain.review_captured_exchanges", new=review))
+                    patches.append(chain_patch("review_captured_exchanges", new=review))
                 for item in extra or ():
                     patches.append(item)
                 for p in patches:
@@ -687,6 +687,7 @@ class CoverageThroughEngagementTests(_EngagementBase):
 # --------------------------------------------------------------------------- #
 
 from harness import test_job_status_passive as _durable  # noqa: E402
+from harness.chain_stage_patch import chain_patch
 
 
 class JournalResumeServerTests(_durable.DurableJobCallerTests, unittest.TestCase):

@@ -12,7 +12,7 @@ send live requests at a target:
   - **Python plane** -- `harness/validators/*.py`, dispatched by
     `ValidatorRegistry` (`harness/validators/registry.py`) and, for the
     engagement coverage-matrix driver, by the `_val_by_conf` confirmation-name
-    map in `harness/orchestrator_chain.py::investigate_engagement`. Every send
+    map in `harness/orchestrator_chain_coverage.py` (a stage of `investigate_engagement`). Every send
     routes through the single `TargetTransport` (`harness/run_context.py`)
     under `SafetyGate` (`harness/safety_gate.py`), the two-flag mutating opt-in
     (`validators.active_enabled` + `allow_mutating_replay`), a request budget,
@@ -229,7 +229,7 @@ _JAVA_ONLY: tuple[CapabilityOwnership, ...] = (
                note="WorkflowReplayLogic.java: 'Decision logic for the workflow_replay_compare "
                     "capability (category: business_logic)' -- numeric price/quantity/amount "
                     "boundary-value differential. Grounded absence on the Python side: "
-                    "orchestrator_chain.py's investigate_engagement explicitly hands an "
+                    "orchestrator_chain_worklist.py's investigate_engagement stages explicitly hand an "
                     "unconfirmed finding with no automated leg to state.flag_business_logic() "
                     "as a human-verification task instead of confirming it -- business logic "
                     "is a deliberate no-leg class in the Python plane today, not an oversight."),

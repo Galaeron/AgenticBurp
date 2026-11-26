@@ -11,7 +11,7 @@ Ollama-backed reasoning and deterministic validators. Safe defaults are passive.
 
 - API/config: `harness/server.py`; packaged imports use `harness.*`.
 - Orchestrator assembly: `orchestrator.py`; analysis: `orchestrator_detect.py`;
-  confirmation: `orchestrator_confirm.py`; engagement: `orchestrator_chain.py`.
+  confirmation: `orchestrator_confirm.py`; engagement: `orchestrator_chain.py` (driver) and its stages `orchestrator_chain_*.py`.
 - Discovery/worklist: `engagement_builder.py`, `api_surface_discovery.py`,
   `role_crawl.py`, `worklist_investigator.py`.
 - Transport/policy: `run_context.py` (the `TargetTransport` class), `safety_gate.py`.

@@ -11,9 +11,10 @@ from harness import engagement_builder, role_crawl, worklist_investigator
 from harness.engagement import EngagementState
 from harness.models import HttpExchange
 from harness.orchestrator import Orchestrator
-from harness.orchestrator_helpers import review_captured_exchanges
+from harness.orchestrator_review import review_captured_exchanges
 from harness.role_crawl import RoleSession
 from harness.test_deterministic_first import BASE, _config
+from harness.chain_stage_patch import chain_patch
 
 
 def exchange(path):
@@ -68,7 +69,7 @@ class ReviewBounds(unittest.IsolatedAsyncioTestCase):
 
         orch.analyze.side_effect = slow_review
         errors = []
-        with patch("harness.orchestrator_helpers.time", clock):
+        with patch("harness.orchestrator_review.time", clock):
             await review_captured_exchanges(
                 orch, state, [exchange("/a"), exchange("/b"), exchange("/c")],
                 errors=errors, deadline=150.0)
@@ -108,11 +109,11 @@ class ReviewBoundsCaller(unittest.TestCase):
         analyze = AsyncMock(return_value=SimpleNamespace(agent_reports=[]))
         patches = [patch.object(engagement_builder, "build_engagement", new=_build),
                    patch.object(worklist_investigator, "investigate_worklist", new=_no_outcomes),
-                   patch("harness.orchestrator_chain.universal_header_audit",
+                   chain_patch("universal_header_audit",
                          new=AsyncMock(return_value=0)),
                    patch.object(orch, "analyze", new=analyze)]
         if review is not None:
-            patches.append(patch("harness.orchestrator_chain.review_captured_exchanges", new=review))
+            patches.append(chain_patch("review_captured_exchanges", new=review))
         for p in patches:
             p.start()
         try:

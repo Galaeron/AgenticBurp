@@ -1218,6 +1218,12 @@ pattern_memory:
 # scheduler/endpoint is a later slice.
 store:
   evidence_retention_days: 0
+  # OPS-5: optional retention TTL for per-engagement stores (harness/engagements/,
+  # selected per process with HARNESS_ENGAGEMENT_ID). SAFE DEFAULT: 0 = off, keep
+  # forever (current behaviour). When >0, `python -m harness.data_maintenance
+  # retention` lists stores not written for N days, and only `retention --apply`
+  # closes them (export first, then removal). Nothing applies it automatically.
+  engagement_retention_days: 0
 
 # Per-run knobs (harness/run_context.py RunContext.create reads
 # runs.cache_namespace; unset here, so cache_namespace defaults to "").

@@ -15,6 +15,7 @@ from harness.orchestrator import Orchestrator
 from harness.role_crawl import RoleSession
 from harness.validators.base import ValidationResult
 from harness.validators.sqlmap import SqlmapValidator
+from harness.chain_stage_patch import chain_patch
 
 
 _HARNESS = Path(__file__).resolve().parent
@@ -84,8 +85,8 @@ class DeterministicFirstCallerTest(unittest.TestCase):
         orch.allowed_hosts = ["shop.test"]
         with patch.object(engagement_builder, "build_engagement", new=_build), \
              patch.object(worklist_investigator, "investigate_worklist", new=investigate), \
-             patch("harness.orchestrator_chain.review_captured_exchanges", new=review), \
-             patch("harness.orchestrator_chain.universal_header_audit",
+             chain_patch("review_captured_exchanges", new=review), \
+             chain_patch("universal_header_audit",
                    new=AsyncMock(return_value=0)), \
              patch.object(SqlmapValidator, "validate", new=AsyncMock(return_value=confirmed)), \
              patch.object(orch, "_persist_confirmation_proof",
@@ -176,7 +177,7 @@ class DeterministicFirstCallerTest(unittest.TestCase):
         orch.allowed_hosts = ["shop.test"]
         with patch.object(engagement_builder, "build_engagement", new=build_admin), \
              patch.object(worklist_investigator, "investigate_worklist", new=investigate), \
-             patch("harness.orchestrator_chain.review_captured_exchanges", new=AsyncMock(return_value=0)), \
+             chain_patch("review_captured_exchanges", new=AsyncMock(return_value=0)), \
              patch("harness.missing_auth_probe.probe",
                    new=AsyncMock(return_value=outcome)) as probe, \
              patch.object(orch, "_persist_confirmation_proof",

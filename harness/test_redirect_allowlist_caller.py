@@ -36,6 +36,7 @@ from harness.coverage_model import CellStatus, CoverageMatrix
 from harness.models import HttpExchange
 from harness.orchestrator import Orchestrator
 from harness.test_param_dispatch_caller import REDIRECT, ROLES, _config
+from harness.chain_stage_patch import chain_patch
 
 _ALLOWED = "https://partner.example/landing"
 _SENTINEL = "oob-openredirect.example"
@@ -149,7 +150,7 @@ class RedirectAllowlistCallerTests(unittest.TestCase):
                     base, ROLES, max_nodes=0, step_budget=4, max_chain_rounds=0, run_context=ctx)
 
         with patch("harness.engagement_builder.build_engagement", side_effect=canned), \
-                patch("harness.orchestrator_chain.shape_precondition_legs", return_value=[]):
+                chain_patch("shape_precondition_legs", return_value=[]):
             result = asyncio.run(investigate())
         coverage = result.get("coverage") or {}
         self.assertIn("cases_driven", coverage, "the case-driven coverage path did not run")

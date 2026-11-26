@@ -42,6 +42,7 @@ from harness.engagement import EngagementState
 from harness.orchestrator import Orchestrator
 from harness.role_crawl import RoleSession
 from harness.run_context import RunContext
+from harness.chain_stage_patch import chain_patch
 
 _HARNESS = Path(__file__).resolve().parent
 _REPORT = '{"report": "q3 payroll", "rows": 41}'
@@ -191,9 +192,9 @@ class _ChainCase(unittest.TestCase):
 
         with patch.object(engagement_builder, "build_engagement", new=build), \
                 patch.object(worklist_investigator, "investigate_worklist", new=investigate), \
-                patch("harness.orchestrator_chain.review_captured_exchanges",
+                chain_patch("review_captured_exchanges",
                       new=AsyncMock(return_value=0)), \
-                patch("harness.orchestrator_chain.universal_header_audit",
+                chain_patch("universal_header_audit",
                       new=AsyncMock(return_value=0)), \
                 patch.object(orch, "_persist_confirmation_proof",
                              new=AsyncMock(return_value=(False, None, "test"))):

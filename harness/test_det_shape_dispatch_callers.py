@@ -22,11 +22,12 @@ from unittest.mock import AsyncMock, patch
 
 from harness import store
 from harness.models import HttpExchange
-from harness.orchestrator_chain import _ConfirmationCache
+from harness.orchestrator_chain_support import _ConfirmationCache
 from harness.role_crawl import RoleSession
 from harness.run_context import current_case_ref
 from harness.test_engagement_transport_callers import _EngagementCallerBase
 from harness.validators.base import ValidationResult
+from harness.chain_stage_patch import chain_patch
 
 
 def _post_search(base, body):
@@ -86,7 +87,7 @@ class SqliBodyDispatchCallerTests(_EngagementCallerBase, unittest.TestCase):
         Without both, the leg depends on a model label, and the silent model gives
         none, so the positive case must fail."""
         recorder = self._run_sqli('{"q": "widget"}', defects=(
-            patch("harness.orchestrator_chain.shape_precondition_legs", return_value=[]),
+            chain_patch("shape_precondition_legs", return_value=[]),
             patch("harness.orchestrator_detect.shape_precondition_findings", return_value=[])))
         self.assertFalse([c for c in recorder.commands
                           if (self._flag(c, "-u") or "").endswith("/api/search")],
@@ -153,7 +154,7 @@ class ConfirmationCacheWiringCallerTests(_EngagementCallerBase, unittest.TestCas
             self._target(), max_requests=500, endpoints=[_PROFILE_NODE], roles=roles,
             extra_patches=[patch("harness.validators.jwt_forge_validator.JwtForgeValidator.validate",
                                  new=confirmed_leg),
-                           patch("harness.orchestrator_chain._ConfirmationCache", SpyCache)])
+                           chain_patch("_ConfirmationCache", SpyCache)])
         profile = [leg for leg in legs if leg[2].url.endswith("/api/profile")]
         confirmed = [f for f in result["findings"] if f.get("confirmed_by_leg") == "jwt_forge"]
         return built, profile, confirmed

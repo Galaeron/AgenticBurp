@@ -20,6 +20,185 @@ _DB_PATH = Path(__file__).parent / "harness_state.db"
 _CURRENT_ENGAGEMENT = contextvars.ContextVar("passive_engagement_owner", default="")
 _CURRENT_CAPTURED_PRINCIPAL = contextvars.ContextVar("passive_captured_auth_context", default="")
 
+# ---------------------------------------------------------------------------
+# OPS-5: per-engagement stores.
+#
+# Layout, all under the directory of the single legacy store (`_DB_PATH`):
+#   harness_state.db                      the legacy single store. Used whenever
+#                                         no engagement is selected (the default),
+#                                         so existing data loads unchanged.
+#   engagements/<key>/engagement.json     which engagement ID owns the directory
+#   engagements/<key>/harness_state.db    that engagement's own store, same schema
+#   engagements/<key>/harness_jobs.db ... sibling databases that callers derive
+#                                         from `_DB_PATH` (job status, run journal)
+#
+# The engagement key is the `engagement_id` partition that findings, the ledger,
+# observations, work items and engagement snapshots already carry (a named
+# engagement can span several hosts; a host-keyed wipe cannot separate clients).
+# A process stores into ONE engagement: `HARNESS_ENGAGEMENT_ID` at import, or
+# select_engagement_store(). Per-process, not per-request, because plan, proof
+# and job lookups by ID (validation results, the Burp plane) carry no engagement
+# and must find the rows the run wrote. Inside an engagement store the
+# `engagement_id` columns still partition, as they do in the legacy store.
+# close_engagement() exports, then removes, one engagement's store and its
+# attributed rows in the legacy store. Nothing here deletes anything implicitly.
+# ---------------------------------------------------------------------------
+ENGAGEMENT_ENV_VAR = "HARNESS_ENGAGEMENT_ID"
+_ENGAGEMENTS_DIRNAME = "engagements"
+_EXPORTS_DIRNAME = "engagement_exports"
+_ENGAGEMENT_DB_NAME = "harness_state.db"
+_ENGAGEMENT_MANIFEST = "engagement.json"
+_ENGAGEMENT_LOCK = "engagement.lock"
+_CLOSING_PREFIX = ".closing-"
+_STORE_LAYOUT_VERSION = 1
+_ACTIVE_ENGAGEMENT = ""
+_ACTIVE_STORE_PATH: Path | None = None
+_LEGACY_DB_PATH = Path(_DB_PATH)
+_HELD_STORE_LOCK = None   # open engagement.lock of the selected store, held while selected
+
+
+class EngagementStoreActive(ValueError):
+    """The engagement named is the one this process is storing into."""
+
+
+def _named_engagement_id(engagement_id) -> str:
+    if (not isinstance(engagement_id, str) or not engagement_id or len(engagement_id) > 128
+            or engagement_id != engagement_id.strip()
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in engagement_id)):
+        raise ValueError("an engagement store needs a nonempty engagement ID of at most 128 "
+                         "printable characters, without surrounding whitespace")
+    return engagement_id
+
+
+def engagement_store_key(engagement_id: str) -> str:
+    """Directory name for one engagement: a readable slug plus a digest of the
+    exact ID, so two IDs that slug alike still get different directories."""
+    engagement_id = _named_engagement_id(engagement_id)
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", engagement_id).strip("_")[:40] or "engagement"
+    return f"{slug}-{hashlib.sha256(engagement_id.encode('utf-8')).hexdigest()[:16]}"
+
+
+def active_engagement() -> str:
+    """The engagement this process stores into; '' for the legacy single store.
+    A `_DB_PATH` pointed elsewhere (a test fixture) counts as the legacy store."""
+    if _ACTIVE_ENGAGEMENT and _ACTIVE_STORE_PATH is not None and Path(_DB_PATH) == _ACTIVE_STORE_PATH:
+        return _ACTIVE_ENGAGEMENT
+    return ""
+
+
+def legacy_store_path() -> Path:
+    """The single legacy store, whichever engagement is selected."""
+    return _LEGACY_DB_PATH if active_engagement() else Path(_DB_PATH)
+
+
+def engagements_root() -> Path:
+    return legacy_store_path().parent / _ENGAGEMENTS_DIRNAME
+
+
+def engagement_store_dir(engagement_id: str) -> Path:
+    return engagements_root() / engagement_store_key(engagement_id)
+
+
+def engagement_store_path(engagement_id: str) -> Path:
+    """The database one engagement stores into: '' is the legacy single store."""
+    if engagement_id == "":
+        return legacy_store_path()
+    return engagement_store_dir(engagement_id) / _ENGAGEMENT_DB_NAME
+
+
+def _manifest_engagement(directory: Path) -> str | None:
+    """The engagement ID a store directory's manifest names, or None."""
+    try:
+        data = json.loads((directory / _ENGAGEMENT_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = data.get("engagement_id") if isinstance(data, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def _claim_engagement_dir(directory: Path, engagement_id: str) -> None:
+    """Create the directory and its manifest, or check an existing manifest names
+    this engagement (a digest collision or a hand-copied directory fails closed)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        directory.chmod(0o700)
+    manifest = directory / _ENGAGEMENT_MANIFEST
+    try:
+        with manifest.open("x", encoding="utf-8") as stream:
+            json.dump({"engagement_id": engagement_id, "created_at": time.time(),
+                       "store_layout": _STORE_LAYOUT_VERSION}, stream, sort_keys=True)
+    except FileExistsError:
+        if _manifest_engagement(directory) != engagement_id:
+            raise ValueError("engagement store directory belongs to a different engagement") from None
+
+
+def _hold_store_lock(directory: Path):
+    """Open the store's lock file and keep it open while the store is selected,
+    so a close from another process sees the store is in use: a shared flock on
+    POSIX; on Windows the open handle alone makes the directory rename fail."""
+    stream = open(directory / _ENGAGEMENT_LOCK, "a+b")
+    if os.name != "nt":
+        import fcntl
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            stream.close()
+            raise EngagementStoreActive("that engagement store is being closed") from None
+    return stream
+
+
+def _release_store_lock() -> None:
+    global _HELD_STORE_LOCK
+    if _HELD_STORE_LOCK is not None:
+        try:
+            _HELD_STORE_LOCK.close()
+        except OSError:
+            pass
+        _HELD_STORE_LOCK = None
+
+
+def interrupted_closes(engagement_id: str | None = None) -> list[Path]:
+    """Store directories a close renamed aside and did not finish removing (a
+    crash mid-export, or files it could not delete). close_engagement recovers
+    them; selecting that engagement is refused until it does."""
+    root = engagements_root()
+    if not root.is_dir():
+        return []
+    pattern = _CLOSING_PREFIX + (f"{engagement_store_key(engagement_id)}-*" if engagement_id else "*")
+    return sorted(path for path in root.glob(pattern) if path.is_dir() and not path.is_symlink())
+
+
+def select_engagement_store(engagement_id: str) -> Path:
+    """Point this process's store at one engagement's own database, creating it
+    on first use; '' goes back to the legacy single store. Returns the path.
+    Selecting never moves or deletes data: rows already in the legacy store stay
+    there and load again once the legacy store is selected. The selected store's
+    lock file stays open, so another process cannot close it meanwhile."""
+    global _DB_PATH, _ACTIVE_ENGAGEMENT, _ACTIVE_STORE_PATH, _LEGACY_DB_PATH, _HELD_STORE_LOCK
+    legacy = legacy_store_path()
+    if engagement_id == "":
+        _release_store_lock()
+        _DB_PATH, _ACTIVE_ENGAGEMENT, _ACTIVE_STORE_PATH = legacy, "", None
+        return legacy
+    directory = legacy.parent / _ENGAGEMENTS_DIRNAME / engagement_store_key(engagement_id)
+    if directory.parent.is_dir() and any(directory.parent.glob(f"{_CLOSING_PREFIX}{directory.name}-*")):
+        raise ValueError("an interrupted close holds this engagement's data aside; run "
+                         "close-engagement for it before storing into it again")
+    _claim_engagement_dir(directory, engagement_id)
+    lock = _hold_store_lock(directory)
+    _release_store_lock()
+    path = directory / _ENGAGEMENT_DB_NAME
+    _LEGACY_DB_PATH, _DB_PATH, _ACTIVE_ENGAGEMENT, _ACTIVE_STORE_PATH = legacy, path, engagement_id, path
+    _HELD_STORE_LOCK = lock
+    return path
+
+
+if os.environ.get(ENGAGEMENT_ENV_VAR):
+    try:
+        select_engagement_store(os.environ[ENGAGEMENT_ENV_VAR])
+    except ValueError as exc:
+        raise ValueError(f"{ENGAGEMENT_ENV_VAR}: {exc}") from None
+
 
 def isolate_engagement_context(fn):
     """Keep passive record attribution local to one async caller's lifetime."""
@@ -387,6 +566,27 @@ CREATE TABLE IF NOT EXISTS ledger_events (
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_finding_ref ON ledger_events(finding_ref);
 """
+# ARC-13 (2026-11-23): tamper evidence for ledger_events. One ledger_chain row per
+# chained event (keyed on ledger_events.event_id) holds `seq` (a store-wide,
+# increasing append number), `prev_hash` (the `row_hash` of the previous chained
+# event of the SAME finding_ref; '' for the first) and `row_hash` (sha256 over the
+# event's canonical content and prev_hash -- see evidence_ledger.ledger_row_hash).
+# The chain is per finding_ref, not store-wide, because the wipe paths delete a
+# finding_ref's events as a whole: a store-wide chain would break at every
+# legitimate wipe. Events written before this change have no ledger_chain row and
+# read as "unchained legacy". Versioned additive side table plus the
+# 'ledger-chain-schema' marker; ledger_events itself is unchanged. Rollback: DROP
+# TABLE ledger_chain and delete the marker; the previous build never reads either.
+_LEDGER_CHAIN_VERSION = 1
+_LEDGER_CHAIN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ledger_chain (
+    event_id TEXT PRIMARY KEY,
+    seq INTEGER NOT NULL,
+    prev_hash TEXT NOT NULL,
+    row_hash TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_chain_seq ON ledger_chain(seq);
+"""
 
 # FR-2 (F03): content-addressed, ALREADY-REDACTED request/response evidence blobs.
 # This is a NEW persistence sink for exchange bodies/headers (today only a URL and
@@ -665,6 +865,7 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
     conn.executescript(_PRINCIPAL_SCHEMA)
     conn.executescript(_ISSUE_MERGE_SCHEMA)
     conn.executescript(_LEDGER_SCHEMA)
+    conn.executescript(_LEDGER_CHAIN_SCHEMA)
     conn.executescript(_EVIDENCE_BLOB_SCHEMA)
     conn.executescript(_WORK_ITEM_SCHEMA)
     conn.executescript(_OBSERVATION_SCHEMA)
@@ -683,6 +884,8 @@ def _initialise_connection(conn: sqlite3.Connection) -> None:
                  (str(_PLAN_DISPATCH_VERSION),))
     conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('plane-dispatch-schema', ?)",
                  (str(_PLANE_DISPATCH_VERSION),))
+    conn.execute("INSERT OR IGNORE INTO state_metadata VALUES ('ledger-chain-schema', ?)",
+                 (str(_LEDGER_CHAIN_VERSION),))
     ledger_cols ={row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
     if "engagement_id" not in ledger_cols:
         try:
@@ -3044,19 +3247,101 @@ def persist_ledger_event(event: dict) -> None:
     caller that persists the same event twice (e.g. a retried emit) is a
     no-op, never an overwrite. Best-effort by design -- callers (evidence_
     ledger.emit) already swallow any exception this raises, so a storage
-    hiccup here can never surface as a pipeline failure."""
+    hiccup here can never surface as a pipeline failure.
+
+    ARC-13: the event is hash-chained in ledger_chain (see _LEDGER_CHAIN_SCHEMA).
+    Reading the finding's chain head, taking the next `seq` and inserting both rows
+    happen inside ONE `BEGIN IMMEDIATE` transaction: SQLite grants the write lock to
+    one connection at a time, across threads and processes, so two appends can
+    never read the same head and fork the chain, and no event is stored without
+    its chain row."""
+    from harness.evidence_ledger import ledger_row_hash
+    fields = {
+        "event_id": event.get("event_id", ""), "event_type": event.get("event_type", ""),
+        "finding_ref": event.get("finding_ref", ""), "case_ref": event.get("case_ref", ""),
+        "summary": event.get("summary", ""),
+        "data_json": json.dumps(event.get("data", {}) or {}),
+        "provenance_json": json.dumps(event.get("provenance", {}) or {}),
+        "engagement_id": _CURRENT_ENGAGEMENT.get(),
+        "captured_principal_id": _CURRENT_CAPTURED_PRINCIPAL.get(),
+        # float() first: the column is REAL, so the hash must cover the value read back.
+        "created_at": float(event.get("created_at", time.time())),
+    }
     conn = _connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM ledger_events WHERE event_id = ?",
+                        (fields["event_id"],)).fetchone():
+            conn.rollback()          # a re-persisted event is a no-op, never an overwrite
+            return
+        head = conn.execute(
+            "SELECT c.row_hash FROM ledger_chain c JOIN ledger_events e ON e.event_id = c.event_id "
+            "WHERE e.finding_ref = ? ORDER BY c.seq DESC LIMIT 1", (fields["finding_ref"],)).fetchone()
+        prev_hash = head[0] if head else ""
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM ledger_chain").fetchone()[0]
+        row_hash = ledger_row_hash(prev_hash=prev_hash, seq=seq, **fields)
         conn.execute(
-            "INSERT OR IGNORE INTO ledger_events "
+            "INSERT INTO ledger_events "
             "(event_id, event_type, finding_ref, case_ref, summary, data_json, "
-            "provenance_json, engagement_id, captured_principal_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (event.get("event_id", ""), event.get("event_type", ""),
-             event.get("finding_ref", ""), event.get("case_ref", ""),
-             event.get("summary", ""), json.dumps(event.get("data", {}) or {}),
-             json.dumps(event.get("provenance", {}) or {}), _CURRENT_ENGAGEMENT.get(),
-             _CURRENT_CAPTURED_PRINCIPAL.get(), event.get("created_at", time.time())))
+            "provenance_json, engagement_id, captured_principal_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (fields["event_id"], fields["event_type"], fields["finding_ref"], fields["case_ref"],
+             fields["summary"], fields["data_json"], fields["provenance_json"],
+             fields["engagement_id"], fields["captured_principal_id"], fields["created_at"]))
+        conn.execute("INSERT INTO ledger_chain (event_id, seq, prev_hash, row_hash) VALUES (?, ?, ?, ?)",
+                     (fields["event_id"], seq, prev_hash, row_hash))
         conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+_LEDGER_CHAIN_COLUMNS = ("event_id", "event_type", "finding_ref", "case_ref", "summary", "data_json",
+                         "provenance_json", "engagement_id", "captured_principal_id", "created_at",
+                         "seq", "prev_hash", "row_hash")
+
+
+def _open_read_only(db_path) -> sqlite3.Connection:
+    """A read-only connection that never creates, migrates or locks the file --
+    what a verifier run against a delivered copy of the store needs."""
+    path = Path(db_path if db_path is not None else _DB_PATH)
+    if not path.is_file():
+        raise FileNotFoundError(f"no store at {path}")
+    return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=10.0)
+
+
+_LEDGER_CHAIN_LINK = ("seq", "prev_hash", "row_hash")
+
+
+def iter_ledger_chain_rows(db_path=None):
+    """Every ledger_events row, joined to its ledger_chain row, as a dict of
+    _LEDGER_CHAIN_COLUMNS in append order (`seq`, then insertion order), for
+    harness.evidence_ledger.verify_ledger_rows.
+
+    Reads the file at `db_path` (default: the live store) read-only and tolerates a
+    store written before ARC-13: an event without a chain row (or a store without
+    ledger_chain, or a column an older build never added) reads as the legacy
+    defaults, so it verifies as "unchained legacy"."""
+    conn = _open_read_only(db_path)
+    try:
+        present = {row[1] for row in conn.execute("PRAGMA table_info(ledger_events)")}
+        if not present:
+            return
+        chained = bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_chain'").fetchone())
+        columns = []
+        for c in _LEDGER_CHAIN_COLUMNS:
+            default = "0" if c == "seq" else "''"
+            if c in _LEDGER_CHAIN_LINK:
+                columns.append(f"COALESCE(c.{c}, {default}) AS {c}" if chained else f"{default} AS {c}")
+            else:
+                columns.append(f"e.{c}" if c in present else f"{default} AS {c}")
+        join = " LEFT JOIN ledger_chain c ON c.event_id = e.event_id" if chained else ""
+        order = "COALESCE(c.seq, 0), e.rowid" if chained else "e.rowid"
+        for row in conn.execute(f"SELECT {', '.join(columns)} FROM ledger_events e{join} ORDER BY {order}"):
+            yield dict(zip(_LEDGER_CHAIN_COLUMNS, row))
     finally:
         conn.close()
 
@@ -3424,15 +3709,68 @@ def engagement_budget_reserved(engagement_id: str) -> float:
 # no redaction logic of its own and persists exactly what it is given.
 # ---------------------------------------------------------------------------
 
-def put_evidence_blob(data: bytes) -> str:
+# ARC-13: the redaction assertion. Callers redact, but nothing checked it. Every blob
+# is now re-run through the project's own redactors (harness.evidence_redaction); a
+# correctly redacted blob changes nothing. What happens when one would change is
+# EVIDENCE_BLOB_UNREDACTED_POLICY:
+#   "flag"   -- store the blob as before, count it and log a warning (no values).
+#               The DEFAULT: it changes no live behaviour. `verify_evidence_ledger
+#               --check-blobs` lists the flagged blobs from the stored data.
+#   "refuse" -- raise UnredactedEvidenceError and store nothing. The callers already
+#               catch a failed write and mark the evidence degraded.
+# "refuse" is the safer end state but is an owner decision: it could degrade evidence
+# if a caller's redaction is weaker than this check, which only a live run can show.
+# A call can override the policy with `unredacted=`.
+EVIDENCE_BLOB_UNREDACTED_POLICY = "flag"
+_UNREDACTED_BLOB_FLAGS = 0
+
+
+class UnredactedEvidenceError(ValueError):
+    """put_evidence_blob refused a blob the redactors would still change."""
+
+
+def evidence_blob_redaction_status() -> dict:
+    """Process-lifetime count of blobs stored under the "flag" policy that the
+    redactors would still have changed, plus the policy in force."""
+    with _STATS_LOCK:
+        flags = _UNREDACTED_BLOB_FLAGS
+    return {"policy": EVIDENCE_BLOB_UNREDACTED_POLICY, "unredacted_flags": flags,
+            "lifetime": "process"}
+
+
+def put_evidence_blob(data: bytes, *, unredacted: str | None = None) -> str:
     """Store `data` keyed by its own sha256 hex digest; returns that digest.
 
     Idempotent: INSERT OR IGNORE means storing the same bytes twice is a
     no-op, never a duplicate row or an overwrite -- the table is content-
     addressed, so the same hash always means the same bytes.
+
+    `data` must already be redacted (see the comment above): a blob the
+    redactors would still change is handled per `unredacted` ("flag" or
+    "refuse"; default EVIDENCE_BLOB_UNREDACTED_POLICY).
     """
+    global _UNREDACTED_BLOB_FLAGS
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError(f"evidence blob data must be bytes, got {type(data).__name__}")
+    policy = unredacted or EVIDENCE_BLOB_UNREDACTED_POLICY
+    if policy not in ("flag", "refuse"):
+        raise ValueError(f"unredacted must be 'flag' or 'refuse', got {policy!r}")
+    from harness.evidence_redaction import redaction_findings
+    try:
+        findings = redaction_findings(data)
+    except Exception:       # e.g. RecursionError on a hostile body: unverifiable, not unstorable
+        findings = [("check-failed", "")]
+    if findings:
+        kinds = ", ".join(sorted({kind for kind, _ in findings}))
+        if policy == "refuse":
+            raise UnredactedEvidenceError(
+                f"evidence blob not stored: {len(findings)} unredacted field(s) ({kinds})")
+        with _STATS_LOCK:
+            _UNREDACTED_BLOB_FLAGS += 1
+        import logging
+        logging.getLogger("harness.store").warning(
+            "evidence blob stored with %d unredacted field(s) (%s); the caller must redact "
+            "before put_evidence_blob", len(findings), kinds)
     digest = hashlib.sha256(data).hexdigest()
     conn = _connect()
     try:
@@ -3443,6 +3781,18 @@ def put_evidence_blob(data: bytes) -> str:
     finally:
         conn.close()
     return digest
+
+
+def iter_evidence_blobs(db_path=None):
+    """`(sha256, bytes)` for every stored blob, read-only, for the ledger verifier."""
+    conn = _open_read_only(db_path)
+    try:
+        for digest, data in conn.execute("SELECT sha256, data FROM evidence_blobs ORDER BY sha256"):
+            yield digest, bytes(data)
+    except sqlite3.OperationalError:     # a store with no blob table yet has nothing to check
+        return
+    finally:
+        conn.close()
 
 
 def get_evidence_blob(h: str, *, conn: "sqlite3.Connection | None" = None) -> bytes | None:
@@ -3571,6 +3921,8 @@ def apply_retention_from_config(cfg: dict, *, now: float | None = None) -> int:
 #     ledger_events          -- finding_ref (sizes case_ids UNION finding_ids
 #                                of the target host's findings -- see the
 #                                blob-guard comment below for why)
+#     ledger_chain           -- event_id of those ledger_events (ARC-13),
+#                                deleted just before them
 #     evidence_blobs         -- sha256, but ONLY the `candidate -
 #                                other_referenced` subset (see below); this
 #                                table has no host column at all -- it is
@@ -3579,7 +3931,8 @@ def apply_retention_from_config(cfg: dict, *, now: float | None = None) -> int:
 #
 #     plane_dispatches / plan_dispatch_notes -- plan_id into test_plans.host,
 #                          deleted the same way as validation_runs below; the
-#                          plane's "plan:<plan_id>" ledger events go with them
+#                          plane's "plan:<plan_id>" ledger events (and their
+#                          ledger_chain rows) go with them
 #
 #     validation_runs  -- no host column of its own; scoped via `plan_id` FK
 #                          into test_plans.host and wiped with the correlated
@@ -3734,16 +4087,20 @@ def wipe_engagement(host: str) -> dict:
         else:
             counts["evidence_blobs"] = 0
 
-        # (d) ledger_events -- finding_ref IN (case_ids UNION finding_ids).
+        # (d) ledger_events -- finding_ref IN (case_ids UNION finding_ids). ARC-13:
+        # their ledger_chain rows go first (the subquery needs the events).
         if target_refs:
             placeholders = ",".join("?" for _ in target_refs)
+            counts["ledger_chain"] = conn.execute(
+                "DELETE FROM ledger_chain WHERE event_id IN (SELECT event_id FROM ledger_events "
+                f"WHERE finding_ref IN ({placeholders}))", list(target_refs)).rowcount
             cur = conn.execute(
                 f"DELETE FROM ledger_events WHERE finding_ref IN ({placeholders})",
                 list(target_refs),
             )
             counts["ledger_events"] = cur.rowcount
         else:
-            counts["ledger_events"] = 0
+            counts["ledger_chain"] = counts["ledger_events"] = 0
 
         # (e) proof_records -- case_id, finding_ref, and proof_id are all
         # real, confirmed columns on this table; a row matching any of them
@@ -3810,6 +4167,10 @@ def wipe_engagement(host: str) -> dict:
         # ledger events the server keys on "plan:<plan_id>".
         conn.execute("DELETE FROM plane_dispatches WHERE plan_id IN "
                      "(SELECT plan_id FROM test_plans WHERE host = ?)", (host,))
+        counts["ledger_chain"] += conn.execute(
+            "DELETE FROM ledger_chain WHERE event_id IN (SELECT event_id FROM ledger_events "
+            "WHERE finding_ref IN (SELECT 'plan:' || plan_id FROM test_plans WHERE host = ?))",
+            (host,)).rowcount
         counts["ledger_events"] += conn.execute(
             "DELETE FROM ledger_events WHERE finding_ref IN "
             "(SELECT 'plan:' || plan_id FROM test_plans WHERE host = ?)", (host,)).rowcount
@@ -3869,6 +4230,135 @@ def wipe_engagement(host: str) -> dict:
         return counts
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# OPS-5: list, close and expire engagement stores (layout at the top of this
+# module). Close is the one destructive path: it always exports first, and
+# data_maintenance.close_engagement_store does the file work.
+# ---------------------------------------------------------------------------
+
+def list_engagement_stores() -> list[dict]:
+    """Every engagement store under engagements_root() whose manifest names the
+    engagement its directory is keyed by. Reads metadata only, never rows."""
+    root = engagements_root()
+    if not root.is_dir():
+        return []
+    stores = []
+    active = active_engagement()
+    for directory in sorted(root.iterdir()):
+        if directory.name.startswith(".") or directory.is_symlink() or not directory.is_dir():
+            continue
+        engagement_id = _manifest_engagement(directory)
+        try:
+            if engagement_id is None or engagement_store_key(engagement_id) != directory.name:
+                continue
+        except ValueError:
+            continue
+        mtimes = []
+        for entry in directory.iterdir():
+            try:
+                if entry.is_file():
+                    mtimes.append(entry.stat().st_mtime)
+            except OSError:   # removed by a concurrent close
+                continue
+        stores.append({"engagement_id": engagement_id, "key": directory.name, "path": str(directory),
+                       "active": engagement_id == active, "last_write": max(mtimes, default=0.0)})
+    return stores
+
+
+def close_engagement(engagement_id: str, *, export_root: Path | str | None = None,
+                     now: float | None = None) -> dict:
+    """Close one engagement: export, then remove, its own store and the rows the
+    legacy single store attributes to it (engagement_id column). Other
+    engagements' stores, unattributed legacy rows and evidence blobs another
+    engagement still references are untouched.
+
+    Refuses the engagement this process is storing into (EngagementStoreActive)
+    and raises LookupError when nothing is stored for it. The export goes to a
+    new directory under `export_root` (default: engagement_exports/ beside the
+    legacy store) and is complete before anything is removed. Removal deletes
+    files and rows; it is not secure erasure (the disk must be encrypted)."""
+    from harness import data_maintenance
+    engagement_id = _named_engagement_id(engagement_id)
+    if active_engagement() == engagement_id:
+        raise EngagementStoreActive("this process is storing into that engagement; select another "
+                                    "engagement (or none) before closing it")
+    legacy = legacy_store_path()
+    directory = engagement_store_dir(engagement_id)
+    leftovers = interrupted_closes(engagement_id)
+    if leftovers:
+        # Recover an interrupted close: put the set-aside store back, then close it.
+        if len(leftovers) > 1 or directory.exists() or _manifest_engagement(leftovers[0]) != engagement_id:
+            raise ValueError("an interrupted close left data aside that needs manual review")
+        os.rename(leftovers[0], directory)
+    store_dir = None
+    if directory.exists() or directory.is_symlink():
+        if directory.is_symlink() or not directory.is_dir() or _manifest_engagement(directory) != engagement_id:
+            raise ValueError("engagement store directory does not belong to this engagement")
+        store_dir = directory
+    legacy_db = legacy if data_maintenance.context_row_count(legacy, engagement_id) else None
+    if store_dir is None and legacy_db is None:
+        raise LookupError("nothing is stored for this engagement")
+    root = Path(export_root) if export_root is not None else legacy.parent / _EXPORTS_DIRNAME
+    if root.resolve().is_relative_to(engagements_root().resolve()):
+        raise ValueError("the export directory must not be inside the engagement stores")
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now if now is not None else time.time()))
+    export_dir = root / f"{engagement_store_key(engagement_id)}-{stamp}-{secrets.token_hex(3)}"
+    try:
+        receipt = data_maintenance.close_engagement_store(
+            engagement_id, store_dir=store_dir, legacy_db=legacy_db, export_dir=export_dir)
+    except data_maintenance.StoreInUse:
+        raise EngagementStoreActive("another process is storing into that engagement; stop it "
+                                    "(or select another engagement there) before closing") from None
+    for path in list(_INITIALISED):
+        if store_dir is not None and Path(path).parent == Path(os.path.abspath(store_dir)):
+            with _INIT_LOCK:
+                _INITIALISED.pop(path, None)
+    return receipt
+
+
+def engagement_retention_days(cfg: dict) -> float:
+    """store.engagement_retention_days from a config dict: 0 (the shipped
+    default) or absent means engagement stores never expire."""
+    raw = (cfg.get("store") or {}).get("engagement_retention_days", 0)
+    if raw is None:
+        return 0.0
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 <= raw < float("inf"):
+        raise ValueError("store.engagement_retention_days must be a finite number >= 0")
+    return float(raw)
+
+
+def expired_engagement_stores(retention_days: float, *, now: float | None = None) -> list[dict]:
+    """Engagement stores not written for `retention_days` days, excluding the one
+    this process stores into. retention_days <= 0 means none ever expire."""
+    if retention_days <= 0:
+        return []
+    cutoff = (now if now is not None else time.time()) - retention_days * 86400.0
+    return [entry for entry in list_engagement_stores()
+            if not entry["active"] and entry["last_write"] < cutoff]
+
+
+def apply_engagement_retention(retention_days: float, *, apply: bool = False,
+                               export_root: Path | str | None = None,
+                               now: float | None = None) -> dict:
+    """The optional retention TTL. Lists expired engagement stores; only with
+    apply=True does it close each one (export first, as close_engagement)."""
+    expired = expired_engagement_stores(retention_days, now=now)
+    result = {"retention_days": retention_days, "applied": bool(apply),
+              "expired": [entry["engagement_id"] for entry in expired], "closed": []}
+    if apply:
+        result["failed"] = []
+        for entry in expired:
+            # One store that cannot close (in use, a locked file) must not hide
+            # the receipts of the stores already closed.
+            try:
+                result["closed"].append(close_engagement(entry["engagement_id"], export_root=export_root,
+                                                         now=now))
+            except (LookupError, ValueError, OSError, sqlite3.Error) as exc:
+                result["failed"].append({"engagement_id": entry["engagement_id"],
+                                         "error_type": type(exc).__name__})
+    return result
 
 
 def save_engagement_declarations(host: str, port: int, *, protected_paths: list[str],

@@ -171,6 +171,8 @@ class ProofIdentityMigrationTests(unittest.TestCase):
             conn.execute("DELETE FROM state_metadata WHERE name = 'plan-dispatch-schema'")
             conn.execute("DROP TABLE plane_dispatches")
             conn.execute("DELETE FROM state_metadata WHERE name = 'plane-dispatch-schema'")
+            conn.execute("DROP TABLE ledger_chain")
+            conn.execute("DELETE FROM state_metadata WHERE name = 'ledger-chain-schema'")
             conn.execute("DROP TABLE exchange_observations")
             conn.execute("DROP TABLE observation_attributions")
             conn.execute("DELETE FROM state_metadata WHERE name = 'observation-schema'")

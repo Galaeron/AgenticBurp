@@ -61,7 +61,7 @@ This is the core path. When the Burp extension sends an HTTP exchange to `POST /
 17. **Auto-escalation** -- if engagement policy allows, escalates to deeper investigation.
 18. **Persist + respond** -- findings stored in SQLite (`store.py`), response returned.
 
-### The engagement investigation (`orchestrator_chain.py: investigate_engagement()`)
+### The engagement investigation (`orchestrator_chain.py: investigate_engagement()`, run as the stages in `orchestrator_chain_*.py`)
 
 `POST /engagement/{host}/investigate` runs a whole-application investigation as a background job, with the supplied identities (roles). In outline:
 
@@ -75,7 +75,7 @@ This is the core path. When the Burp extension sends an HTTP exchange to `POST /
 
 ### Evidence ledger
 
-Every step emits events to an append-only ledger (`evidence_ledger.py`). Events carry a `Provenance` envelope (code version, config fingerprint, model tag). The ledger is wired into agents (HYPOTHESIS events), validators (EXECUTION events), the confirmation gate (FINDING_REVISION events), and the orchestrator (RUN_SUMMARY). Persisted to SQLite and exposed via `GET /findings/{finding_ref}/evidence`.
+Every step emits events to an append-only ledger (`evidence_ledger.py`). Events carry a `Provenance` envelope (code version, config fingerprint, model tag). The ledger is wired into agents (HYPOTHESIS events), validators (EXECUTION events), the confirmation gate (FINDING_REVISION events), and the orchestrator (RUN_SUMMARY). Persisted to SQLite and exposed via `GET /findings/{finding_ref}/evidence`. Persisted rows are hash-chained per finding; `python tools/verify_evidence_ledger.py` reports an edited, deleted, inserted or reordered row (see the script header for what the chain cannot show).
 
 ## Components
 
@@ -122,9 +122,9 @@ Assembled from the mixins below. `__init__` constructs: `OllamaClient`, coordina
 
 | Mixin | Module | Key methods |
 |---|---|---|
-| `DetectMixin` | `orchestrator_detect.py` | `analyze()`, `_choose_agents()`, `_maybe_adaptive_respin()`, `_resolve_known_vulnerabilities()` |
+| `DetectMixin` | `orchestrator_detect.py` (steps in `orchestrator_detect_steps.py`) | `analyze()`, `_choose_agents()`, `_maybe_adaptive_respin()`, `_resolve_known_vulnerabilities()` |
 | `ConfirmMixin` | `orchestrator_confirm.py` | `_validate_findings()`, `run_active_probe()`, `run_retry_agents()`, `_coverage_proof()` |
-| `ChainMixin` | `orchestrator_chain.py` | `plan_engagement()`, `run_engagement()`, `investigate_engagement()` |
+| `ChainMixin` | `orchestrator_chain.py` (stages in `orchestrator_chain_{discovery,legs,worklist,coverage,finish}.py`) | `plan_engagement()`, `run_engagement()`, `investigate_engagement()` |
 | `ReportMixin` | `orchestrator_report.py` | `plan_allocation()`, `estimate_for_urls()`, `list_models()`, `set_coordinator_model()` |
 
 ### Agents (`harness/agents/`)

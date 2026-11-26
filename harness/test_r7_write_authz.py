@@ -20,6 +20,7 @@ from harness.run_handoff import RESTORED, RESTORE_FAILED, RESTORE_SEND
 from harness.test_b1_write_authz import _Fixture, _Handler
 from harness.validators.cross_identity_validator import (
     _choose_write_field, _protected_field, _unwrap_envelope)
+from harness.chain_stage_patch import chain_patch
 
 
 class _EnvelopeHandler(_Handler):
@@ -112,8 +113,8 @@ class ChainDispatchTests(_Base):
                                                        finding_class="x", summary="stub"))
         with patch.object(engagement_builder, "build_engagement", new=build), \
              patch.object(worklist_investigator, "investigate_worklist", new=investigate), \
-             patch("harness.orchestrator_chain.review_captured_exchanges", new=AsyncMock(return_value=0)), \
-             patch("harness.orchestrator_chain.universal_header_audit", new=AsyncMock(return_value=0)), \
+             chain_patch("review_captured_exchanges", new=AsyncMock(return_value=0)), \
+             chain_patch("universal_header_audit", new=AsyncMock(return_value=0)), \
              patch.object(IdorReadValidator, "validate", new=skip), \
              patch.object(AuthSequenceValidator, "validate", new=skip), \
              patch.object(missing_auth_probe, "probe", new=AsyncMock(side_effect=RuntimeError("stub"))), \
@@ -145,7 +146,7 @@ class ChainDispatchTests(_Base):
         self.assertEqual(self.server.obj, self.original)
 
     def test_shape_gap_unit_contract(self):
-        from harness.orchestrator_chain import _access_control_shape_gap
+        from harness.orchestrator_chain_support import _access_control_shape_gap
         from harness.validators.cross_identity_validator import CrossIdentityValidator
         put = HttpExchange(url=self.url, method="PUT")
         self.assertEqual(_access_control_shape_gap(put, CrossIdentityValidator(allow_writes=True)), "")

@@ -24,7 +24,7 @@ from unittest.mock import patch
 
 from harness import execution_registry
 from harness.execution_registry import ExecutionRegistry
-from harness.orchestrator_chain import _ConfirmationCache
+from harness.orchestrator_chain_support import _ConfirmationCache
 from harness.run_context import RunContext, TypedRequest
 from harness import test_execution_registry as registry_tests
 from harness.test_engagement_transport_callers import _EngagementCallerBase, _config

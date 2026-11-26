@@ -23,6 +23,7 @@ import harness.orchestrator_chain  # noqa: F401
 from harness.models import Finding, HttpExchange
 from harness.run_context import transport_for
 from harness.test_run_context import _Fixture
+from harness.chain_stage_patch import chain_patch
 
 
 def _passive(real):
@@ -40,7 +41,7 @@ def _force_passive():
     real = rc_mod.transport_for
     wrapped = _passive(real)
     stack.enter_context(patch.object(rc_mod, "transport_for", wrapped))
-    stack.enter_context(patch("harness.orchestrator_chain.transport_for", wrapped))
+    stack.enter_context(chain_patch("transport_for", wrapped))
     stack.enter_context(patch("harness.iterative_agent.transport_for", wrapped))
     return stack
 

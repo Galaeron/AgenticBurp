@@ -24,14 +24,17 @@ _LEGACY_SQL = Path(__file__).resolve().parent / "testing_fixtures" / "state_sche
 # finding_inputs side tables are the other objects added since this fixture (their
 # own legacy-read and rollback tests: test_proof_identity_migration,
 # test_i16_persist, test_finding_dedup; proof_evidence_source:
-# test_tool_reported_accounting; plane_dispatches: test_plane_dispatch).
+# test_tool_reported_accounting; plane_dispatches: test_plane_dispatch; ARC-13's
+# ledger_chain: test_evidence_ledger_chain).
 _NEW_OBJECTS = {"exchange_observations", "observation_attributions",
                 "idx_exchange_observations_scope", "idx_exchange_observations_endpoint",
                 "proof_identity", "engagement_declarations", "finding_inputs",
-                "plan_dispatch_notes", "proof_evidence_source", "plane_dispatches"}
+                "plan_dispatch_notes", "proof_evidence_source", "plane_dispatches",
+                "ledger_chain", "idx_ledger_chain_seq"}
 _NEW_MARKERS = sorted([repr(("observation-schema", "1")), repr(("proof-identity-schema", "1")),
                        repr(("engagement-declarations-schema", "1")), repr(("finding-inputs-schema", "1")),
-                       repr(("plan-dispatch-schema", "1")), repr(("plane-dispatch-schema", "1"))])
+                       repr(("plan-dispatch-schema", "1")), repr(("plane-dispatch-schema", "1")),
+                       repr(("ledger-chain-schema", "1"))])
 _LEGACY_URL = "https://legacy.example/api/orders/7"
 
 
@@ -156,9 +159,10 @@ class ObservationMigrationTests(unittest.TestCase):
             conn.execute("DROP TABLE plan_dispatch_notes")
             conn.execute("DROP TABLE proof_evidence_source")
             conn.execute("DROP TABLE plane_dispatches")
+            conn.execute("DROP TABLE ledger_chain")
             conn.execute("DELETE FROM state_metadata WHERE name IN ('observation-schema', 'proof-identity-schema', "
                          "'engagement-declarations-schema', 'finding-inputs-schema', 'plan-dispatch-schema', "
-                         "'plane-dispatch-schema')")
+                         "'plane-dispatch-schema', 'ledger-chain-schema')")
             conn.commit()
             after = _legacy_identity(conn)
         finally:

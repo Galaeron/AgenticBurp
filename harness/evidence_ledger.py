@@ -30,6 +30,8 @@ answer the five questions.
 from __future__ import annotations
 
 import functools
+import hashlib
+import json
 import os
 import subprocess
 import time
@@ -760,3 +762,180 @@ def reproduction_recipe_persisted(finding_ref: str, *, engagement_id: str | None
     """reproduction_recipe(), reading from the durable store instead of memory."""
     return ledger_from_store(finding_ref, engagement_id=engagement_id,
                              captured_principal=captured_principal).reproduction_recipe(finding_ref)
+
+
+# ---------------------------------------------------------------------------
+# ARC-13: tamper evidence. store.persist_ledger_event chains every durable row
+# (prev_hash -> row_hash, per finding_ref); verify_ledger_rows / verify_ledger
+# below recompute that chain. What this can and cannot show:
+#   - It detects an edited, deleted, inserted or reordered row anywhere BEFORE
+#     the newest row of a finding's chain, and names the first row that fails.
+#   - It does NOT detect removal of the newest rows of a chain, a deleted whole
+#     finding, or a rewrite that recomputes every later hash: the hashes are
+#     unkeyed, so someone with write access to the file can forge a consistent
+#     chain. `digest` is the anchor for that: record it when a ledger is handed
+#     over and pass it back as expect_digest to detect any later change.
+# ---------------------------------------------------------------------------
+
+LEDGER_CHAIN_VERSION = "ledger-chain-v1"
+_MAX_REPORTED_PROBLEMS = 50
+
+
+def ledger_row_hash(*, prev_hash: str, seq: int, event_id: str, event_type: str,
+                    finding_ref: str, case_ref: str, summary: str, data_json: str,
+                    provenance_json: str, engagement_id: str, captured_principal_id: str,
+                    created_at: float) -> str:
+    """sha256 over one ledger row's canonical content and its predecessor's hash.
+
+    The content is a JSON array of the stored column values, not a re-serialisation
+    of the event: the exact `data_json` / `provenance_json` text is hashed, so the
+    verifier needs no knowledge of how they were produced. A JSON array of strings
+    has no delimiter ambiguity. `created_at` is hashed as its float repr, which
+    SQLite's REAL round-trips exactly."""
+    payload = json.dumps(
+        [LEDGER_CHAIN_VERSION, prev_hash, int(seq), event_id, event_type, finding_ref, case_ref,
+         summary, data_json, provenance_json, engagement_id, captured_principal_id,
+         repr(float(created_at))],
+        ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
+def _chain_digest(heads: "dict[str, tuple]") -> str:
+    entries = [[ref, head, count] for ref, (head, count) in sorted(heads.items())]
+    return hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+def verify_ledger_rows(rows) -> dict:
+    """Verify an iterable of ledger rows, given in append order (`seq`, then
+    insertion order) as dicts of store._LEDGER_CHAIN_COLUMNS.
+
+    A row with an empty `row_hash` is an unchained LEGACY row (written before
+    ARC-13): it is counted, never failed -- unless it belongs after the start of
+    its finding's chain, which new code never writes: an unchained row whose
+    `created_at` is later than the finding's first chained row is flagged. A
+    legacy row cannot be verified at all, and a forger who back-dates an
+    unchained row is indistinguishable from real legacy data, so treat the
+    legacy count as unverified and use `strict` for a store that has none.
+    Every chained row must (1) name
+    the previous chained row of its finding as `prev_hash` ('' for the first),
+    (2) have a larger `seq`, and (3) hash to its own `row_hash`. One edited row
+    yields one problem (the chain links on the stored hash, so later rows still
+    verify); a deleted or inserted row shows as a prev mismatch on the row after
+    the gap.
+
+    Returns a JSON-able dict: `ok`, `rows`, `chained`, `legacy_unchained`,
+    `findings`, `problem_count`, `problems` (first 50, in append order),
+    `first_bad` (the first problem or None) and `digest` (see the section note).
+    The digest covers chained rows only: an edit to a legacy row changes no digest."""
+    heads: "dict[str, list]" = {}      # finding_ref -> [head row_hash, chained count, last seq]
+    chain_start: "dict[str, float]" = {}    # finding_ref -> created_at of its first chained row
+    latest_legacy: "dict[str, dict]" = {}   # finding_ref -> its newest unchained row
+    total = chained = legacy = problem_count = 0
+    problems: list = []
+
+    def as_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def flag(row, reasons):
+        nonlocal problem_count
+        problem_count += 1
+        if len(problems) < _MAX_REPORTED_PROBLEMS:
+            problems.append({"event_id": row["event_id"], "finding_ref": row["finding_ref"],
+                             "seq": row["seq"], "reasons": reasons})
+
+    for row in rows:
+        total += 1
+        ref = row["finding_ref"]
+        if not row["row_hash"]:
+            legacy += 1
+            if ref in heads:
+                flag(row, ["unchained-after-chain"])
+            elif ref not in latest_legacy or (as_float(row["created_at"])
+                                              > as_float(latest_legacy[ref]["created_at"])):
+                latest_legacy[ref] = row
+            continue
+        chained += 1
+        chain_start.setdefault(ref, as_float(row["created_at"]))
+        head, count, last_seq = heads.get(ref, ["", 0, 0])
+        reasons = []
+        if row["prev_hash"] != head:
+            reasons.append("missing-predecessor" if not head else "prev-mismatch")
+        try:
+            seq = int(row["seq"])
+            if seq <= last_seq:
+                reasons.append("seq-not-increasing")
+            recomputed = ledger_row_hash(
+                prev_hash=row["prev_hash"], seq=seq, event_id=row["event_id"],
+                event_type=row["event_type"], finding_ref=ref, case_ref=row["case_ref"],
+                summary=row["summary"], data_json=row["data_json"],
+                provenance_json=row["provenance_json"], engagement_id=row["engagement_id"],
+                captured_principal_id=row["captured_principal_id"], created_at=row["created_at"])
+            if recomputed != row["row_hash"]:
+                reasons.append("hash-mismatch")
+        except (TypeError, ValueError):       # a value of the wrong type is itself an edit
+            seq = last_seq
+            reasons.append("malformed-row")
+        if reasons:
+            flag(row, reasons)
+        heads[ref] = [row["row_hash"], count + 1, seq]
+    # Unchained rows sort before every chained row (seq 0), so their position says
+    # nothing; their timestamp against the finding's chain start is all there is.
+    late = [row for ref, row in latest_legacy.items()
+            if ref in chain_start and as_float(row["created_at"]) > chain_start[ref]]
+    for row in late:
+        flag(row, ["unchained-after-chain"])
+    problems.sort(key=lambda p: as_float(p["seq"]))
+    return {
+        "ok": problem_count == 0, "rows": total, "chained": chained, "legacy_unchained": legacy,
+        "findings": len(heads), "problem_count": problem_count, "problems": problems,
+        "first_bad": problems[0] if problems else None,
+        "digest": _chain_digest({ref: (v[0], v[1]) for ref, v in heads.items()}),
+    }
+
+
+def scan_evidence_blobs(blobs) -> dict:
+    """Check `(sha256, bytes)` pairs: a blob whose bytes no longer hash to its key was
+    altered (`corrupt`); one the redactors would still change is `unredacted`
+    (kinds only -- never a value)."""
+    from harness.evidence_redaction import redaction_findings
+    checked = 0
+    corrupt: list = []
+    unredacted: list = []
+    for digest, data in blobs:
+        checked += 1
+        if hashlib.sha256(data).hexdigest() != digest:
+            corrupt.append(digest)
+            continue
+        findings = redaction_findings(data)
+        if findings:
+            unredacted.append({"sha256": digest, "kinds": sorted({kind for kind, _ in findings})})
+    return {"checked": checked, "corrupt": corrupt[:_MAX_REPORTED_PROBLEMS],
+            "corrupt_count": len(corrupt), "unredacted": unredacted[:_MAX_REPORTED_PROBLEMS],
+            "unredacted_count": len(unredacted),
+            "ok": not corrupt and not unredacted}
+
+
+def verify_ledger(db_path=None, *, strict: bool = False, check_blobs: bool = False,
+                  expect_digest: str | None = None) -> dict:
+    """Verify the durable ledger in the store file at `db_path` (default: the live
+    store), read-only. `verify_ledger_rows` plus three optional tightenings, each of
+    which can only turn `ok` to False:
+      strict         -- unchained legacy rows are a failure, not a note.
+      expect_digest  -- the chain `digest` recorded earlier must match now (detects
+                        removed newest rows and wholesale rewrites).
+      check_blobs    -- also scan every evidence blob (see scan_evidence_blobs)."""
+    from harness import store
+    report = verify_ledger_rows(store.iter_ledger_chain_rows(db_path))
+    if strict and report["legacy_unchained"]:
+        report["ok"] = False
+        report["strict_failure"] = f"{report['legacy_unchained']} unchained legacy row(s)"
+    if expect_digest is not None:
+        report["digest_matches"] = report["digest"] == expect_digest
+        report["ok"] = report["ok"] and report["digest_matches"]
+    if check_blobs:
+        report["blobs"] = scan_evidence_blobs(store.iter_evidence_blobs(db_path))
+        report["ok"] = report["ok"] and report["blobs"]["ok"]
+    return report

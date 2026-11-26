@@ -22,6 +22,7 @@ from harness import principals
 from harness.models import AgentReport, Finding, HttpExchange
 from harness.run_context import RunContext
 from harness.validators.registry import ValidatorRegistry
+from harness.chain_stage_patch import chain_patch
 
 _EMAIL = {"Bearer a": "alice@example.test", "Bearer b": "bob@example.test"}
 _ALLOWED_ACCOUNT_FIELDS = {"email", "password", "name"}
@@ -574,8 +575,8 @@ class ChainCallerTests(_Fixture):
 
         with patch.object(engagement_builder, "build_engagement", new=build), \
              patch.object(worklist_investigator, "investigate_worklist", new=investigate), \
-             patch("harness.orchestrator_chain.review_captured_exchanges", new=AsyncMock(return_value=0)), \
-             patch("harness.orchestrator_chain.universal_header_audit", new=AsyncMock(return_value=0)), \
+             chain_patch("review_captured_exchanges", new=AsyncMock(return_value=0)), \
+             chain_patch("universal_header_audit", new=AsyncMock(return_value=0)), \
              patch.object(WriteIntegrityValidator, "validate", spy), \
              patch.object(missing_auth_probe, "probe", new=AsyncMock(side_effect=RuntimeError("stub"))), \
              patch.object(orch, "_persist_confirmation_proof",

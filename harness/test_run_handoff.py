@@ -33,7 +33,10 @@ _HARNESS = Path(__file__).resolve().parent
 
 class PhaseListTest(unittest.TestCase):
     def test_run_phases_match_the_phases_investigate_engagement_opens(self):
-        src = (_HARNESS / "orchestrator_chain.py").read_text(encoding="utf-8")
+        # ARC-9: the stages run in this order; each module holds its stages in source order.
+        src = "\n".join((_HARNESS / f"{stage}.py").read_text(encoding="utf-8") for stage in (
+            "orchestrator_chain_discovery", "orchestrator_chain_legs", "orchestrator_chain_worklist",
+            "orchestrator_chain_coverage", "orchestrator_chain_finish"))
         opened = list(dict.fromkeys(re.findall(r'_instr\.phases\.begin\(\s*"([a-z_]+)"', src)))
         self.assertEqual(opened, list(run_handoff.RUN_PHASES))
 

@@ -171,7 +171,7 @@ class EngagementCapabilityTests(unittest.TestCase):
     def test_catalog_aliases_and_registered_families_reach_engagement_dispatch(self):
         from harness import test_smoke_investigate as smoke
         from harness.orchestrator import Orchestrator
-        from harness.orchestrator_chain import _ConfirmationCache
+        from harness.orchestrator_chain_support import _ConfirmationCache
         from harness.engagement import EngagementState
         from harness.role_crawl import RoleCrawlResult
         from harness.validators.base import ValidationResult
@@ -235,7 +235,7 @@ class EngagementCapabilityTests(unittest.TestCase):
         explicit disable of another driven family still removes it."""
         from harness import test_smoke_investigate as smoke
         from harness.orchestrator import Orchestrator
-        from harness.orchestrator_chain import _ConfirmationCache
+        from harness.orchestrator_chain_support import _ConfirmationCache
         from harness.validators.base import ValidationResult
         cfg = smoke._test_config()
         self.assertFalse(cfg['validators']['cross_identity']['enabled'])
@@ -285,7 +285,7 @@ class AddedDriveLegCallerTests(unittest.TestCase):
         from harness.engagement import EngagementState
         from harness.models import HttpExchange
         from harness.orchestrator import Orchestrator
-        from harness.orchestrator_chain import _ConfirmationCache
+        from harness.orchestrator_chain_support import _ConfirmationCache
         from harness.role_crawl import RoleCrawlResult, RoleSession
         from harness.run_context import RunContext
         from harness.validators.base import ValidationResult
