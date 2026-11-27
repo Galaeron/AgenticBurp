@@ -381,6 +381,8 @@ CREATE INDEX IF NOT EXISTS idx_ledger_finding_ref ON ledger_events(finding_ref);
 # rather than silently served. Purely additive and read-only from every verdict/
 # severity/scope decision's perspective -- only the P0-6 resolvability assessment
 # (evidence_ledger._assess_completeness) and report/API display consult it.
+# Every byte read goes through read_evidence_blob, which re-hashes the row, so
+# no reader (leads, write-ups, the app map, exports) can serve a mismatched row.
 _EVIDENCE_BLOB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS evidence_blobs (
     sha256 TEXT PRIMARY KEY,
@@ -3291,20 +3293,29 @@ def put_evidence_blob(data: bytes) -> str:
     return digest
 
 
-def get_evidence_blob(h: str, *, conn: "sqlite3.Connection | None" = None) -> bytes | None:
-    """The raw bytes stored under hash `h`, or None if absent. Does not
-    re-verify the hash -- see evidence_blob_resolves() for the verified
-    presence check that resolvability depends on.
+# Evidence read status values (read_evidence_blob). A hash mismatch is an error
+# state of its own: the row exists but its bytes are not the evidence the hash
+# names, so no reader may serve them.
+BLOB_RESOLVED = "resolved"
+BLOB_MISSING = "missing"
+BLOB_HASH_MISMATCH = "hash_mismatch"
+
+
+def read_evidence_blob(h: str, *, conn: "sqlite3.Connection | None" = None
+                       ) -> "tuple[str, bytes | None]":
+    """(status, bytes) for hash `h`, re-verified on every read.
+
+    status is BLOB_RESOLVED (bytes are returned and hash to `h`), BLOB_MISSING
+    (no row, or an empty hash) or BLOB_HASH_MISMATCH (a row exists but its bytes
+    no longer hash to `h`: corrupted, truncated or rewritten). Bytes are returned
+    only when resolved, so a caller cannot serve a mismatched row by mistake.
 
     `conn`: optional already-open connection to run this lookup on, instead
     of opening (and closing) a fresh one just for this one hash (RA-4: lets
     a batched report reuse ONE connection across every blob hash it needs to
-    resolve, rather than one fresh connection per hash). Omitted (the
-    default, and what every existing caller gets) preserves the exact prior
-    behavior; a caller-supplied `conn` is never closed here -- that stays
-    the caller's responsibility."""
+    resolve). A caller-supplied `conn` is never closed here."""
     if not h:
-        return None
+        return BLOB_MISSING, None
     owns_conn = conn is None
     c = conn if conn is not None else _connect()
     try:
@@ -3314,8 +3325,22 @@ def get_evidence_blob(h: str, *, conn: "sqlite3.Connection | None" = None) -> by
         if owns_conn:
             c.close()
     if row is None:
-        return None
-    return bytes(row[0])
+        return BLOB_MISSING, None
+    raw = row[0]
+    # A row rewritten as TEXT (e.g. by a SQL concatenation) is hashed as its UTF-8
+    # bytes, so it is judged on content like any other row rather than crashing.
+    data = raw.encode("utf-8", "surrogateescape") if isinstance(raw, str) else bytes(raw)
+    if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), str(h)):
+        return BLOB_HASH_MISMATCH, None
+    return BLOB_RESOLVED, data
+
+
+def get_evidence_blob(h: str, *, conn: "sqlite3.Connection | None" = None) -> bytes | None:
+    """The bytes stored under hash `h`, or None if absent OR if they no longer
+    hash to `h` (evidence integrity, 2026-11-26: every read re-verifies, so a
+    corrupted row is never served; read_evidence_blob tells the two apart).
+    `conn`: see read_evidence_blob."""
+    return read_evidence_blob(h, conn=conn)[1]
 
 
 def evidence_blob_resolves(h: str, *, conn: "sqlite3.Connection | None" = None) -> bool:
@@ -3324,13 +3349,9 @@ def evidence_blob_resolves(h: str, *, conn: "sqlite3.Connection | None" = None) 
     a present-but-corrupted row (or one that was deleted) resolves False,
     same as a hash that was never stored at all.
 
-    `conn`: optional shared connection, forwarded to get_evidence_blob (see
-    its docstring) -- RA-4 batched-report perf. Omitted (the default)
-    preserves the exact prior one-connection-per-call behavior."""
-    data = get_evidence_blob(h, conn=conn)
-    if data is None:
-        return False
-    return hashlib.sha256(data).hexdigest() == h
+    `conn`: optional shared connection, forwarded to read_evidence_blob (see
+    its docstring) -- RA-4 batched-report perf."""
+    return read_evidence_blob(h, conn=conn)[0] == BLOB_RESOLVED
 
 
 # ---------------------------------------------------------------------------

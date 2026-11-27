@@ -625,8 +625,33 @@ class EvidenceBlobStoreTests(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
-        self.assertIsNotNone(store.get_evidence_blob(h))  # a row is still there...
+        conn = store._connect()
+        try:  # a row is still there...
+            self.assertIsNotNone(conn.execute(
+                "SELECT data FROM evidence_blobs WHERE sha256 = ?", (h,)).fetchone())
+        finally:
+            conn.close()
         self.assertFalse(store.evidence_blob_resolves(h))  # ...but it does not verify
+        # Evidence integrity (2026-11-26): the byte reader re-verifies too, so the
+        # tampered bytes are never served; the status names the mismatch.
+        self.assertIsNone(store.get_evidence_blob(h))
+        self.assertEqual(store.read_evidence_blob(h),
+                         (store.BLOB_HASH_MISMATCH, None))
+        self.assertEqual(store.read_evidence_blob("0" * 64), (store.BLOB_MISSING, None))
+
+
+    def test_a_row_rewritten_as_text_is_judged_on_content(self):
+        # A SQL concatenation turns the BLOB into TEXT; the reader hashes it rather
+        # than crashing, and the changed content is a mismatch, never served.
+        h = store.put_evidence_blob(b"original bytes")
+        conn = store._connect()
+        try:
+            conn.execute("UPDATE evidence_blobs SET data = data || 'x' WHERE sha256 = ?", (h,))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(store.read_evidence_blob(h), (store.BLOB_HASH_MISMATCH, None))
+        self.assertFalse(store.evidence_blob_resolves(h))
 
 
 class EvidenceRetentionPolicyTests(unittest.TestCase):
