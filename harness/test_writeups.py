@@ -82,6 +82,25 @@ class WriteupCallerTests(unittest.TestCase):
             self.assertEqual(Path(paths[0]).name, w["filename"])
             self.assertEqual(Path(paths[0]).read_text(encoding="utf-8"), md)
 
+    # --- evidence integrity (2026-11-26): a corrupted proof blob is not served ----
+    def test_a_corrupted_proof_blob_gives_no_writeup(self):
+        from harness import store
+        self._prove_cross_owner_read()
+        self._writeup()                                  # control: intact proof, one write-up
+        conn = store._connect()
+        try:
+            n = conn.execute("UPDATE evidence_blobs SET data = ? ",
+                             (b'{"url": "http://forged.test/x", "method": "GET", "status": 200}',)
+                             ).rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertGreater(n, 0)
+        exports = self._export(export_markdown=True)
+        self.assertTrue(exports)                          # the issue is still exported...
+        self.assertEqual([e for e in exports if e.get("writeup")], [])   # ...without a write-up
+        self.assertNotIn("forged.test", repr(exports))
+
     # --- negative control: an unproven candidate ----------------------------------
     # --- r7: a captured session is never named as the principal "captured" ---------
     def _principals_line(self, md: str) -> str:

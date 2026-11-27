@@ -287,6 +287,30 @@ class AppMapCallerTests(_IsolatedStateCase, unittest.TestCase):
             "PUT /api/items/{id}"])
         self.assertEqual(doc, self._get_map())                      # deterministic
 
+    def test_a_corrupted_capture_gives_no_fields_and_is_named_unresolved(self):
+        """Evidence integrity (2026-11-26): the map reads capture bytes through the
+        verified reader. An intact store lists no unresolved capture (control); a
+        capture whose blob no longer hashes to its sha256 contributes no fields
+        and is named in sources.evidence_unresolved."""
+        doc = self._get_map()
+        self.assertEqual(doc["sources"]["evidence_unresolved"], [])
+        self.assertIn("is_admin", {f["field"] for f in doc["value_fields"]})
+        conn = store._connect()
+        try:
+            oid, sha = conn.execute("SELECT observation_id, evidence_sha256 FROM exchange_observations "
+                                    "WHERE method = 'PATCH'").fetchone()
+            conn.execute("UPDATE evidence_blobs SET data = ? WHERE sha256 = ?",
+                         (b'{"request_body": {"is_superuser": true}}', sha))
+            conn.commit()
+        finally:
+            conn.close()
+        doc = self._get_map()
+        self.assertEqual(doc["sources"]["evidence_unresolved"], [oid])
+        fields = {f["field"] for f in doc["value_fields"]}
+        self.assertNotIn("is_admin", fields)        # the capture's real bytes are gone
+        self.assertNotIn("is_superuser", fields)    # and the rewritten bytes are not served
+        self.assertIn("quantity", fields)           # intact captures still feed the map
+
     def test_building_the_map_sends_no_traffic_and_calls_no_model(self):
         self._seed_asm()
         self._get_map()
