@@ -27,6 +27,7 @@ network, no LLM; it reconciles what the run already produced.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import hashlib
@@ -360,6 +361,160 @@ def _drive_order(items, unauthenticated, spent=None):
     return chain(_fair_cells(passive, unauthenticated),
                  _time_fair_cells(sending, unauthenticated, spent))
 
+# Worker pool for the drive (engagement.coverage_drive_workers; 1 = one cell at a
+# time, as before). With more workers, a leg in the EXCLUSIVE lane never overlaps
+# another send: its oracle reads timing, concurrency or target state (a burst, a
+# rate limit, a time-based payload, a write and its read-back, a browser driver a
+# leg shares). Only the legs named in _SHARED_LEG_CONFIRMATIONS may overlap, and
+# then only on a read (GET, HEAD, OPTIONS): any other method is exclusive, whatever its leg.
+# A leg named in neither set (a new one) is exclusive until it is classified.
+_EXCLUSIVE_LEG_CONFIRMATIONS = frozenset({
+    # timing / concurrency oracles
+    "race_condition", "toctou", "rate_limit", "http_request_smuggling",
+    # sqlmap: time-based blind techniques, and an external tool run
+    "sqlmap",
+    # writes, plants, flows and their read-backs (target state)
+    "write_integrity", "verb_tamper", "file_upload", "csrf", "client_trust",
+    "stored_xss", "sequence", "reset_token", "auth_sequence", "deserialization_oob",
+    "xxe",  # an XML POST whatever the captured method
+    # one browser driver per validator; overlapping visits are not established safe
+    "browser_xss", "dom_xss",
+    # multi-step protocol flows, not established safe to overlap
+    "oauth", "websocket",
+})
+# Read-only legs whose oracle is a response diff, a reflected header or an
+# out-of-band callback on a unique token: safe to overlap on a GET/HEAD/OPTIONS cell.
+_SHARED_LEG_CONFIRMATIONS = frozenset({
+    "cross_identity", "jwt_forge", "ssrf", "ssti", "command_injection", "path_traversal",
+    "open_redirect", "csp", "cors", "nosql", "header_injection", "listing_exposure",
+    "filter_bypass", "metrics_exposure", "sensitive_file", "well_known",
+})
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_STOP, _WAIT, _GO = "stop", "wait", "go"
+
+
+def _drive_lane(endpoint: str, check) -> str:
+    """"passive" (sends nothing), "shared" (may overlap other shared cells, one in
+    flight per identity) or "exclusive" (runs alone) for a drive cell."""
+    confirmation = getattr(check, "confirmation", "")
+    if confirmation in _PASSIVE_LEG_CONFIRMATIONS:
+        return "passive"
+    method = str(endpoint).partition(" ")[0].upper()
+    if confirmation in _SHARED_LEG_CONFIRMATIONS and method in _READ_METHODS:
+        return "shared"
+    return "exclusive"
+
+
+def _drive_workers(value) -> int:
+    """engagement.coverage_drive_workers: a real integer of at least 1 (no bool)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"coverage drive workers must be an integer >= 1, got {value!r}")
+    return value
+
+
+async def _run_drive_pool(order, workers: int, claim, dispatch, cell_of, stats: dict) -> None:
+    """Dispatch the cells of `order` with up to `workers` in flight.
+
+    `claim(item, running)` is called synchronously, with no await between the
+    decision and the claim, so a cell is claimed exactly once and the budget it
+    reserves is never handed to another worker; it returns _GO, _WAIT (only while
+    cells are in flight: a finishing cell may free what this one needs) or _STOP
+    (the budget or deadline is spent: no worker claims again; started cells
+    finish). Claims follow `order`, which is read lazily (a time-fair order reads
+    the seconds each check has used): a worker takes the first cell of the next
+    `workers` that may start now. A shared cell waits while another cell of its
+    identity is in flight; an exclusive cell waits until nothing is in flight, and
+    no cell behind it is claimed before it, so it always runs alone. With one
+    worker this is the plain sequential loop. Cancelling the drive cancels every
+    worker; a worker that raises cancels the others and the error propagates."""
+    stats.update(workers=workers, max_in_flight=0, exclusive_dispatches=0)
+    if workers <= 1:
+        for item in order:
+            if claim(item, 0) != _GO:
+                return
+            stats["max_in_flight"] = 1
+            stats["exclusive_dispatches"] += _drive_lane(cell_of(item)[1], cell_of(item)[2]) == "exclusive"
+            await dispatch(item)
+        return
+    source = iter(order)
+    window: deque = deque()
+    cond = asyncio.Condition()
+    pool = {"running": 0, "exclusive": False, "stop": False, "exhausted": False}
+    busy: dict[str, int] = {}
+
+    def refill():
+        while not pool["exhausted"] and len(window) < workers:
+            try:
+                window.append(next(source))
+            except StopIteration:
+                pool["exhausted"] = True
+
+    def startable():
+        refill()
+        for index, item in enumerate(window):
+            ident, endpoint, check = cell_of(item)
+            lane = _drive_lane(endpoint, check)
+            if lane == "exclusive":
+                return index if pool["running"] == 0 else None   # never bypassed
+            if pool["exclusive"]:
+                return None
+            if lane == "passive" or not busy.get(ident):
+                return index
+        return None
+
+    async def worker():
+        while True:
+            async with cond:
+                while True:
+                    if pool["stop"]:
+                        return
+                    index = startable()
+                    if index is None:
+                        if not window and pool["exhausted"]:
+                            return
+                        await cond.wait()
+                        continue
+                    item = window[index]
+                    verdict = claim(item, pool["running"])
+                    if verdict == _STOP:
+                        pool["stop"] = True
+                        cond.notify_all()
+                        return
+                    if verdict == _WAIT:
+                        await cond.wait()
+                        continue
+                    del window[index]
+                    break
+                ident, endpoint, check = cell_of(item)
+                lane = _drive_lane(endpoint, check)
+                pool["running"] += 1
+                stats["max_in_flight"] = max(stats["max_in_flight"], pool["running"])
+                if lane == "exclusive":
+                    pool["exclusive"] = True
+                    stats["exclusive_dispatches"] += 1
+                elif lane == "shared":
+                    busy[ident] = busy.get(ident, 0) + 1
+            try:
+                await dispatch(item)
+            finally:
+                async with cond:
+                    pool["running"] -= 1
+                    if lane == "exclusive":
+                        pool["exclusive"] = False
+                    elif lane == "shared":
+                        busy[ident] -= 1
+                    cond.notify_all()
+
+    tasks = [asyncio.ensure_future(worker()) for _ in range(workers)]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 # E7: a drive hands its checkpoint to `on_checkpoint` after every this many completed
 # legs, so a run that dies inside a long drive resumes from the last of them.
 CHECKPOINT_EVERY_LEGS = 25
@@ -418,6 +573,9 @@ class CoverageTracker:
         self.stopped_by = None
         # Passive legs judged (no send, no budget); the drivers return only budgeted dispatches.
         self.passive_judged = 0
+        # The last drive's pool: workers, the most cells in flight at once, and
+        # how many dispatches ran in the exclusive lane (_run_drive_pool).
+        self.drive_pool: dict = {}
         # canonical vulnerability_class -> [check_id]; plus the raw class token so
         # a check class canonicalize() returns None for (e.g. "misconfig") still maps.
         self._class_to_checks: dict[str, list[str]] = {}
@@ -753,7 +911,8 @@ class CoverageTracker:
         return out
 
     async def drive_coverage_legs(self, run_leg, *, driveable: set[str] | None = None,
-                                  budget: int = 80, deadline: float | None = None, readiness=None) -> int:
+                                  budget: int = 80, deadline: float | None = None, readiness=None,
+                                  workers: int = 1) -> int:
         """Actively FIRE each applicable+pending leg-backed cell via the injected
         async `run_leg(identity, method, path, check) -> result` (result exposing
         .status / .summary, or None to skip), recording the REAL outcome. This is
@@ -762,55 +921,69 @@ class CoverageTracker:
         independent of whether the LLM labelled it. Returns the budgeted (sending)
         cells driven; passive judgements are counted in `passive_judged`. Bounded
         by `budget` (a passive leg spends none) so a large surface can't fan out unboundedly, and by
-        `deadline` (a `time.monotonic()` value) so it ends in time."""
+        `deadline` (a `time.monotonic()` value) so it ends in time. `workers` cells
+        may be in flight at once (`_run_drive_pool`); 1, the default, drives one at
+        a time."""
+        workers = _drive_workers(workers)
         self.evaluate_readiness(readiness)
-        n = 0
         self.driveable = set(_LEG_CONFIRMATIONS if driveable is None else driveable)
         pending = self.pending_leg_cells(driveable)
         self.queued.update((ident, ep_key, check.id) for ident, ep_key, check in pending)
-        spent = 0
         # Under a deadline each check's dispatch seconds steer the order (_drive_order).
         seconds: dict[str, float] | None = {} if deadline is not None else None
-        for (ident, ep_key, check) in _drive_order(pending, self._unauthenticated(), seconds):
+        count = {"claimed": 0, "spent": 0}
+
+        def claim(item, _running):
+            ident, ep_key, check = item
             passive = check.confirmation in _PASSIVE_LEG_CONFIRMATIONS
-            if not passive and spent >= budget:
+            if not passive and count["spent"] >= budget:
                 self.stopped_by = "leg budget"
-                break
+                return _STOP
             if deadline is not None and time.monotonic() >= deadline:
                 self.stopped_by = "time budget"
-                break
-            self._checkpoint_after(n)
-            n += 1
-            spent += not passive  # Bound attempts, including failed or declined dispatches.
+                return _STOP
+            self._checkpoint_after(count["claimed"])
+            count["claimed"] += 1
+            count["spent"] += not passive  # Bound attempts, including failed or declined dispatches.
             self.passive_judged += passive
             self.attempted.add((ident, ep_key, check.id))
-            method, _, path = ep_key.partition(" ")
-            started = time.monotonic()
-            try:
-                res = await run_leg(ident, method, path, check)
-            except Exception as e:  # a leg blowing up must not sink coverage
-                log.debug("drive_coverage_legs: %s on %s failed: %s", check.confirmation, ep_key, e)
-                self.matrix.record(ident, ep_key, check.id, status=CellStatus.ERROR,
-                                   reason=f"validator dispatch failed: {type(e).__name__}",
-                                   validator=check.confirmation, executed=False)
-                continue
-            finally:
-                if seconds is not None:
-                    seconds[check.id] = seconds.get(check.id, 0.0) + time.monotonic() - started
-            if res is None:
-                self.matrix.record(ident, ep_key, check.id, status=CellStatus.INCONCLUSIVE,
-                                   reason="validator dispatch returned no result", validator=check.confirmation)
-                continue
-            status = _covered_status(res, _LEG_STATUS.get(getattr(res, "status", ""), _LEG_STATUS_UNKNOWN))
-            executed, fresh, referenced = _attempt_facts(res, status)
-            self.matrix.record(
-                ident, ep_key, check.id, status=status,
-                reason=(getattr(res, "summary", "") or f"{check.confirmation} leg driven off the matrix")[:180],
-                confidence=getattr(res, "confidence", None),
-                validator=getattr(res, "validator", None) or check.confirmation,
-                evidence=(getattr(res, "evidence", "") or "")[:200],
-                executed=executed, attempts=fresh, referenced_attempts=referenced)
-        return spent
+            return _GO
+
+        async def dispatch(item):
+            await self._drive_leg_cell(run_leg, *item, seconds)
+
+        await _run_drive_pool(_drive_order(pending, self._unauthenticated(), seconds), workers,
+                              claim, dispatch, lambda item: item, self.drive_pool)
+        return count["spent"]
+
+    async def _drive_leg_cell(self, run_leg, ident, ep_key, check, seconds) -> None:
+        """Dispatch one claimed cell of `drive_coverage_legs` and record its outcome."""
+        method, _, path = ep_key.partition(" ")
+        started = time.monotonic()
+        try:
+            res = await run_leg(ident, method, path, check)
+        except Exception as e:  # a leg blowing up must not sink coverage
+            log.debug("drive_coverage_legs: %s on %s failed: %s", check.confirmation, ep_key, e)
+            self.matrix.record(ident, ep_key, check.id, status=CellStatus.ERROR,
+                               reason=f"validator dispatch failed: {type(e).__name__}",
+                               validator=check.confirmation, executed=False)
+            return
+        finally:
+            if seconds is not None:
+                seconds[check.id] = seconds.get(check.id, 0.0) + time.monotonic() - started
+        if res is None:
+            self.matrix.record(ident, ep_key, check.id, status=CellStatus.INCONCLUSIVE,
+                               reason="validator dispatch returned no result", validator=check.confirmation)
+            return
+        status = _covered_status(res, _LEG_STATUS.get(getattr(res, "status", ""), _LEG_STATUS_UNKNOWN))
+        executed, fresh, referenced = _attempt_facts(res, status)
+        self.matrix.record(
+            ident, ep_key, check.id, status=status,
+            reason=(getattr(res, "summary", "") or f"{check.confirmation} leg driven off the matrix")[:180],
+            confidence=getattr(res, "confidence", None),
+            validator=getattr(res, "validator", None) or check.confirmation,
+            evidence=(getattr(res, "evidence", "") or "")[:200],
+            executed=executed, attempts=fresh, referenced_attempts=referenced)
 
     def expand_parameter_cases(self, endpoints: dict[str, dict], *,
                                driveable: set[str] | None = None,
@@ -864,7 +1037,7 @@ class CoverageTracker:
 
     async def drive_coverage_cases(self, run_case, *, driveable: set[str] | None = None,
                                    budget: int = 80, deadline: float | None = None, readiness=None,
-                                   field_cap: int = PER_PARAMETER_FIELD_CAP) -> int:
+                                   field_cap: int = PER_PARAMETER_FIELD_CAP, workers: int = 1) -> int:
         """Fire each PENDING child case via the injected async
         `run_case(identity, method, path, check, case_key) -> result` (result
         exposing .status/.summary/..., or None when the leg produced no send),
@@ -890,7 +1063,11 @@ class CoverageTracker:
         unknown status fails conservatively to INCONCLUSIVE, not an optimistic
         NOT_DETECTED (R06). `deadline`, a `time.monotonic()` value, stops new
         dispatches once passed. Returns the number of budgeted dispatch attempts
-        made; passive judgements are counted in `passive_judged`."""
+        made; passive judgements are counted in `passive_judged`. `workers` cells
+        may be in flight at once (`_run_drive_pool`); a per-parameter cell holds
+        the leg-budget units it can use while it runs, so concurrent cells never
+        spend more than `budget` between them."""
+        _drive_workers(workers)
         # group pending cases by cell so each leg is driven once, at request level
         self.evaluate_readiness(readiness)
         cells: dict[tuple[str, str, str], list] = {}
@@ -904,40 +1081,73 @@ class CoverageTracker:
                 continue
             cells.setdefault((ident, ep_key, check_id), []).append(ck)
 
-        attempts = passive_attempts = 0
         self.driveable = set(_LEG_CONFIRMATIONS if driveable is None else driveable)
         self.queued.update(cells)
         # Under a deadline each check's dispatch seconds steer the order (_drive_order).
         seconds: dict[str, float] | None = {} if deadline is not None else None
-        for (ident, ep_key, check_id) in _drive_order(list(cells), self._unauthenticated(), seconds):
-            cks = cells[(ident, ep_key, check_id)]
-            passive = CHECKS_BY_ID[check_id].confirmation in _PASSIVE_LEG_CONFIRMATIONS
-            if not passive and attempts - passive_attempts >= budget:
+        # attempts: dispatches made (passive ones included, as before); reserved:
+        # leg-budget units a per-parameter cell in flight holds and has not used yet.
+        count = {"attempts": 0, "passive": 0, "reserved": 0}
+        plan: dict = {}
+
+        def claim(item, running):
+            ident, ep_key, check_id = item
+            cks = cells[item]
+            check = CHECKS_BY_ID[check_id]
+            passive = check.confirmation in _PASSIVE_LEG_CONFIRMATIONS
+            committed = count["attempts"] - count["passive"] + count["reserved"]
+            if not passive and committed >= budget:
+                if running and count["reserved"]:
+                    return _WAIT   # a cell in flight may hand back units it does not use
                 self.stopped_by = "leg budget"
-                break
+                return _STOP
             if deadline is not None and time.monotonic() >= deadline:
                 self.stopped_by = "time budget"
-                break
-            self._checkpoint_after(attempts)
-            check = CHECKS_BY_ID[check_id]
+                return _STOP
+            self._checkpoint_after(count["attempts"])
             # the request-level representative the whole-request result binds to
             rep = next((c for c in cks if c.is_no_parameter), cks[0])
-            self.attempted.add((ident, ep_key, check_id))
+            self.attempted.add(item)
             targets = ([c for c in cks if c is not rep and case_target(check.confirmation, c)]
                        if rep.is_no_parameter else [])
-            started = time.monotonic()
             if targets:
-                attempts += await self._drive_parameter_cases(
-                    run_case, ident, ep_key, check, cks, rep, targets, deadline,
-                    budget - (attempts - passive_attempts), field_cap)
+                # At most one dispatch per input under the cap, plus the request-level
+                # attempt: the units this cell can use, held until it finishes.
+                units = min(budget - committed, min(len(targets), field_cap) + 1)
+                count["reserved"] += units
             else:
-                attempts += 1
-                passive_attempts += passive
-                await self._drive_request_level(run_case, ident, ep_key, check, cks, rep)
-            if seconds is not None:
-                seconds[check_id] = seconds.get(check_id, 0.0) + time.monotonic() - started
-        self.passive_judged += passive_attempts
-        return attempts - passive_attempts
+                units = 0
+                count["attempts"] += 1
+                count["passive"] += passive
+            plan[item] = (check, cks, rep, targets, units)
+            return _GO
+
+        async def dispatch(item):
+            ident, ep_key, check_id = item
+            check, cks, rep, targets, units = plan.pop(item)
+            started = time.monotonic()
+            try:
+                if targets:
+                    used = 0
+                    try:
+                        used = await self._drive_parameter_cases(
+                            run_case, ident, ep_key, check, cks, rep, targets, deadline,
+                            units, field_cap)
+                    finally:
+                        count["reserved"] -= units
+                        count["attempts"] += used
+                else:
+                    await self._drive_request_level(run_case, ident, ep_key, check, cks, rep)
+            finally:
+                if seconds is not None:
+                    seconds[check_id] = seconds.get(check_id, 0.0) + time.monotonic() - started
+
+        await _run_drive_pool(_drive_order(list(cells), self._unauthenticated(), seconds),
+                              _drive_workers(workers), claim, dispatch,
+                              lambda item: (item[0], item[1], CHECKS_BY_ID[item[2]]),
+                              self.drive_pool)
+        self.passive_judged += count["passive"]
+        return count["attempts"] - count["passive"]
 
     async def _drive_request_level(self, run_case, ident, ep_key, check, cks, rep, *,
                                    remainder_only: bool = False) -> None:
@@ -1424,12 +1634,13 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
                                 budget: int = 80, investigated_keys: set[str] | None = None,
                                 checkpoint=None, context_key="",
                                 deadline: float | None = None, on_checkpoint=None, readiness=None,
-                                tracker_out: list | None = None) -> dict:
+                                tracker_out: list | None = None, workers: int = 1) -> dict:
     """Like build_coverage, but ACTIVELY DRIVES the deterministic legs (I1): after
     recording the findings the run already produced, it fires every applicable
     leg-backed cell via `run_leg` (regardless of any agent label) and records the
     real outcome, THEN reasons over what is still pending. Async because the
     driving sends live traffic through the injected `run_leg` seam."""
+    _drive_workers(workers)
     tracker = CoverageTracker()
     endpoints = endpoint_view(state)
     identities, identity_roles = _identities_of(roles)
@@ -1440,14 +1651,18 @@ async def build_coverage_driven(state, roles, run_leg, *, driveable: set[str] | 
     # honest skip reason below (R01: never fabricate a not_detected).
     tracker.restore_checkpoint(checkpoint, context_key)
     tracker.on_checkpoint = on_checkpoint
+    # `workers` is passed only above 1, so the default call is the former one.
     driven = await tracker.drive_coverage_legs(run_leg, driveable=driveable, budget=budget,
-                                               deadline=deadline, readiness=readiness)
+                                               deadline=deadline, readiness=readiness,
+                                               **({"workers": workers} if workers != 1 else {}))
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
     report = tracker.report()
     report["legs_driven"] = driven
     report["passive_legs_judged"] = tracker.passive_judged
     report["drive_stopped_by"] = tracker.stopped_by
     report["queued_not_attempted"] = len(tracker.queued - tracker.attempted)
+    if workers > 1:   # one worker reports exactly as before
+        report["drive_pool"] = dict(tracker.drive_pool)
     if tracker_out is not None:
         tracker_out.append(tracker)
     return report
@@ -1459,7 +1674,7 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
                                       investigated_keys: set[str] | None = None,
                                       checkpoint=None, context_key="",
                                       deadline: float | None = None, on_checkpoint=None, readiness=None,
-                                      tracker_out: list | None = None) -> dict:
+                                      tracker_out: list | None = None, workers: int = 1) -> dict:
     """Case-granular coverage driving (T05/R26): enumerate each applicable leg
     cell's concrete input cases from the endpoint template, then fire a leg PER
     CASE via `run_case(identity, method, path, check, case_key)` and record the
@@ -1469,6 +1684,7 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     Distinct from `build_coverage_driven` (which drives once per cell): this is the
     finer-grained path the orchestrator uses when parameter-level coverage is
     enabled. Async because driving sends live traffic through `run_case`."""
+    _drive_workers(workers)
     tracker = CoverageTracker()
     endpoints = endpoint_view(state)
     identities, identity_roles = _identities_of(roles)
@@ -1481,7 +1697,8 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
         endpoints, driveable=driveable, per_cell_budget=per_cell_case_budget)
     driven = await tracker.drive_coverage_cases(run_case, driveable=driveable, budget=budget,
                                                 deadline=deadline, readiness=None,
-                                                field_cap=parameter_field_cap)
+                                                field_cap=parameter_field_cap,
+                                                **({"workers": workers} if workers != 1 else {}))
     tracker.finalize_pending_reasons(investigated_keys=set(investigated_keys or ()))
     report = tracker.report()
     report["cases_enumerated"] = enumerated
@@ -1489,6 +1706,8 @@ async def build_coverage_cases_driven(state, roles, run_case, *, driveable: set[
     report["passive_legs_judged"] = tracker.passive_judged
     report["drive_stopped_by"] = tracker.stopped_by
     report["queued_not_attempted"] = len(tracker.queued - tracker.attempted)
+    if workers > 1:   # one worker reports exactly as before
+        report["drive_pool"] = dict(tracker.drive_pool)
     if tracker_out is not None:
         tracker_out.append(tracker)
     return report

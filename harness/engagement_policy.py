@@ -40,6 +40,15 @@ def _field_cap(value) -> int:
     return value
 
 
+def _workers(value) -> int:
+    """engagement.coverage_drive_workers, strictly: a real integer of at least 1
+    (no bool, float or quoted number)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("engagement.coverage_drive_workers must be an integer >= 1, "
+                         f"got {value!r}")
+    return value
+
+
 def _share(value) -> float:
     """engagement.coverage_endpoint_check_share: a fraction from 0 to 1 (no bool)."""
     if isinstance(value, bool):
@@ -98,6 +107,9 @@ class EngagementPolicy:
     # (all identities together; access-control checks per identity). Applies only
     # while the drive is time-bound; 0 = no per-endpoint bound.
     coverage_endpoint_check_share: float = 0.05
+    # Coverage-drive cells in flight at once (added after the refactor). The
+    # default 1 is the former one-at-a-time drive.
+    coverage_drive_workers: int = 1
 
     @classmethod
     def from_config(cls, config: dict) -> "EngagementPolicy":
@@ -133,6 +145,7 @@ class EngagementPolicy:
             investigation_seconds=float(eng_cfg.get("investigation_seconds", 0)),
             coverage_drive_seconds=float(eng_cfg.get("coverage_drive_seconds", 0)),
             coverage_endpoint_check_share=_share(eng_cfg.get("coverage_endpoint_check_share", 0.05)),
+            coverage_drive_workers=_workers(eng_cfg.get("coverage_drive_workers", 1)),
         )
 
     def as_dict(self) -> dict:

@@ -474,6 +474,16 @@ engagement:
   # by the bound are reported as inconclusive (endpoint_check_time_share) and listed
   # under coverage.endpoint_check_time_capped. A fraction from 0 to 1; 0 = no bound.
   coverage_endpoint_check_share: 0.05
+  # Coverage-drive cells in flight at once (coverage_tracker._run_drive_pool). The
+  # drive's legs make no model call, so concurrency.max_parallel_agents does not
+  # bound them. Each cell is claimed once, in the drive's time-fair order; the leg
+  # budget, the run request ceiling and coverage_drive_seconds bind all workers.
+  # Legs whose oracle reads timing or target state (race, TOCTOU, rate limit,
+  # sqlmap, writes, uploads, browser legs, any cell on a write method) run alone,
+  # and one identity has at most one cell in flight. Not forced under passive-only:
+  # that profile already turns coverage_drive_legs off. An integer >= 1;
+  # 1 (the default) drives one cell at a time, as before.
+  coverage_drive_workers: 1
   # Phase time-slices of investigation_seconds (harness/phase_schedule.py). A map of
   # phase -> share for worklist, recrawl, capture_review and chain_rounds: each phase
   # gets its share of the time LEFT when it begins (time a phase leaves unused rolls

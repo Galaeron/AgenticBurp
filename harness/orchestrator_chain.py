@@ -2643,6 +2643,10 @@ class ChainMixin:
             # E7: a caller's checkpoint wins; otherwise the journal's, when an earlier attempt
             # got far enough to write one. It is handed back every N legs of the drive.
             _coverage_kwargs: dict = {"tracker_out": _coverage_trackers}
+            # engagement.coverage_drive_workers: passed only above 1, so the default
+            # drive is called exactly as before.
+            if getattr(self, "coverage_drive_workers", 1) != 1:
+                _coverage_kwargs["workers"] = self.coverage_drive_workers
             if _journal is not None:
                 _coverage_kwargs["on_checkpoint"] = lambda cp: _journal_put("coverage:checkpoint", cp)
                 _stored_checkpoint = (_journal_read(lambda: _journal.get("coverage:checkpoint"), None)
