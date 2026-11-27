@@ -35,7 +35,7 @@
   `cancelled_mid_sweep_leaves_no_review_running` (engagement returned a result); native 38,
   evaluation 452 / 18 skips, integrity 59 OK. Not reproduced in 22 reruns (alone, per batch
   worktree, under CPU stress on this branch and on base, and an ordered replay of the 191
-  modules up to it, 3021 OK). Full run 2: PENDING.
+  modules up to it, 3021 OK). Full run 2 exit 0 (harness 6756 / 8 skips, native 38, eval 452).
 - Base `0fb8cd5`, same container, same day: full exit 0 (harness 6676 / 8 skips, native 38,
   evaluation 452 / 18 skips, integrity 59). Per-batch targeted counts: each batch HANDOFF.
 - Earlier: `4b3a7062`, `9fab7470` full exit 0 (Python 3.14.7); PR #30 full in CI. Java `a3681c5`
