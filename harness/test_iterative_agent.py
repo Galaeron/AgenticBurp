@@ -405,7 +405,8 @@ class DuplicateProposalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([s.n for s in dup_steps], [3, 5, 6])
         # the prompt after the first duplicate (step 3) names it and lists the earlier attempts
         after_dup = ollama.prompts[3]
-        self.assertIn("[step 3] DUPLICATE of step 1 (outcome HTTP 200, 15 bytes): "
+        self.assertIn("[step 3] HARNESS POLICY REFUSAL [duplicate]", after_dup)
+        self.assertIn("Harness reason: DUPLICATE of step 1 (outcome HTTP 200, 15 bytes): "
                       "choose a different supported action or stop", after_dup)
         self.assertEqual(_attempt_lines(after_dup), [
             '- step 1: mutate path:1="2" | GET /api/tickets/2?q=widget | HTTP 200, 15 bytes',
@@ -468,7 +469,8 @@ class DuplicateProposalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(net.sent, [])
         self.assertEqual(result.duplicate_proposals, 1)
         self.assertEqual(result.distinct_requests, 1)  # tried once; blocked at transport
-        self.assertIn("[step 2] DUPLICATE of step 1 (outcome blocked: evil.test out of scope)",
+        self.assertIn("[step 2] HARNESS POLICY REFUSAL [duplicate]", ollama.prompts[2])
+        self.assertIn("Harness reason: DUPLICATE of step 1 (outcome blocked: evil.test out of scope)",
                       ollama.prompts[2])
 
     async def test_request_sent_by_an_earlier_run_of_this_agent_is_a_duplicate(self):
@@ -478,7 +480,8 @@ class DuplicateProposalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(net1.sent), 1)
         self.assertEqual(net2.sent, [])
         self.assertEqual((second.duplicate_proposals, second.distinct_requests), (1, 0))
-        self.assertIn("[step 1] DUPLICATE of an earlier run's request", ollama2.prompts[1])
+        self.assertIn("[step 1] HARNESS POLICY REFUSAL [duplicate]", ollama2.prompts[1])
+        self.assertIn("Harness reason: DUPLICATE of an earlier run's request", ollama2.prompts[1])
 
     async def test_execute_keeps_its_own_signature_check_as_backstop(self):
         agent = IterativeAgent(_ScriptedOllama([]), "m", ["localhost"])
