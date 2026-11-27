@@ -85,6 +85,7 @@ class EnumerationSafeDefaultsTests(unittest.TestCase):
             "coverage_case_budget", "coverage_parameter_field_cap", "capture_review_limit",
             "capture_review_seconds", "coverage_request_reserve",
             "investigation_seconds", "coverage_drive_seconds", "coverage_endpoint_check_share",
+            "coverage_drive_workers",
         }
         self.assertEqual(set(d.keys()), expected_fields)
 
@@ -131,6 +132,9 @@ class ParityTests(unittest.TestCase):
             # Added after the refactor: the per-(endpoint, check) share of a
             # time-bound coverage drive.
             coverage_endpoint_check_share=float(eng_cfg.get("coverage_endpoint_check_share", 0.05)),
+            # Added after the refactor: coverage-drive cells in flight, one by default
+            # (strictly an int, so no coercion to reproduce).
+            coverage_drive_workers=eng_cfg.get("coverage_drive_workers", 1),
         )
 
     def test_parity_on_committed_config(self):
@@ -168,6 +172,7 @@ class ParityTests(unittest.TestCase):
                 "investigation_seconds": "3600",
                 "coverage_drive_seconds": "900",
                 "coverage_endpoint_check_share": "0.1",
+                "coverage_drive_workers": 4,
             },
         }
         policy = EngagementPolicy.from_config(config)
@@ -216,6 +221,25 @@ class ParameterFieldCapTests(unittest.TestCase):
         for value in (True, False, -1, 2.0, "3", None, [3]):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 EngagementPolicy.from_config({"engagement": {"coverage_parameter_field_cap": value}})
+
+
+class CoverageDriveWorkersTests(unittest.TestCase):
+    """engagement.coverage_drive_workers: the committed default drives one cell at
+    a time (as before), and anything but a real integer >= 1 is refused."""
+
+    def test_committed_default_is_one(self):
+        self.assertEqual(EngagementPolicy.from_config(_load_committed_config()).coverage_drive_workers, 1)
+        self.assertEqual(EngagementPolicy.from_config({}).coverage_drive_workers, 1)
+
+    def test_integer_of_at_least_one_is_kept(self):
+        for value in (1, 2, 16):
+            policy = EngagementPolicy.from_config({"engagement": {"coverage_drive_workers": value}})
+            self.assertEqual(policy.coverage_drive_workers, value)
+
+    def test_anything_else_is_refused(self):
+        for value in (True, False, 0, -1, 2.0, "3", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                EngagementPolicy.from_config({"engagement": {"coverage_drive_workers": value}})
 
 
 class OverridePrecedenceTests(unittest.TestCase):

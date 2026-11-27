@@ -915,6 +915,10 @@ class TargetTransport:
             if session and credential_destination:
                 for k, v in session.headers.items():
                     send_headers.setdefault(k, v)
+            # The credentials this send carries. A send that raced a refresh (another
+            # coroutine replaced them while it was in flight) answers for the old
+            # login, so its status says nothing about the session as it now is.
+            sent_generation = session.generation if session else None
             use_http2 = bool((ctx.config.get("transport", {}) or {}).get("http2", False))
             client = (session.client(ctx.timeout, http2=use_http2,
                                      trust_policy=ctx.tls_policy, destination=url,
@@ -946,7 +950,8 @@ class TargetTransport:
                     body_fn=lambda: getattr(resp, "text", ""), request_body=body,
                     content_type=next((v for k, v in send_headers.items()
                                        if (k or "").lower() == "content-type"), ""))
-            if session and credential_destination and capability != _HEALTH_CAPABILITY:
+            if (session and credential_destination and capability != _HEALTH_CAPABILITY
+                    and session.generation == sent_generation):
                 await self._session_feedback(session, resp.status_code, url)
                 await self._freshness_feedback(session, method, url, resp.status_code)
             if ctx.route_feed is not None:
@@ -1020,8 +1025,14 @@ class TargetTransport:
         monitor = self.ctx.freshness()
         if monitor is None or session.health in ("expired", "stale"):
             return
+        seen = (session.generation, session._refreshes)
         if monitor.observe(session, method, url, status):
             async with session.health_lock():
+                # Concurrent sends can each see the window turn stale; the first
+                # acts (refreshes, or tries to), and the rest, waking after it,
+                # stop here rather than spend the refresh limit on the same window.
+                if (session.generation, session._refreshes) != seen:
+                    return
                 await self._session_stale(session, monitor)
 
     async def _session_stale(self, session: ManagedSession, monitor) -> None:
