@@ -74,5 +74,8 @@ def frame(category: str, reason: str) -> str:
 
 
 def short(category: str, reason: str) -> str:
-    """The compact form for one-line attempt summaries (PRIOR ATTEMPTS)."""
+    """The compact form: PRIOR ATTEMPTS lines, and every refusal after the first
+    of its category in one probe (the system prompt explains the marker), so a
+    probe full of refusals grows its prompt by this much per refusal, not by
+    the full framing."""
     return f"{MARKER} [{category}], not sent: {reason}"

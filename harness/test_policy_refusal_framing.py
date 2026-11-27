@@ -217,6 +217,75 @@ class RawValuesUnchangedTests(_Base):
         self.assertIn(framed[0].stop_reason, ("no_progress", "target_distress"))
 
 
+_FULL = "so there is nothing to get around"   # only the full framing says this
+
+
+class PromptGrowthTests(_Base):
+    """The full framing is shown once per category per probe; later refusals of a
+    seen category use the short form, so a refusal-heavy probe's prompt (whose plain
+    history lines _render_history keeps in full) grows by the short form only."""
+
+    N = 100  # duplicates in the long probe
+
+    def _script(self):
+        # fresh send, duplicate of step 1, fresh send, duplicate of step 1, ...: a
+        # fresh send between duplicates keeps the no_progress and duplicate-streak
+        # stops from ending the probe, so all N duplicates reach the model.
+        acts = [_q("v0")]
+        for i in range(1, self.N + 1):
+            acts += [_q("v0"), _q(f"v{i}")]
+        return acts + [_STOP]
+
+    async def _long(self):
+        return await self.drive(self._script(), step_budget=2 * self.N + 5)
+
+    async def test_many_duplicates_grow_the_prompt_by_the_short_form_only(self):
+        result, model, _ = await self._long()
+        self.assertEqual(result.duplicate_proposals, self.N)
+        self.assertEqual(result.stop_reason, "gave_up")
+        final = model.prompts[-1]
+        dups = [ln for ln in _step_lines(final) if f"{MARK} [duplicate]" in ln]
+        self.assertEqual(len(dups), self.N)
+        # first duplicate: full framing; every later one: the short form only
+        self.assertIn(_FULL, dups[0])
+        short_prefix = f"{MARK} [duplicate], not sent: DUPLICATE of step 1"
+        for ln in dups[1:]:
+            self.assertNotIn(_FULL, ln)
+            self.assertIn(short_prefix, ln)
+            self.assertLessEqual(len(ln), 220, ln)   # per-refusal growth bound
+        self.assertEqual(final.count(_FULL), 1)
+        # against the same probe with no framing at all, the added text is one full
+        # framing plus N-1 short markers -- nothing that scales with the full text
+        with patch.object(policy_refusal, "frame", lambda c, r: r), \
+                patch.object(policy_refusal, "short", lambda c, r: r):
+            _, plain_model, _ = await self._long()
+        overhead = len(final) - len(plain_model.prompts[-1])
+        one_full = len(policy_refusal.frame("duplicate", ""))
+        one_short = len(policy_refusal.short("duplicate", ""))
+        self.assertLessEqual(overhead, one_full + (self.N - 1) * one_short)
+        # absolute bound on the final prompt of this 201-step probe. Measured 2026-11-26:
+        # 33,711 chars framed, 28,791 with no framing, 65,391 if every refusal carried
+        # the full framing (the pre-fix behaviour), which this bound rejects.
+        self.assertLess(len(final), 40_000)
+
+    async def test_first_refusal_of_each_category_keeps_the_full_framing(self):
+        """Negative control: a short form only ever follows a full one of the SAME
+        category; a new category starts with the full framing again."""
+        bad = {"action": "mutate", "location": "query", "param": "nope", "value": "1"}
+        result, model, _ = await self.drive(
+            [_q("a"), _q("a"), _q("b"), bad, _q("c"), _q("a"), _q("d"), bad, _STOP], step_budget=12)
+        lines = _step_lines(model.prompts[-1])
+        dup = [ln for ln in lines if f"{MARK} [duplicate]" in ln]
+        rej = [ln for ln in lines if f"{MARK} [rejected_proposal]" in ln]
+        self.assertEqual((len(dup), len(rej)), (2, 2))
+        self.assertIn(_FULL, dup[0])
+        self.assertIn(_FULL, rej[0])        # rejected_proposal's first is full despite the earlier duplicate
+        self.assertNotIn(_FULL, dup[1])
+        self.assertNotIn(_FULL, rej[1])
+        self.assertIn("not sent: query param 'nope' not present on the captured request", rej[1])
+        self.assertEqual(result.diagnostics["policy_refusal_repeats"], 2)
+
+
 class PolicyRefusalRepeatCountTests(_Base):
     async def test_repeated_scope_blocks_are_counted(self):
         result, _, _ = await self.drive([_q("x"), _q("y"), _STOP], _get("http://evil.test/api/search?q=w"))

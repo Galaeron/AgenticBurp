@@ -826,14 +826,21 @@ class IterativeAgent:
         attempts: list[AttemptRecord] = []
         attempt_by_key: dict[str, AttemptRecord] = {}
         dup_streak = _DuplicateStreak()
-        # Optional telemetry: harness refusals of a category this run already
-        # refused once (the model came back to a forbidden kind of action).
+        # Harness refusal categories this probe has already shown the model.
+        # The first refusal of a category carries the full framing; later ones
+        # the compact marker (the system prompt explains it), so a refusal-heavy
+        # probe's plain history lines -- kept in full for the whole probe by
+        # _render_history -- grow by the short form only. A repeat is also
+        # counted (diagnostics policy_refusal_repeats: the model came back to a
+        # kind of action the harness had already refused).
         refused_categories: set[str] = set()
 
-        def note_refusal(category: str) -> None:
+        def refusal_text(category: str, reason: str) -> str:
             if category in refused_categories:
                 diag["policy_refusal_repeats"] += 1
+                return policy_refusal.short(category, reason)
             refused_categories.add(category)
+            return policy_refusal.frame(category, reason)
 
         def emit(step_obj: IterativeStep) -> None:
             result.transcript.append(step_obj)
@@ -949,9 +956,8 @@ class IterativeAgent:
                            'needs_prerequisite': policy_refusal.MECHANISM,
                            'reused': policy_refusal.DUPLICATE}.get(status)
                 if refusal:
-                    note_refusal(refusal)
                     history.append(f"[step {step}] mechanism result: "
-                                   f"{policy_refusal.frame(refusal, json.dumps(outcome))}")
+                                   f"{refusal_text(refusal, json.dumps(outcome))}")
                 else:
                     history.append(f"[step {step}] mechanism result: {json.dumps(outcome)}")
                 emit(IterativeStep(step, {"action":"experiment", "kind":outcome.get('kind','<rejected>'),
@@ -981,9 +987,8 @@ class IterativeAgent:
                     err = "reset: the request is already the captured request"
                     diag["rejected_proposals"] += 1
                     consecutive_no_progress += 1
-                    note_refusal(policy_refusal.REJECTED_PROPOSAL)
                     history.append(f"[step {step}] action rejected: "
-                                   f"{policy_refusal.frame(policy_refusal.REJECTED_PROPOSAL, err)}")
+                                   f"{refusal_text(policy_refusal.REJECTED_PROPOSAL, err)}")
                     emit(IterativeStep(step, action, "(rejected)", None, err, blocked=err))
                     continue
                 headers_state, request_state = dict(captured_headers), captured_request
@@ -1000,9 +1005,8 @@ class IterativeAgent:
             if err:
                 diag["rejected_proposals"] += 1
                 consecutive_no_progress += 1
-                note_refusal(policy_refusal.REJECTED_PROPOSAL)
                 history.append(f"[step {step}] action rejected: "
-                               f"{policy_refusal.frame(policy_refusal.REJECTED_PROPOSAL, err)}")
+                               f"{refusal_text(policy_refusal.REJECTED_PROPOSAL, err)}")
                 emit(IterativeStep(step, action, "(rejected)", None, err, blocked=err))
                 continue
             method, url, headers, body = built
@@ -1025,8 +1029,7 @@ class IterativeAgent:
                        else "an earlier run's request on this agent (outcome unknown)")
                 note = (f"DUPLICATE of {ref}: choose a different supported action or stop "
                         f"[attempt {_attempt_id(key)}]")
-                note_refusal(policy_refusal.DUPLICATE)
-                history.append(f"[step {step}] {policy_refusal.frame(policy_refusal.DUPLICATE, note)}")
+                history.append(f"[step {step}] {refusal_text(policy_refusal.DUPLICATE, note)}")
                 log.info(
                     "iterative_agent: skipping duplicate request already sent this "
                     "active-probe session: %s %s", method, url)
@@ -1065,9 +1068,7 @@ class IterativeAgent:
             if status is None:
                 diag["blocked_attempts"] += 1
                 consecutive_no_progress += 1
-                if refusal:
-                    note_refusal(refusal)
-                shown = policy_refusal.frame(refusal, text) if refusal else text
+                shown = refusal_text(refusal, text) if refusal else text
                 history.append(f"[step {step}] {req_summary} -> {shown} [attempt {rec.attempt_id}]")
                 emit(IterativeStep(step, action, req_summary, None, text, blocked=text,
                                    attempt_id=rec.attempt_id))
