@@ -184,7 +184,10 @@ def _observations(host: str, engagement_id: str) -> list:
         out = []
         for (oid, method, url, norm, captured_at, ingested_at, pid, facts, sha, _h) in rows:
             evidence = {}
-            blob = store.get_evidence_blob(sha, conn=conn) if sha else None
+            # Verified read: a capture whose bytes fail their hash check gives no
+            # fields to the map, and the map names it (sources.evidence_unresolved).
+            evidence_status, blob = (store.read_evidence_blob(sha, conn=conn) if sha
+                                     else (store.BLOB_MISSING, None))
             if blob:
                 try:
                     evidence = json.loads(blob.decode("utf-8", "surrogatepass"))
@@ -195,7 +198,8 @@ def _observations(host: str, engagement_id: str) -> list:
                         "ingested_at": ingested_at, "principal": pid or "",
                         "facts": json.loads(facts or "{}"),
                         "attribution": attributions.get(oid) or {},
-                        "request_body": evidence.get("request_body")})
+                        "request_body": evidence.get("request_body"),
+                        "evidence_status": evidence_status})
     except sqlite3.OperationalError:
         return []
     finally:
@@ -511,12 +515,15 @@ def build_map(host: str, *, engagement_id: str = "", asm=None, use_stored_asm: b
                                "rank": h.get("rank", 0.0), "classes": list(h.get("classes") or []),
                                "endpoints": sorted(h.get("endpoints") or [])})
 
-    from harness import security
+    from harness import security, store
     return security.sanitize_data({
         "schema_version": SCHEMA_VERSION, "host": host, "engagement_id": engagement_id,
         "sends_traffic": False, "model_calls": 0,
         "sources": {"engagement_snapshot": state is not None,
                     "observations": len(observations), "ownership_facts": len(owned),
+                    "evidence_unresolved": sorted(
+                        o["observation_id"] for o in observations
+                        if o.get("evidence_status") == store.BLOB_HASH_MISMATCH),
                     "semantic_model": asm_source if asm_doc else None,
                     "semantic_model_note": "" if asm_doc else asm_source},
         "roles": role_list, "objects": object_list, "endpoints": endpoint_list,

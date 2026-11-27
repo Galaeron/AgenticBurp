@@ -313,6 +313,23 @@ class CorrectionAndDeletionTests(_TempStore):
             store.delete_observation(a["observation_id"])
         self.assertTrue(store.evidence_blob_resolves(blob), "fault left the deleted capture's bytes behind")
 
+    def test_corrupted_evidence_is_reported_not_served(self):
+        a = store.record_observation(_exchange())
+        blob = self._rows("SELECT evidence_sha256 FROM exchange_observations")[0][0]
+        self.assertEqual(store.get_observation(a["observation_id"])["evidence_status"], "resolved")
+        conn = sqlite3.connect(store._DB_PATH)
+        try:
+            conn.execute("UPDATE evidence_blobs SET data = ? WHERE sha256 = ?", (b"tampered", blob))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(store.get_observation(a["observation_id"])["evidence_status"], "unavailable")
+        self.assertEqual(self._select(_exchange('{"id": 1001}'))["selected"][0]["evidence_status"],
+                         "unavailable")
+        self.assertEqual(store.resolve_observation_refs([a["observation_id"]]),
+                         {a["observation_id"]: "evidence_unavailable"})
+        self.assertIsNone(store.get_evidence_blob(blob))
+
     def test_expired_evidence_is_reported_not_served(self):
         a = store.record_observation(_exchange())
         before = self._select(_exchange('{"id": 1001}'))

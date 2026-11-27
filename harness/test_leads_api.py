@@ -254,6 +254,43 @@ class LeadsCallerTests(_ProofCallerBase, unittest.TestCase):
         self.assertIn(f"**Steps to reproduce:** {leads.NO_REPRO_TEXT}.", noleg)
         self.assertNotIn("reproduction recipe", noleg)
 
+    # ------------------------------------------- evidence integrity (2026-11-26)
+    def _corrupt(self, sha):
+        conn = store._connect()
+        try:
+            self.assertEqual(conn.execute("UPDATE evidence_blobs SET data = data || X'00' "
+                                          "WHERE sha256 = ?", (sha,)).rowcount, 1)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_a_corrupted_request_blob_is_reported_unresolved_not_served(self):
+        self._seed()
+        conn = store._connect()
+        try:
+            obs_sha = conn.execute("SELECT evidence_sha256 FROM exchange_observations "
+                                   "WHERE url_redacted LIKE '%/api/items/7%'").fetchone()[0]
+        finally:
+            conn.close()
+        sqli_sha = next(e["data"]["request_blob"] for e in store.ledger_events_for("f-sqli")
+                        if e["event_type"] == "execution" and (e["data"] or {}).get("request_blob"))
+
+        # The captured observation is corrupted: the idor lead serves nothing and
+        # says why; the intact ledger send for sqli is still served (control).
+        self._corrupt(obs_sha)
+        by_id = {l["finding_id"]: l for l in self._get(self.host)["leads"] if l["kind"] == "finding"}
+        self.assertIsNone(by_id["f-idor"]["request"])
+        self.assertEqual(by_id["f-idor"]["no_request_reason"], leads.NO_REQUEST_UNRESOLVED)
+        self.assertEqual(by_id["f-sqli"]["request"]["source"], "ledger_execution")
+        # Negative control: a finding that never had a request keeps the old reason.
+        self.assertEqual(by_id["f-noleg"]["no_request_reason"], leads.NO_REQUEST_FINDING)
+
+        # Now the ledger send's request blob is corrupted too.
+        self._corrupt(sqli_sha)
+        by_id = {l["finding_id"]: l for l in self._get(self.host)["leads"] if l["kind"] == "finding"}
+        self.assertIsNone(by_id["f-sqli"]["request"])
+        self.assertEqual(by_id["f-sqli"]["no_request_reason"], leads.NO_REQUEST_UNRESOLVED)
+
 
 if __name__ == "__main__":
     unittest.main()

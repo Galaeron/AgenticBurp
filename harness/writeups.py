@@ -130,10 +130,12 @@ def _path_of(url: str) -> str:
 
 def _load_blob(sha: str, conn) -> dict | None:
     from harness import store
-    if not sha or not store.evidence_blob_resolves(sha, conn=conn):
+    # One verified read: bytes come back only when they still hash to `sha`.
+    data = store.get_evidence_blob(sha, conn=conn) if sha else None
+    if data is None:
         return None
     try:
-        doc = json.loads(store.get_evidence_blob(sha, conn=conn) or b"{}")
+        doc = json.loads(data)
     except ValueError:
         return None
     return doc if isinstance(doc, dict) else None

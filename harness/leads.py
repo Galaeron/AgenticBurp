@@ -90,6 +90,10 @@ NO_REQUEST_FINDING = ("no request recorded: neither the capture that produced th
                       "nor any harness send for it was retained")
 NO_REQUEST_EXPERIMENT = "no request recorded: this experiment was never sent"
 NO_REQUEST_PREREQUISITE = "no request recorded as this identity"
+# Evidence integrity (2026-11-26): a recorded request whose stored bytes no longer
+# hash to their sha256 is not served; the lead says so instead of "not retained".
+NO_REQUEST_UNRESOLVED = ("recorded request evidence failed its integrity check (sha256 "
+                         "mismatch) and is not served")
 
 
 # --------------------------------------------------------------------------- #
@@ -209,8 +213,11 @@ def _redacted_request(method: str, url: str, headers: dict | None, body,
             "truncated": bool(truncated), "redacted": True, "rehydration_required": True}
 
 
-def _observation_request(conn, finding: dict, engagement_id: str) -> dict | None:
-    """The retained capture that produced this finding (same host, pile, exchange id)."""
+def _observation_request(conn, finding: dict, engagement_id: str,
+                         integrity_failures: list | None = None) -> dict | None:
+    """The retained capture that produced this finding (same host, pile, exchange id).
+    A capture whose blob fails its hash check is not served; its sha256 is appended
+    to `integrity_failures` when given."""
     from harness import store
     exchange_id = finding.get("exchange_id") or ""
     if not exchange_id:
@@ -220,10 +227,15 @@ def _observation_request(conn, finding: dict, engagement_id: str) -> dict | None
         "SELECT observation_id, evidence_sha256, evidence_truncated FROM exchange_observations "
         "WHERE host = ? AND engagement_id = ? AND exchange_id = ? AND status = 'active'",
         (host, engagement_id, exchange_id)).fetchone()
-    if row is None or not row[1] or not store.evidence_blob_resolves(row[1], conn=conn):
+    if row is None or not row[1]:
+        return None
+    status, data = store.read_evidence_blob(row[1], conn=conn)
+    if status == store.BLOB_HASH_MISMATCH and integrity_failures is not None:
+        integrity_failures.append(row[1])
+    if data is None:
         return None
     try:
-        doc = json.loads(store.get_evidence_blob(row[1], conn=conn) or b"{}")
+        doc = json.loads(data)
     except ValueError:
         return None
     if not doc.get("url") or not doc.get("method"):
@@ -234,17 +246,23 @@ def _observation_request(conn, finding: dict, engagement_id: str) -> dict | None
                              truncated=bool(row[2]) or bool(doc.get("evidence_truncated")))
 
 
-def _ledger_request(conn, events: list[dict]) -> dict | None:
-    """The newest harness send for this finding whose request blob still resolves."""
+def _ledger_request(conn, events: list[dict], integrity_failures: list | None = None) -> dict | None:
+    """The newest harness send for this finding whose request blob still resolves.
+    A blob that fails its hash check is skipped and noted in `integrity_failures`."""
     from harness import store
     for event in reversed(events):
         if event.get("event_type") != "execution":
             continue
         blob = (event.get("data") or {}).get("request_blob")
-        if not blob or not store.evidence_blob_resolves(blob, conn=conn):
+        if not blob:
+            continue
+        status, data = store.read_evidence_blob(blob, conn=conn)
+        if status == store.BLOB_HASH_MISMATCH and integrity_failures is not None:
+            integrity_failures.append(blob)
+        if data is None:
             continue
         try:
-            doc = json.loads(store.get_evidence_blob(blob, conn=conn) or b"{}")
+            doc = json.loads(data)
         except ValueError:
             continue
         if doc.get("url") and doc.get("method"):
@@ -372,7 +390,9 @@ def _finding_lead(conn, finding: dict, events: list[dict], investigation: dict,
                   engagement_id: str) -> dict:
     from harness import issues
     from harness.confirmation_gate import finding_triage
-    request = _observation_request(conn, finding, engagement_id) or _ledger_request(conn, events)
+    integrity_failures: list = []
+    request = (_observation_request(conn, finding, engagement_id, integrity_failures)
+               or _ledger_request(conn, events, integrity_failures))
     location = finding.get("parameter_location") or ""
     name = finding.get("parameter_name") or ""
     suggested = issues.redact(finding.get("suggested_test") or "")
@@ -394,7 +414,8 @@ def _finding_lead(conn, finding: dict, events: list[dict], investigation: dict,
         "identity": {"captured_principal_id": finding.get("captured_principal_id") or "",
                      "principal_id": finding.get("principal_id") or ""},
         "request": request,
-        "no_request_reason": None if request else NO_REQUEST_FINDING,
+        "no_request_reason": (None if request else
+                              NO_REQUEST_UNRESOLVED if integrity_failures else NO_REQUEST_FINDING),
         "change": change, "expected": expected,
         "blocked_on": _primary(facts), "blocked_facts": facts,
         "suggested_test": suggested,
