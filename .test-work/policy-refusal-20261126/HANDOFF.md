@@ -26,6 +26,12 @@ Offline only: no Juice Shop, Ollama or Docker here. No live-run or model-behavio
   cancel), the duplicate rejection, both `action rejected:` paths (build error, no-op reset), and the
   experiment handoff's own refusals (`rejected`, `needs_prerequisite` -> `mechanism`; `reused` ->
   `duplicate`). A completed/inconclusive mechanism result is not framed.
+- Prompt growth (review fix, second commit): `_render_history` keeps every plain history line in
+  full for the whole probe, so only the FIRST refusal of each category in a probe gets the full
+  `frame(...)` text; later refusals of a seen category get `short(...)` (`HARNESS POLICY REFUSAL
+  [<category>], not sent: <raw reason>`; the system prompt explains the marker). Measured on a
+  201-step probe with 100 duplicates: final prompt 33,711 chars, vs 28,791 with no framing and
+  65,391 if every refusal were fully framed.
 - PRIOR ATTEMPTS line: `AttemptRecord` gets `policy: str = ""`; only `line()` renders the marker,
   `outcome` stays raw (so a duplicate's citation of an earlier outcome is unchanged).
 - System prompt: one new rule naming the marker and saying a target 403/429/WAF is shown as
@@ -40,14 +46,18 @@ Offline only: no Juice Shop, Ollama or Docker here. No live-run or model-behavio
   the model's output format, not an action, and "do not retry" would be wrong for it.
 
 ### 3. Tests
-- New `harness/test_policy_refusal_framing.py` (13 tests), caller-level through `IterativeAgent.run`
+- New `harness/test_policy_refusal_framing.py` (15 tests), caller-level through `IterativeAgent.run`
   with a recording fake model, the real TargetTransport, network patched at `httpx.AsyncClient.request`:
   scope, gate (default gate refuses POST), budget (`max_requests=0`), duplicate, rejected proposal,
   mechanism refusal (+ completed one as control), system prompt; negative controls: target 403, 429
   and a 406 WAF page are `HTTP <status>` with no marker anywhere, a transport `ConnectError` is not
   framed; raw-values tests run the same script with `frame`/`short` patched to identity and assert
   `to_dict()` (stop reason, counters, transcript) is identical, the prompts differ, and no log line
-  carries the marker; repeat counter and its control.
+  carries the marker; repeat counter and its control. Prompt growth: 100 duplicates interleaved with
+  fresh sends -> exactly one full framing in the final prompt, every later duplicate line <= 220
+  chars, overhead vs no framing <= one full + 99 short markers, final prompt < 40,000 chars (the
+  always-full behaviour, 65,391, fails it); negative control: the first refusal of each category
+  (duplicate, then rejected_proposal) is still fully framed and only same-category repeats are short.
 - Updated assertions (old refusal text in the prompt, now framed; the raw reason is still asserted):
   `harness/test_iterative_agent.py` (3 duplicate tests), `harness/test_iterative_typed_actions.py`
   (2 rejected-action tests).
@@ -67,14 +77,19 @@ Offline only: no Juice Shop, Ollama or Docker here. No live-run or model-behavio
   `orchestrator_detect.py`.
 
 ## Verification (this worktree, /home/user/.venv-agb Python 3.13, PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers)
+After the prompt-growth fix (second commit):
 - `python -m harness.suite smoke`: exit 0, 182 tests OK.
 - `python -m unittest harness.test_orchestrator_precondition`: exit 0, 74 tests OK.
 - `python -m unittest <the 67 harness/test_*.py modules that mention iterative_agent /
-  IterativeAgent / run_active_probe> harness.test_policy_refusal_framing harness.test_pipeline_gate`
-  (module list: `grep -rl "iterative_agent\|IterativeAgent\|run_active_probe" harness/test_*.py`;
-  includes all `test_iterative_*`, `test_worklist_*`, `test_prompt_budget`): exit 0,
-  1165 tests OK, no skips, 1341 s.
-- `python -m unittest harness.test_policy_refusal_framing`: 13 OK (the gate test ran, not skipped).
+  IterativeAgent / run_active_probe>` (module list: `grep -rl "iterative_agent\|IterativeAgent\|run_active_probe"
+  harness/test_*.py`; it already contains `test_policy_refusal_framing` and `test_pipeline_gate`, and
+  all `test_iterative_*`, `test_worklist_*`, `test_prompt_budget`): exit 0, 1144 tests OK, no skips,
+  1310 s.
+- `python -m unittest harness.test_policy_refusal_framing`: 15 OK (the gate test ran, not skipped).
+- Before the fix (first commit): smoke 182 OK, precondition 74 OK, targeted exit 0 with 1165 OK.
+  That command also named `test_policy_refusal_framing` and `test_pipeline_gate` explicitly although
+  both were already in the list, so they ran twice: 1165 = 1142 unique + 13 + 10. The 1144 above
+  counts each module once (1142 + the 2 new tests).
 - Before the assertion updates the iterative modules failed 5 tests (the 5 updated ones), as expected.
 - Full suite not run (orchestrator runs it once after merging).
 
