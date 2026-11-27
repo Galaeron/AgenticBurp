@@ -330,6 +330,21 @@ driver_capture:
   # DEFAULT OFF. max_uploads caps the inputs tried per crawl.
   file_uploads: false
   max_uploads: 4
+  # Click exploration (needs spa_navigation): on each view, click up to
+  # max_clicks_per_view controls that are not links (buttons, [role=button],
+  # inline click handlers, pointer-styled list items/cards), in document order,
+  # at most max_clicks per crawl and within click_seconds of the first click, then
+  # put the view back. Never clicked: anything inside a form, disabled, or whose
+  # text/aria-label/title/id/class reads destructive or state-changing (delete,
+  # remove, logout, pay, checkout, submit, save, reset, clear, add to basket, ...).
+  # Reads a click fires take the browser's identity router (scope, credentials,
+  # budget) and feed discovery; every write is checked, then held, never sent. The
+  # route map keeps "open view, click control" recipes, which the stored_xss
+  # read-back replays. DEFAULT OFF (clicks send traffic).
+  click_explore: false
+  max_clicks_per_view: 8
+  max_clicks: 60
+  click_seconds: 120
 
 # Cross-site browser PoC for CSRF confirmation -- LB-5 (harness/browser_driver.py
 # PlaywrightDriver.cross_site_submit + harness/validators/csrf_validator.py).

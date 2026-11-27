@@ -301,6 +301,10 @@ class ExecutionObservation:
     # The HTML each navigation's final answer carried (bounded): dom_xss reads it to
     # tell a payload the server reflected from one only page script could place.
     navigation_bodies: list[str] = field(default_factory=list)
+    # visit(clicks=...): one line per recipe click, "selector: clicked" or
+    # "selector: not clicked (why)", and the writes those clicks issued (held).
+    clicks: list[str] = field(default_factory=list)
+    held_writes: list[str] = field(default_factory=list)
 
     def all_text(self) -> str:
         return "\n".join(self.dialogs + self.console + self.page_errors)
@@ -585,6 +589,12 @@ class _IdentityRouter:
         # crawl_spa(file_uploads=True) while one file input's upload is tried: every
         # write the page issues is HELD and aborted, never sent (see _hold_write).
         self.hold: dict | None = None
+        # crawl_spa(clicks_per_view=...) / visit(clicks=...) while a control is
+        # clicked and its view put back: {"held": [...], "blocked": [...]}. Every
+        # write the page issues meanwhile is checked (scope, then the gate) and
+        # HELD -- dropped, never sent -- whatever the gate says; reads take the
+        # normal route, and each request the policy refuses is listed.
+        self.click_hold: dict | None = None
         extra, cookies = _extra_headers_and_cookies(headers, url)
         self.identity_headers = {k.lower(): v for k, v in (extra or {}).items()}
         self.identity_cookies = {c["name"]: c["value"] for c in cookies}
@@ -663,6 +673,10 @@ class _IdentityRouter:
         if self.hold is not None and (request.method or "GET").upper() not in _HELD_READS:
             await self._hold_write(route, request, self.hold)
             return
+        if (self.click_hold is not None
+                and (request.method or "GET").upper() not in _HELD_READS):
+            await self._hold_click_write(route, request, self.click_hold)
+            return
         is_navigation = request.is_navigation_request()
         decision = self._decide(request.url, request.method, request.resource_type,
                                 is_navigation, account=True)
@@ -670,6 +684,10 @@ class _IdentityRouter:
             log.info("%s: blocked %s %s (%s)", self.label, request.method, request.url,
                      decision.reason)
             self._blocked(decision.reason)
+            if self.click_hold is not None and len(self.click_hold["blocked"]) < 50:
+                self.click_hold["blocked"].append(
+                    f"{(request.method or 'GET').upper()} {ScopePolicy.origin_of(request.url)}"
+                    f"{urlsplit(request.url).path or '/'} ({decision.reason})")
             await _quietly(route.abort())
             return
         if self.obs is not None:
@@ -803,6 +821,34 @@ class _IdentityRouter:
                     request_body=body.decode("utf-8", "replace"),
                     analyst_note=hold["note"][:2000], capture_source=hold["capability"],
                 ).model_dump()
+        await self._drop_held(route, request)
+
+    async def _hold_click_write(self, route, request, hold: dict) -> None:
+        """A write the page issued while a control was clicked (click_hold). It is
+        checked as any browser write is -- scope and same-origin, then the run's
+        gate -- for the record, then dropped, never sent: a click may only read.
+        No budget and no mutating ceiling is spent on it."""
+        method, url = (request.method or "POST").upper(), request.url
+        where = f"{method} {ScopePolicy.origin_of(url)}{urlsplit(url).path or '/'}"
+        try:
+            navigation = request.is_navigation_request()
+        except Exception:
+            navigation = False
+        decision = self._decide(url, method, request.resource_type, navigation, account=False)
+        if not decision.allow:
+            reason = f"refused: {decision.reason}"
+            if len(hold["blocked"]) < 50:
+                hold["blocked"].append(f"{where} ({decision.reason})")
+        elif self.gate is None:
+            reason = "held: no gate"
+        else:
+            verdict = self.gate.authorize(validator_name="browser", method=method, url=url)
+            reason = ("held: the gate would allow it; a click never sends a write"
+                      if verdict.allowed else f"held: gate denied ({verdict.reason})")
+        if len(hold["held"]) < 50:
+            hold["held"].append(f"{where} ({reason})")
+        log.info("%s: click write %s %s not sent (%s)", self.label, method,
+                 urlsplit(url).path or "/", reason)
         await self._drop_held(route, request)
 
     @staticmethod
@@ -1077,6 +1123,93 @@ async def _upload_file_input(page, router, desc: dict, *, gate, headers: dict | 
     return None, f"no upload request observed after attaching a benign .{ext} file{how}{others}"
 
 
+# ---------------------------------------------------------------------------
+# Click exploration (crawl_spa(clicks_per_view=...), visit(clicks=...))
+# ---------------------------------------------------------------------------
+
+# What a view shows, for "what did the click reveal": its visible text length and
+# the dialogs and overlays open (a native <dialog open>, ARIA dialogs, CDK/Material
+# overlay panes), plus a DOM size so a change with no new text still counts.
+_CLICK_STATE_JS = """() => ({
+  text: document.body ? (document.body.innerText || '').length : 0,
+  nodes: document.getElementsByTagName('*').length,
+  dialogs: document.querySelectorAll(
+    'dialog[open], [role=dialog], [role=alertdialog], [aria-modal=true], .cdk-overlay-pane, .modal.show'
+  ).length
+})"""
+
+
+# visit(clicks=...): at most this many recipe clicks in one load.
+_MAX_RECIPE_CLICKS = 4
+
+
+async def _click_control(page, router, desc: dict, *, wait_ms: int, timeout_ms: int) -> dict:
+    """Click the one element `desc["selector"]` names, as a user would, and report
+    what it changed. The element is described again and refused (never clicked)
+    when the selector no longer names exactly one element, or when it now reads
+    as destructive or state-changing (spa_navigation.click_refusal). From the
+    click until `end_click`, every write the page issues is held, never sent
+    (router.click_hold). Returns {"clicked", "reason", "revealed", "dialog",
+    "changed"}."""
+    from harness.spa_navigation import CLICK_CANDIDATES_JS, click_refusal
+    selector = str(desc.get("selector") or "")
+    if not selector:
+        return {"clicked": False, "reason": "no selector"}
+    locator = page.locator(selector)
+    count = await locator.count()
+    if count != 1:
+        return {"clicked": False, "reason": f"the selector names {count} elements now"}
+    # The element the selector names now, described and checked again.
+    current = [d for d in (await page.evaluate(CLICK_CANDIDATES_JS, selector) or [])
+               if isinstance(d, dict)]
+    if not current:
+        return {"clicked": False, "reason": "no longer a click candidate"}
+    refusal = click_refusal(current[0])
+    if refusal:
+        return {"clicked": False, "reason": f"refused: {refusal}"}
+    before = await page.evaluate(_CLICK_STATE_JS)
+    if router.click_hold is None:
+        router.click_hold = {"held": [], "blocked": []}
+    popups: list = []
+
+    def on_page(opened) -> None:
+        popups.append(opened)
+    context = page.context
+    context.on("page", on_page)
+    try:
+        try:
+            await locator.click(timeout=min(timeout_ms, 3000), no_wait_after=True)
+        except Exception:
+            # Covered by a banner or toast: activate the element itself.
+            await locator.evaluate("e => e.click()")
+        await page.wait_for_timeout(wait_ms)
+    finally:
+        _quiet_off(context, "page", on_page)
+        for popup in popups:      # a window the click opened is not followed
+            await _quietly(popup.close())
+    try:
+        after = await page.evaluate(_CLICK_STATE_JS)
+    except Exception:            # the click navigated away mid-read
+        return {"clicked": True, "reason": "", "revealed": 0, "dialog": False, "changed": True}
+    revealed = max(0, int(after.get("text", 0)) - int(before.get("text", 0)))
+    dialog = int(after.get("dialogs", 0)) > int(before.get("dialogs", 0))
+    changed = bool(revealed or dialog or popups or after != before)
+    return {"clicked": True, "reason": "opened a window (closed)" if popups else "",
+            "revealed": revealed, "dialog": dialog, "changed": changed}
+
+
+def _quiet_off(emitter, event: str, handler) -> None:
+    try:
+        emitter.remove_listener(event, handler)
+    except Exception:
+        pass
+
+
+def _end_click(router) -> dict:
+    hold, router.click_hold = router.click_hold, None
+    return hold or {"held": [], "blocked": []}
+
+
 def playwright_available() -> bool:
     try:
         import playwright.async_api  # noqa: F401
@@ -1136,8 +1269,16 @@ class PlaywrightDriver:
                     gate: "SafetyGate | None" = None,
                     budget: "RequestBudget | None" = None,
                     observe_marker: str = "",
+                    clicks=(),
                     ) -> ExecutionObservation:
         """Navigate to `url` and report what executed.
+
+        `clicks` (a click recipe the SPA crawl recorded: selectors, in order) are
+        clicked after the load settles, each as `_click_control` does it -- the
+        element described again and refused when it now looks destructive or
+        state-changing -- and every write the page issues from the first click
+        on is held, never sent (obs.clicks, obs.held_writes). Empty (the
+        default) clicks nothing.
 
         `scope` is the run's approved-origin policy (PR-10 / R01): every
         request the browser makes -- navigation, redirects, subresources,
@@ -1231,6 +1372,21 @@ class PlaywrightDriver:
                         obs.navigation_status = response.status if response else None
                         obs.final_url = page.url
                         await page.wait_for_timeout(wait_ms)
+                        for selector in list(clicks or ())[:_MAX_RECIPE_CLICKS]:
+                            if is_cancelled(cancel):
+                                break
+                            try:
+                                done = await _click_control(
+                                    page, router, {"selector": str(selector)},
+                                    wait_ms=wait_ms, timeout_ms=self.launch_timeout_ms)
+                            except Exception as e:
+                                done = {"clicked": False, "reason": type(e).__name__}
+                            obs.clicks.append(f"{selector}: clicked" if done.get("clicked") else
+                                              f"{selector}: not clicked ({done.get('reason')})")
+                            if not done.get("clicked"):
+                                break
+                        if clicks:
+                            obs.held_writes = list(_end_click(router).get("held") or [])
                         obs.cancelled = is_cancelled(cancel)
                         obs.final_url = page.url
                         if observe_marker:
@@ -1355,6 +1511,8 @@ class PlaywrightDriver:
                         max_captured: int = 200, extra_views=(),
                         declared_views: int = 0, route_probes: int = 0,
                         file_uploads: bool = False, max_uploads: int = 4,
+                        clicks_per_view: int = 0, max_clicks: int = 0,
+                        click_seconds: float = 120.0,
                         deadline: float | None = None):
         """`capture_requests` across the app's client-side views: load `url`, then
         follow the in-app links and router targets the rendered DOM exposes
@@ -1372,10 +1530,14 @@ class PlaywrightDriver:
         name the scripts read (spa_navigation.crawl_views; the rendered text and
         form values are read back). `file_uploads` also tries, up to
         `max_uploads`, each view's file inputs (_upload_file_input: a benign file
-        attached, the upload request held and captured, never sent). Returns a
-        `spa_navigation.SpaCrawlResult`."""
-        from harness.spa_navigation import (LINK_TARGETS_JS, SpaCrawlResult, ViewRefused,
-                                            crawl_views, describe_error)
+        attached, the upload request held and captured, never sent).
+        `clicks_per_view` and `max_clicks` (both > 0) also click, on each view, the
+        controls that are not links and do not look destructive or state-changing
+        (spa_navigation.crawl_views, _click_control), within `click_seconds` of
+        the first click; reads they fire take this same router, and every write
+        they fire is held, never sent. Returns a `spa_navigation.SpaCrawlResult`."""
+        from harness.spa_navigation import (CLICK_CANDIDATES_JS, LINK_TARGETS_JS, SpaCrawlResult,
+                                            ViewRefused, crawl_views, describe_error)
         effective_scope = scope if scope is not None else ScopePolicy(
             allowed_hosts=frozenset({ScopePolicy.host_of(url)}))
         if is_cancelled(cancel):
@@ -1488,6 +1650,21 @@ class PlaywrightDriver:
                             found = await page.evaluate(_VIEW_TEXT_JS)
                             return found if isinstance(found, str) else ""
 
+                        # Click exploration (clicks_per_view > 0): _click_control.
+                        async def click_candidates(self) -> list:
+                            found = await page.evaluate(CLICK_CANDIDATES_JS, None)
+                            return [d for d in found or [] if isinstance(d, dict)]
+
+                        async def click(self, desc: dict) -> dict:
+                            return await _click_control(page, router, desc, wait_ms=wait_ms,
+                                                        timeout_ms=timeout_ms)
+
+                        async def restore(self, target: str) -> None:
+                            await self.open_fresh(target)
+
+                        async def end_click(self) -> dict:
+                            return _end_click(router)
+
                     class _UploadAdapter(_Adapter):
                         # driver_capture.file_uploads: see _upload_file_input.
                         async def file_inputs(self) -> list:
@@ -1507,6 +1684,9 @@ class PlaywrightDriver:
                         extra_views=extra_views, declared_views=max(0, int(declared_views)),
                         route_probes=max(0, int(route_probes)),
                         uploads=max(0, int(max_uploads)) if file_uploads else 0,
+                        clicks_per_view=max(0, int(clicks_per_view)),
+                        max_clicks=max(0, int(max_clicks)),
+                        click_seconds=max(0.0, float(click_seconds)),
                         cancel=cancel, budget=budget, deadline=deadline)
                 finally:
                     if context is not None:
